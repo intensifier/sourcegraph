@@ -636,12 +636,7 @@ func (r *Resolver) filterRepoHasFileContent(
 
 				g.Go(func(ctx context.Context) error {
 					for _, arg := range op.HasFileContent {
-						commitID, err := r.gitserver.ResolveRevision(
-							ctx,
-							repo.Name,
-							rev,
-							gitserver.ResolveRevisionOptions{NoEnsureRevision: true},
-						)
+						commitID, err := r.gitserver.ResolveRevision(ctx, repo.Name, rev, gitserver.ResolveRevisionOptions{NoEnsureRevision: true})
 						if err != nil {
 							if errors.Is(err, context.DeadlineExceeded) || errors.HasType(err, gitdomain.BadCommitError{}) {
 								return err
@@ -650,43 +645,10 @@ func (r *Resolver) filterRepoHasFileContent(
 							return nil
 						}
 
-						patternInfo := search.TextPatternInfo{
-							Pattern:         arg.Content,
-							IsNegated:       arg.Negated,
-							IsRegExp:        true,
-							IsCaseSensitive: false,
-							FileMatchLimit:  1,
-						}
-
-						if arg.Path != "" {
-							patternInfo.IncludePatterns = []string{arg.Path}
-						}
-
-						foundMatches := false
-						onMatches := func(fms []*protocol.FileMatch) {
-							if len(fms) > 0 {
-								foundMatches = true
-							}
-						}
-
-						_, err = searcher.Search(
-							ctx,
-							r.searcher,
-							repo.Name,
-							repo.ID,
-							"", // not using zoekt, don't need branch
-							commitID,
-							false, // not using zoekt, don't need indexing
-							&patternInfo,
-							time.Hour,         // depend on context for timeout
-							nil,               // not using zoekt, don't need indexing
-							search.Features{}, // not using any search features
-							onMatches,
-						)
+						foundMatches, err := r.repoHasFileContentAtCommit(ctx, repo, commitID, arg)
 						if err != nil {
 							return err
 						}
-
 						if !foundMatches {
 							return nil
 						}
@@ -732,6 +694,45 @@ func zoektQueryForFileContentArgs(opt query.RepoHasFileContentArgs, caseSensitiv
 	}
 	q = zoektquery.Simplify(q)
 	return q
+}
+
+func (r *Resolver) repoHasFileContentAtCommit(ctx context.Context, repo types.MinimalRepo, commitID api.CommitID, args query.RepoHasFileContentArgs) (bool, error) {
+	patternInfo := search.TextPatternInfo{
+		Pattern:               args.Content,
+		IsNegated:             args.Negated,
+		IsRegExp:              true,
+		IsCaseSensitive:       false,
+		FileMatchLimit:        1,
+		PatternMatchesContent: true,
+	}
+
+	if args.Path != "" {
+		patternInfo.IncludePatterns = []string{args.Path}
+		patternInfo.PatternMatchesPath = true
+	}
+
+	foundMatches := false
+	onMatches := func(fms []*protocol.FileMatch) {
+		if len(fms) > 0 {
+			foundMatches = true
+		}
+	}
+
+	_, err := searcher.Search(
+		ctx,
+		r.searcher,
+		repo.Name,
+		repo.ID,
+		"", // not using zoekt, don't need branch
+		commitID,
+		false, // not using zoekt, don't need indexing
+		&patternInfo,
+		time.Hour,         // depend on context for timeout
+		nil,               // not using zoekt, don't need indexing
+		search.Features{}, // not using any search features
+		onMatches,
+	)
+	return foundMatches, err
 }
 
 // computeExcludedRepos computes the ExcludedRepos that the given RepoOptions would not match. This is
