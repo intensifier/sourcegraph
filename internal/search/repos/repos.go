@@ -1213,12 +1213,14 @@ func (r *RepoRevSpecs) RevSpecs() []string {
 	return res
 }
 
+// Set is a small helper utility for a unique set of objects
 type Set[T comparable] map[T]struct{}
 
 func (s Set[T]) Add(t T) {
 	s[t] = struct{}{}
 }
 
+// IntersectWith mutates `s`, removing any elements not in `other`
 func (s Set[T]) IntersectWith(other Set[T]) {
 	for k := range s {
 		if _, ok := other[k]; !ok {
