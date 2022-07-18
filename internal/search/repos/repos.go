@@ -538,7 +538,7 @@ func (r *Resolver) filterRepoHasFileContent(
 		repoRevs,
 		r.zoekt,
 		search.TextRequest,
-		query.Yes, // TODO respect index:no
+		op.UseIndex,
 		false,
 	)
 	if err != nil {

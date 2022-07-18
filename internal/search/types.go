@@ -325,6 +325,9 @@ type RepoOptions struct {
 	ArchivedSet  bool
 	NoArchived   bool
 	OnlyArchived bool
+
+	// Whether we should depend on Zoekt for resolving repositories
+	UseIndex query.YesNoOnly
 }
 
 func (op *RepoOptions) Tags() []otlog.Field {
