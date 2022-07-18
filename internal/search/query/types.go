@@ -366,6 +366,20 @@ func (p Parameters) RepoContainsCommitAfter() (value string) {
 	return value
 }
 
+func (p Parameters) FileOwnership() (include, exclude []string) {
+	nodes := toNodes(p)
+
+	VisitTypedPredicate(nodes, func(pred *FileHasOwnerPredicate, negated bool) {
+		if negated {
+			exclude = append(exclude, pred.Owner)
+		} else {
+			include = append(include, pred.Owner)
+		}
+	})
+
+	return include, exclude
+}
+
 // Exists returns whether a parameter exists in the query (whether negated or not).
 func (p Parameters) Exists(field string) bool {
 	found := false
