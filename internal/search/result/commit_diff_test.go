@@ -3,7 +3,9 @@ package result
 import (
 	"testing"
 
-	"github.com/hexops/autogold"
+	"github.com/stretchr/testify/require"
+
+	"github.com/hexops/autogold/v2"
 )
 
 const input = `client/web/src/enterprise/codeintel/badge/components/IndexerSummary.module.scss client/web/src/enterprise/codeintel/badge/components/IndexerSummary.module.scss
@@ -45,14 +47,16 @@ func TestParseDiffString(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	autogold.Equal(t, res)
+	autogold.ExpectFile(t, res)
+
+	formatted := FormatDiffFiles(res)
+	require.Equal(t, input, formatted)
+
 }
 
 func TestCommitDiffMatch(t *testing.T) {
 	res, _ := ParseDiffString(input)
 	commitDiff := &CommitDiffMatch{DiffFile: &res[0]}
-	autogold.Want(
-		"path when modified",
-		"client/web/src/enterprise/codeintel/badge/components/IndexerSummary.module.scss").
+	autogold.Expect("client/web/src/enterprise/codeintel/badge/components/IndexerSummary.module.scss").
 		Equal(t, commitDiff.Path())
 }

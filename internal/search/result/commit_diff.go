@@ -1,14 +1,17 @@
 package result
 
 import (
-	"errors"
-	"regexp"
+	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/grafana/regexp"
+
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
+	"github.com/sourcegraph/sourcegraph/internal/lazyregexp"
 	"github.com/sourcegraph/sourcegraph/internal/search/filter"
 	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
 type CommitDiffMatch struct {
@@ -111,6 +114,33 @@ func (cm *CommitDiffMatch) Select(path filter.SelectPath) Match {
 
 func (cm *CommitDiffMatch) searchResultMarker() {}
 
+// FormatDiffFiles inverts ParseDiffString
+func FormatDiffFiles(res []DiffFile) string {
+	var buf strings.Builder
+	for _, diffFile := range res {
+		buf.WriteString(escaper.Replace(diffFile.OrigName))
+		buf.WriteByte(' ')
+		buf.WriteString(escaper.Replace(diffFile.NewName))
+		buf.WriteByte('\n')
+		for _, hunk := range diffFile.Hunks {
+			fmt.Fprintf(&buf, "@@ -%d,%d +%d,%d @@", hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount)
+			if hunk.Header != "" {
+				// Only add a space before the header if the header is non-empty
+				fmt.Fprintf(&buf, " %s", hunk.Header)
+			}
+			buf.WriteByte('\n')
+			for _, line := range hunk.Lines {
+				buf.WriteString(line)
+				buf.WriteByte('\n')
+			}
+		}
+	}
+	return buf.String()
+}
+
+var escaper = strings.NewReplacer(" ", `\ `)
+var unescaper = strings.NewReplacer(`\ `, " ")
+
 func ParseDiffString(diff string) (res []DiffFile, err error) {
 	const (
 		INIT = iota
@@ -120,7 +150,17 @@ func ParseDiffString(diff string) (res []DiffFile, err error) {
 
 	state := INIT
 	var currentDiff DiffFile
+	finishDiff := func() {
+		res = append(res, currentDiff)
+		currentDiff = DiffFile{}
+	}
+
 	var currentHunk Hunk
+	finishHunk := func() {
+		currentDiff.Hunks = append(currentDiff.Hunks, currentHunk)
+		currentHunk = Hunk{}
+	}
+
 	for _, line := range strings.Split(diff, "\n") {
 		if len(line) == 0 {
 			continue
@@ -137,12 +177,12 @@ func ParseDiffString(diff string) (res []DiffFile, err error) {
 			case '-', '+', ' ':
 				currentHunk.Lines = append(currentHunk.Lines, line)
 			case '@':
-				currentDiff.Hunks = append(currentDiff.Hunks, currentHunk)
-				currentHunk = Hunk{}
+				finishHunk()
 				currentHunk.OldStart, currentHunk.OldCount, currentHunk.NewStart, currentHunk.NewCount, currentHunk.Header, err = parseHunkHeader(line)
 				state = IN_HUNK
 			default:
-				res = append(res, currentDiff)
+				finishHunk()
+				finishDiff()
 				currentDiff.OrigName, currentDiff.NewName, err = splitDiffFiles(line)
 				state = IN_DIFF
 			}
@@ -151,18 +191,21 @@ func ParseDiffString(diff string) (res []DiffFile, err error) {
 			return nil, err
 		}
 	}
+	finishHunk()
+	finishDiff()
 
 	return res, nil
 }
 
 var errInvalidDiff = errors.New("invalid diff format")
+var splitRegex = lazyregexp.New(`(.*[^\\]) (.*)`)
 
 func splitDiffFiles(fileLine string) (oldFile, newFile string, err error) {
-	split := strings.Fields(fileLine)
-	if len(split) != 2 {
+	match := splitRegex.FindStringSubmatch(fileLine)
+	if len(match) == 0 {
 		return "", "", errInvalidDiff
 	}
-	return split[0], split[1], nil
+	return unescaper.Replace(match[1]), unescaper.Replace(match[2]), nil
 }
 
 var headerRegex = regexp.MustCompile(`@@ -(\d+),(\d+) \+(\d+),(\d+) @@\ ?(.*)`)

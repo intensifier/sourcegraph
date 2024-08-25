@@ -1,28 +1,28 @@
-import { Observable } from 'rxjs'
+import type { Observable } from 'rxjs'
 import { map } from 'rxjs/operators'
 
 import { dataOrThrowErrors, gql } from '@sourcegraph/http-client'
-import * as GQL from '@sourcegraph/shared/src/schema'
 
 import { requestGraphQL } from '../backend/graphql'
 import {
-    CreateNotebookResult,
-    CreateNotebookStarResult,
-    CreateNotebookStarVariables,
-    CreateNotebookVariables,
-    DeleteNotebookResult,
-    DeleteNotebookStarResult,
-    DeleteNotebookStarVariables,
-    DeleteNotebookVariables,
-    FetchNotebookResult,
-    FetchNotebookVariables,
-    ListNotebooksResult,
-    ListNotebooksVariables,
-    Maybe,
-    NotebookFields,
-    Scalars,
-    UpdateNotebookResult,
-    UpdateNotebookVariables,
+    type CreateNotebookResult,
+    type CreateNotebookStarResult,
+    type CreateNotebookStarVariables,
+    type CreateNotebookVariables,
+    type DeleteNotebookResult,
+    type DeleteNotebookStarResult,
+    type DeleteNotebookStarVariables,
+    type DeleteNotebookVariables,
+    type FetchNotebookResult,
+    type FetchNotebookVariables,
+    type ListNotebooksResult,
+    type ListNotebooksVariables,
+    type Maybe,
+    type NotebookFields,
+    type Scalars,
+    type UpdateNotebookResult,
+    type UpdateNotebookVariables,
+    NotebooksOrderBy,
 } from '../graphql-operations'
 
 const notebooksFragment = gql`
@@ -49,6 +49,7 @@ const notebooksFragment = gql`
         stars {
             totalCount
         }
+        patternType
         blocks {
             ... on MarkdownBlock {
                 __typename
@@ -88,11 +89,6 @@ const notebooksFragment = gql`
                     symbolContainerName
                     symbolKind
                 }
-            }
-            ... on ComputeBlock {
-                __typename
-                id
-                computeInput
             }
         }
     }
@@ -148,7 +144,7 @@ export function fetchNotebooks({
     starredByUserID?: Maybe<Scalars['ID']>
     namespace?: Maybe<Scalars['ID']>
     after?: string
-    orderBy?: GQL.NotebooksOrderBy
+    orderBy?: NotebooksOrderBy
     descending?: boolean
 }): Observable<ListNotebooksResult['notebooks']> {
     return requestGraphQL<ListNotebooksResult, ListNotebooksVariables>(fetchNotebooksQuery, {
@@ -158,7 +154,7 @@ export function fetchNotebooks({
         creatorUserID: creatorUserID ?? null,
         starredByUserID: starredByUserID ?? null,
         namespace: namespace ?? null,
-        orderBy: orderBy ?? GQL.NotebooksOrderBy.NOTEBOOK_UPDATED_AT,
+        orderBy: orderBy ?? NotebooksOrderBy.NOTEBOOK_UPDATED_AT,
         descending: descending ?? true,
     }).pipe(
         map(dataOrThrowErrors),
@@ -199,6 +195,9 @@ const createNotebookMutation = gql`
 `
 
 export function createNotebook(variables: CreateNotebookVariables): Observable<NotebookFields> {
+    // Remove any null blocks. This is caused by deleted block types.
+    variables.notebook.blocks = variables.notebook.blocks.filter(block => block)
+
     return requestGraphQL<CreateNotebookResult, CreateNotebookVariables>(createNotebookMutation, variables).pipe(
         map(dataOrThrowErrors),
         map(data => data.createNotebook)
@@ -215,6 +214,9 @@ const updateNotebookMutation = gql`
 `
 
 export function updateNotebook(variables: UpdateNotebookVariables): Observable<NotebookFields> {
+    // Remove any null blocks. This is caused by deleted block types.
+    variables.notebook.blocks = variables.notebook.blocks.filter(block => block)
+
     return requestGraphQL<UpdateNotebookResult, UpdateNotebookVariables>(updateNotebookMutation, variables).pipe(
         map(dataOrThrowErrors),
         map(data => data.updateNotebook)
@@ -229,7 +231,7 @@ const deleteNotebookMutation = gql`
     }
 `
 
-export function deleteNotebook(id: GQL.ID): Observable<DeleteNotebookResult> {
+export function deleteNotebook(id: Scalars['ID']): Observable<DeleteNotebookResult> {
     return requestGraphQL<DeleteNotebookResult, DeleteNotebookVariables>(deleteNotebookMutation, { id }).pipe(
         map(dataOrThrowErrors)
     )
@@ -243,7 +245,9 @@ const createNotebookStarMutation = gql`
     }
 `
 
-export function createNotebookStar(notebookID: GQL.ID): Observable<CreateNotebookStarResult['createNotebookStar']> {
+export function createNotebookStar(
+    notebookID: Scalars['ID']
+): Observable<CreateNotebookStarResult['createNotebookStar']> {
     return requestGraphQL<CreateNotebookStarResult, CreateNotebookStarVariables>(createNotebookStarMutation, {
         notebookID,
     }).pipe(
@@ -260,7 +264,7 @@ const deleteNotebookStarMutation = gql`
     }
 `
 
-export function deleteNotebookStar(notebookID: GQL.ID): Observable<DeleteNotebookStarResult> {
+export function deleteNotebookStar(notebookID: Scalars['ID']): Observable<DeleteNotebookStarResult> {
     return requestGraphQL<DeleteNotebookStarResult, DeleteNotebookStarVariables>(deleteNotebookStarMutation, {
         notebookID,
     }).pipe(map(dataOrThrowErrors))

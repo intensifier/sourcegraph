@@ -1,12 +1,18 @@
-import React, { forwardRef, HTMLAttributes } from 'react'
+import React, { type FC, forwardRef, type HTMLAttributes, type PropsWithChildren } from 'react'
 
 import { mdiRefresh } from '@mdi/js'
 import { ParentSize } from '@visx/responsive'
 import classNames from 'classnames'
 
-import { Button, ForwardReferenceComponent, Icon } from '@sourcegraph/wildcard'
+import {
+    Button,
+    type ForwardReferenceComponent,
+    Icon,
+    LegendItem,
+    LegendList,
+    type Series,
+} from '@sourcegraph/wildcard'
 
-import { getLineColor, LegendItem, LegendList, Series } from '../../../../../charts'
 import { InsightCard, InsightCardBanner, InsightCardHeader, InsightCardLoading } from '../../views'
 
 import styles from './LivePreviewCard.module.scss'
@@ -22,25 +28,40 @@ export interface LivePreviewUpdateButtonProps {
     onClick: () => void
 }
 
-const LivePreviewUpdateButton: React.FunctionComponent<
-    React.PropsWithChildren<LivePreviewUpdateButtonProps>
-> = props => {
+const LivePreviewUpdateButton: FC<LivePreviewUpdateButtonProps> = props => {
     const { disabled, onClick } = props
 
     return (
-        <Button variant="icon" disabled={disabled} className={styles.updateButton} onClick={onClick}>
-            Live preview <Icon svgPath={mdiRefresh} inline={false} aria-hidden={true} height="1rem" width="1rem" />
+        <Button
+            aria-label="Update code insight live preview"
+            variant="icon"
+            disabled={disabled}
+            className={styles.updateButton}
+            onClick={onClick}
+        >
+            Live preview
+            <Icon svgPath={mdiRefresh} inline={false} aria-hidden={true} height="1rem" width="1rem" />
         </Button>
     )
 }
 
-const LivePreviewLoading = InsightCardLoading
+const LivePreviewLoading: FC<PropsWithChildren<unknown>> = props => (
+    <InsightCardLoading {...props} aria-label="Loading insight live preview" />
+)
+
 const LivePreviewHeader = InsightCardHeader
 
 const LivePreviewBlurBackdrop = forwardRef((props, reference) => {
     const { as: Component = 'svg', className, ...attributes } = props
 
-    return <Component ref={reference} className={classNames(styles.chartWithMock, className)} {...attributes} />
+    return (
+        <Component
+            {...attributes}
+            ref={reference}
+            aria-hidden={true}
+            className={classNames(styles.chartWithMock, className)}
+        />
+    )
 }) as ForwardReferenceComponent<'svg', {}>
 
 const LivePreviewBanner: React.FunctionComponent<React.PropsWithChildren<unknown>> = props => (
@@ -61,9 +82,9 @@ const LivePreviewLegend: React.FunctionComponent<React.PropsWithChildren<LivePre
     const { series } = props
 
     return (
-        <LegendList className="mt-3">
+        <LegendList aria-label="Live preview chart legend" className="mt-3">
             {series.map(series => (
-                <LegendItem key={series.id} color={getLineColor(series)} name={series.name} />
+                <LegendItem key={series.id} color={series.color} name={series.name} />
             ))}
         </LegendList>
     )

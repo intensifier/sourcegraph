@@ -1,17 +1,14 @@
 import { useState } from 'react'
 
-import { number } from '@storybook/addon-knobs'
-import { DecoratorFn, Meta, Story } from '@storybook/react'
-
-import { BrandedStory } from '@sourcegraph/branded/src/components/BrandedStory'
-import webStyles from '@sourcegraph/web/src/SourcegraphWebApp.scss'
+import type { Decorator, Meta, StoryFn } from '@storybook/react'
 
 import { H1, H2 } from '..'
+import { BrandedStory } from '../../stories/BrandedStory'
 
 import { PageSelector } from './PageSelector'
 
-const decorator: DecoratorFn = story => (
-    <BrandedStory styles={webStyles}>{() => <div className="container mt-3">{story()}</div>}</BrandedStory>
+const decorator: Decorator = story => (
+    <BrandedStory>{() => <div className="container mt-3">{story()}</div>}</BrandedStory>
 )
 
 const config: Meta = {
@@ -22,12 +19,21 @@ const config: Meta = {
 
 export default config
 
-export const Simple: Story = () => {
+export const Simple: StoryFn = (args = {}) => {
     const [page, setPage] = useState(1)
-    return <PageSelector currentPage={page} onPageChange={setPage} totalPages={number('maxPages', 5)} />
+    return <PageSelector currentPage={page} onPageChange={setPage} totalPages={args.totalPages} />
+}
+Simple.argTypes = {
+    totalPages: {
+        name: 'maxPages',
+        control: { type: 'number' },
+    },
+}
+Simple.args = {
+    totalPages: 5,
 }
 
-export const AllPageSelectors: Story = () => (
+export const AllPageSelectors: StoryFn = () => (
     <>
         <H1>Page Selector</H1>
         <H2>Short</H2>
@@ -42,13 +48,6 @@ export const AllPageSelectors: Story = () => (
         <LongOnMobile />
     </>
 )
-
-AllPageSelectors.parameters = {
-    chromatic: {
-        enableDarkMode: true,
-        disableSnapshot: false,
-    },
-}
 
 const Short = () => {
     const [page, setPage] = useState(1)

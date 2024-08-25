@@ -17,13 +17,17 @@ import (
 
 // NewNpmPackagesSource returns a new PackagesSource from the given external
 // service.
-func NewNpmPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+func NewNpmPackagesSource(ctx context.Context, svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+	rawConfig, err := svc.Config.Decrypt(ctx)
+	if err != nil {
+		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
+	}
 	var c schema.NpmPackagesConnection
-	if err := jsonc.Unmarshal(svc.Config, &c); err != nil {
+	if err := jsonc.Unmarshal(rawConfig, &c); err != nil {
 		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
 	}
 
-	cli, err := cf.Doer()
+	client, err := npm.NewHTTPClient(svc.URN(), c.Registry, c.Credentials, cf)
 	if err != nil {
 		return nil, err
 	}
@@ -33,14 +37,11 @@ func NewNpmPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*Pac
 		configDeps: c.Dependencies,
 		scheme:     dependencies.NpmPackagesScheme,
 		/* depsSvc initialized in SetDependenciesService */
-		src: &npmPackagesSource{
-			client: npm.NewHTTPClient(svc.URN(), c.Registry, c.Credentials, cli),
-		},
+		src: &npmPackagesSource{client},
 	}, nil
 }
 
 var _ packagesSource = &npmPackagesSource{}
-var _ packagesDownloadSource = &npmPackagesSource{}
 
 type npmPackagesSource struct {
 	client npm.Client

@@ -10,9 +10,11 @@ import (
 
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/definition"
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/schemas"
-	"github.com/sourcegraph/sourcegraph/internal/database/migration/storetypes"
+	"github.com/sourcegraph/sourcegraph/internal/database/migration/shared"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
+
+type RunnerFactoryWithSchemas func(schemaNames []string, schemas []*schemas.Schema) (*Runner, error)
 
 type Runner struct {
 	logger             log.Logger
@@ -115,7 +117,7 @@ func (r *Runner) forEachSchema(ctx context.Context, schemaNames []string, visito
 	for _, schemaName := range schemaNames {
 		wg.Add(1)
 
-		go func(schemaName string) {
+		go func() {
 			defer wg.Done()
 
 			errorCh <- visitor(ctx, schemaContext{
@@ -124,7 +126,7 @@ func (r *Runner) forEachSchema(ctx context.Context, schemaNames []string, visito
 				store:                storeMap[schemaName],
 				initialSchemaVersion: versionMap[schemaName],
 			})
-		}(schemaName)
+		}()
 	}
 
 	wg.Wait()
@@ -222,12 +224,18 @@ type unlockFunc func(err error) error
 // the given schema context. This is meant to enable a short development loop where the user can
 // re-apply the `up` command without having to create a dummy migration log to proceed.
 //
+// If the ignoreSinglePendingLog flag is set to true, then the callback will be invoked if there is
+// a single pending migration log, and it's the next migration that would be applied with respect to
+// the given schema context. This is meant to be used in the upgrade process, where an interrupted
+// migrator command will appear as a concurrent upgrade attempt.
+//
 // This method returns a true-valued flag if it should be re-invoked by the caller.
 func (r *Runner) withLockedSchemaState(
 	ctx context.Context,
 	schemaContext schemaContext,
 	definitions []definition.Definition,
 	ignoreSingleDirtyLog bool,
+	ignoreSinglePendingLog bool,
 	f lockedVersionCallback,
 ) (retry bool, _ error) {
 	// Take an advisory lock to determine if there are any migrator instances currently
@@ -260,7 +268,14 @@ func (r *Runner) withLockedSchemaState(
 
 	// Detect failed migrations, and determine if we need to wait longer for concurrent migrator
 	// instances to finish their current work.
-	if retry, err := validateSchemaState(ctx, schemaContext, definitions, byState, ignoreSingleDirtyLog); err != nil {
+	if retry, err := validateSchemaState(
+		ctx,
+		schemaContext,
+		definitions,
+		byState,
+		ignoreSingleDirtyLog,
+		ignoreSinglePendingLog,
+	); err != nil {
 		return false, err
 	} else if retry {
 		// An index is currently being created. We return true here to flag to the caller that
@@ -273,8 +288,10 @@ func (r *Runner) withLockedSchemaState(
 	return false, f(schemaVersion, byState, unlock)
 }
 
-const lockPollInterval = time.Second
-const lockPollLogRatio = 5
+const (
+	lockPollInterval = time.Second
+	lockPollLogRatio = 5
+)
 
 // pollLock will attempt to acquire a session-level advisory lock while the given context has not
 // been canceled. The caller must eventually invoke the unlock function on successful acquisition
@@ -328,15 +345,15 @@ func groupByState(schemaVersion schemaVersion, definitions []definition.Definiti
 	pendingVersionsMap := intSet(schemaVersion.pendingVersions)
 
 	states := definitionsByState{}
-	for _, definition := range definitions {
-		if _, ok := appliedVersionsMap[definition.ID]; ok {
-			states.applied = append(states.applied, definition)
+	for _, def := range definitions {
+		if _, ok := appliedVersionsMap[def.ID]; ok {
+			states.applied = append(states.applied, def)
 		}
-		if _, ok := pendingVersionsMap[definition.ID]; ok {
-			states.pending = append(states.pending, definition)
+		if _, ok := pendingVersionsMap[def.ID]; ok {
+			states.pending = append(states.pending, def)
 		}
-		if _, ok := failedVersionsMap[definition.ID]; ok {
-			states.failed = append(states.failed, definition)
+		if _, ok := failedVersionsMap[def.ID]; ok {
+			states.failed = append(states.failed, def)
 		}
 	}
 
@@ -352,19 +369,25 @@ func validateSchemaState(
 	definitions []definition.Definition,
 	byState definitionsByState,
 	ignoreSingleDirtyLog bool,
+	ignoreSinglePendingLog bool,
 ) (retry bool, _ error) {
 	if ignoreSingleDirtyLog && len(byState.failed) == 1 {
 		appliedVersionMap := intSet(extractIDs(byState.applied))
-		for _, definition := range definitions {
+		for _, def := range definitions {
 			if _, ok := appliedVersionMap[definitions[0].ID]; ok {
 				continue
 			}
 
-			if byState.failed[0].ID == definition.ID {
+			if byState.failed[0].ID == def.ID {
 				schemaContext.logger.Warn("Attempting to re-try migration that previously failed")
 				return false, nil
 			}
 		}
+	}
+
+	if ignoreSinglePendingLog && len(byState.pending) == 1 {
+		schemaContext.logger.Warn("Ignoring a pending migration")
+		return false, nil
 	}
 
 	if len(byState.failed) > 0 {
@@ -402,7 +425,7 @@ func validateSchemaState(
 
 type definitionWithStatus struct {
 	definition  definition.Definition
-	indexStatus storetypes.IndexStatus
+	indexStatus shared.IndexStatus
 }
 
 // partitionPendingMigrations partitions the given migrations into two sets: the set of pending
@@ -416,20 +439,20 @@ func partitionPendingMigrations(
 	schemaContext schemaContext,
 	definitions []definition.Definition,
 ) (pendingDefinitions []definitionWithStatus, failedDefinitions []definition.Definition, _ error) {
-	for _, definition := range definitions {
-		if definition.IsCreateIndexConcurrently {
-			tableName := definition.IndexMetadata.TableName
-			indexName := definition.IndexMetadata.IndexName
+	for _, def := range definitions {
+		if def.IsCreateIndexConcurrently {
+			tableName := def.IndexMetadata.TableName
+			indexName := def.IndexMetadata.IndexName
 
 			if indexStatus, ok, err := schemaContext.store.IndexStatus(ctx, tableName, indexName); err != nil {
 				return nil, nil, errors.Wrapf(err, "failed to check creation status of index %q.%q", tableName, indexName)
 			} else if ok && indexStatus.Phase != nil {
-				pendingDefinitions = append(pendingDefinitions, definitionWithStatus{definition, indexStatus})
+				pendingDefinitions = append(pendingDefinitions, definitionWithStatus{def, indexStatus})
 				continue
 			}
 		}
 
-		failedDefinitions = append(failedDefinitions, definition)
+		failedDefinitions = append(failedDefinitions, def)
 	}
 
 	return pendingDefinitions, failedDefinitions, nil
@@ -437,10 +460,10 @@ func partitionPendingMigrations(
 
 // getAndLogIndexStatus calls IndexStatus on the given store and returns the results. The result
 // is logged to the package-level logger.
-func getAndLogIndexStatus(ctx context.Context, schemaContext schemaContext, tableName, indexName string) (storetypes.IndexStatus, bool, error) {
+func getAndLogIndexStatus(ctx context.Context, schemaContext schemaContext, tableName, indexName string) (shared.IndexStatus, bool, error) {
 	indexStatus, exists, err := schemaContext.store.IndexStatus(ctx, tableName, indexName)
 	if err != nil {
-		return storetypes.IndexStatus{}, false, errors.Wrap(err, "failed to query state of index")
+		return shared.IndexStatus{}, false, errors.Wrap(err, "failed to query state of index")
 	}
 
 	logIndexStatus(schemaContext, tableName, indexName, indexStatus, exists)
@@ -448,7 +471,7 @@ func getAndLogIndexStatus(ctx context.Context, schemaContext schemaContext, tabl
 }
 
 // logIndexStatus logs the result of IndexStatus to the package-level logger.
-func logIndexStatus(schemaContext schemaContext, tableName, indexName string, indexStatus storetypes.IndexStatus, exists bool) {
+func logIndexStatus(schemaContext schemaContext, tableName, indexName string, indexStatus shared.IndexStatus, exists bool) {
 	schemaContext.logger.Info(
 		"Checked progress of index creation",
 		log.Object("result",
@@ -460,19 +483,18 @@ func logIndexStatus(schemaContext schemaContext, tableName, indexName string, in
 			renderIndexStatus(indexStatus),
 		),
 	)
-
 }
 
 // renderIndexStatus returns a slice of interface pairs describing the given index status for use in a
 // call to logger. If the index is currently being created, the progress of the create operation will be
 // summarized.
-func renderIndexStatus(progress storetypes.IndexStatus) log.Field {
+func renderIndexStatus(progress shared.IndexStatus) log.Field {
 	if progress.Phase == nil {
 		return log.Object("index status", log.Bool("in-progress", false))
 	}
 
 	index := -1
-	for i, phase := range storetypes.CreateIndexConcurrentlyPhases {
+	for i, phase := range shared.CreateIndexConcurrentlyPhases {
 		if phase == *progress.Phase {
 			index = i
 			break
@@ -483,7 +505,7 @@ func renderIndexStatus(progress storetypes.IndexStatus) log.Field {
 		"index status",
 		log.Bool("in-progress", true),
 		log.String("phase", *progress.Phase),
-		log.String("phases", fmt.Sprintf("%d of %d", index, len(storetypes.CreateIndexConcurrentlyPhases))),
+		log.String("phases", fmt.Sprintf("%d of %d", index, len(shared.CreateIndexConcurrentlyPhases))),
 		log.String("lockers", fmt.Sprintf("%d of %d", progress.LockersDone, progress.LockersTotal)),
 		log.String("blocks", fmt.Sprintf("%d of %d", progress.BlocksDone, progress.BlocksTotal)),
 		log.String("tuples", fmt.Sprintf("%d of %d", progress.TuplesDone, progress.TuplesTotal)),

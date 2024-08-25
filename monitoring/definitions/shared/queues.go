@@ -19,7 +19,7 @@ type queueConstructor struct{}
 // Requires a gauge of the format `src_{options.MetricNameRoot}_total`
 func (queueConstructor) Size(options ObservableConstructorOptions) sharedObservable {
 	return func(containerName string, owner monitoring.ObservableOwner) Observable {
-		filters := makeFilters(containerName, options.Filters...)
+		filters := makeFilters(options.JobLabel, containerName, options.Filters...)
 		by, legendPrefix := makeBy(options.By...)
 
 		return Observable{
@@ -40,7 +40,7 @@ func (queueConstructor) Size(options ObservableConstructorOptions) sharedObserva
 //   - counter of the format `src_{options.MetricNameRoot}_processor_total`
 func (queueConstructor) GrowthRate(options ObservableConstructorOptions) sharedObservable {
 	return func(containerName string, owner monitoring.ObservableOwner) Observable {
-		filters := makeFilters(containerName, options.Filters...)
+		filters := makeFilters(options.JobLabel, containerName, options.Filters...)
 		by, legendPrefix := makeBy(options.By...)
 
 		return Observable{
@@ -60,7 +60,7 @@ func (queueConstructor) GrowthRate(options ObservableConstructorOptions) sharedO
 //   - counter of the format `src_{options.MetricNameRoot}_queued_duration_seconds_total`
 func (queueConstructor) MaxAge(options ObservableConstructorOptions) sharedObservable {
 	return func(containerName string, owner monitoring.ObservableOwner) Observable {
-		filters := makeFilters(containerName, options.Filters...)
+		filters := makeFilters(options.JobLabel, containerName, options.Filters...)
 		by, legendPrefix := makeBy(options.By...)
 
 		return Observable{
@@ -72,6 +72,24 @@ func (queueConstructor) MaxAge(options ObservableConstructorOptions) sharedObser
 		}
 	}
 }
+
+func (queueConstructor) DequeueCacheSize(options ObservableConstructorOptions) sharedObservable {
+	return func(containerName string, owner monitoring.ObservableOwner) Observable {
+		filters := makeFilters(options.JobLabel, containerName, options.Filters...)
+		_, legendPrefix := makeBy(options.By...)
+
+		return Observable{
+			Name:        fmt.Sprintf("multiqueue_%s_dequeue_cache_size", options.MetricNameRoot),
+			Description: fmt.Sprintf("%s dequeue cache size for multiqueue executors", options.MetricDescriptionRoot),
+			Query:       fmt.Sprintf(`multiqueue_%[1]s_dequeue_cache_size{%[2]s}`, options.MetricNameRoot, filters),
+			Panel:       monitoring.Panel().LegendFormat(fmt.Sprintf("%s dequeue cache size", legendPrefix)),
+			Owner:       owner,
+		}
+	}
+}
+
+//      "expr": "max by (queue) (src_executor_total{job=~\"^(executor|sourcegraph-code-intel-indexers|executor-batches|frontend|sourcegraph-frontend|worker|sourcegraph-executors).*\",queue=~\"$queue\"})",
+//      "expr": "multiqueue_executor_dequeue_cache_size{job=~\"^(executor|sourcegraph-code-intel-indexers|executor-batches|frontend|sourcegraph-frontend|worker|sourcegraph-executors).*\",queue=~\"$queue\"}",
 
 type QueueSizeGroupOptions struct {
 	GroupConstructorOptions
@@ -86,6 +104,12 @@ type QueueSizeGroupOptions struct {
 	QueueMaxAge ObservableOption
 }
 
+type MultiqueueGroupOptions struct {
+	GroupConstructorOptions
+
+	QueueDequeueCacheSize ObservableOption
+}
+
 // NewGroup creates a group containing panels displaying metrics to monitor the size and growth rate
 // of a queue of work within the given container, as well as the age of the oldest unprocessed entry
 // in the queue.
@@ -93,7 +117,7 @@ type QueueSizeGroupOptions struct {
 // Requires any of the following:
 //   - gauge of the format `src_{options.MetricNameRoot}_total`
 //   - counter of the format `src_{options.MetricNameRoot}_processor_total`
-// 	 - counter of the format `src_{options.MetricNameRoot}_queued_duration_seconds_total`
+//   - counter of the format `src_{options.MetricNameRoot}_queued_duration_seconds_total`
 //
 // The queue size metric should be created via a Prometheus gauge function in the Go backend. For
 // instructions on how to create the processor metrics, see the `NewWorkerutilGroup` function in
@@ -108,6 +132,23 @@ func (queueConstructor) NewGroup(containerName string, owner monitoring.Observab
 	}
 	if options.QueueMaxAge != nil {
 		row = append(row, options.QueueMaxAge(Queue.MaxAge(options.ObservableConstructorOptions)(containerName, owner)).Observable())
+	}
+
+	if len(row) == 0 {
+		panic("No rows were constructed. Supply at least one ObservableOption to this group constructor.")
+	}
+
+	return monitoring.Group{
+		Title:  fmt.Sprintf("%s: %s", titlecase(options.Namespace), options.DescriptionRoot),
+		Hidden: options.Hidden,
+		Rows:   []monitoring.Row{row},
+	}
+}
+
+func (queueConstructor) NewMultiqueueGroup(containerName string, owner monitoring.ObservableOwner, options MultiqueueGroupOptions) monitoring.Group {
+	row := make(monitoring.Row, 0, 1)
+	if options.QueueDequeueCacheSize != nil {
+		row = append(row, options.QueueDequeueCacheSize(Queue.DequeueCacheSize(options.ObservableConstructorOptions)(containerName, owner)).Observable())
 	}
 
 	if len(row) == 0 {

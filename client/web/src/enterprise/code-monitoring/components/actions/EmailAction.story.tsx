@@ -1,19 +1,17 @@
-import { Meta, Story } from '@storybook/react'
+import type { Meta, StoryFn } from '@storybook/react'
 import sinon from 'sinon'
 
 import { H2 } from '@sourcegraph/wildcard'
 
 import { WebStory } from '../../../../components/WebStory'
 import { mockAuthenticatedUser } from '../../testing/util'
-import { ActionProps } from '../FormActionArea'
+import type { ActionProps } from '../FormActionArea'
 
 import { EmailAction } from './EmailAction'
 
 const config: Meta = {
     title: 'web/enterprise/code-monitoring/actions/EmailAction',
-    parameters: {
-        chromatic: { disableSnapshot: false },
-    },
+    parameters: {},
 }
 
 export default config
@@ -33,8 +31,9 @@ const action: ActionProps['action'] = {
     enabled: true,
     includeResults: false,
 }
+window.context.emailEnabled = true
 
-export const EmailActionStory: Story = () => (
+export const EmailActionStory: StoryFn = () => (
     <WebStory>
         {() => (
             <>

@@ -1,8 +1,8 @@
-import { ApolloError, FetchResult, MutationFunctionOptions, OperationVariables } from '@apollo/client'
+import type { ApolloError, FetchResult, MutationFunctionOptions, OperationVariables } from '@apollo/client'
 
 import { gql, useMutation } from '@sourcegraph/http-client'
 
-import { UpdateCodeIntelligenceConfigurationPolicyResult } from '../../../../graphql-operations'
+import type { UpdateCodeIntelligenceConfigurationPolicyResult } from '../../../../graphql-operations'
 
 const CREATE_POLICY_CONFIGURATION = gql`
     mutation CreateCodeIntelligenceConfigurationPolicy(
@@ -15,9 +15,9 @@ const CREATE_POLICY_CONFIGURATION = gql`
         $retentionDurationHours: Int
         $retainIntermediateCommits: Boolean!
         $indexingEnabled: Boolean!
+        $syntacticIndexingEnabled: Boolean!
         $indexCommitMaxAgeHours: Int
         $indexIntermediateCommits: Boolean!
-        $lockfileIndexingEnabled: Boolean!
     ) {
         createCodeIntelligenceConfigurationPolicy(
             repository: $repositoryId
@@ -29,9 +29,9 @@ const CREATE_POLICY_CONFIGURATION = gql`
             retentionDurationHours: $retentionDurationHours
             retainIntermediateCommits: $retainIntermediateCommits
             indexingEnabled: $indexingEnabled
+            syntacticIndexingEnabled: $syntacticIndexingEnabled
             indexCommitMaxAgeHours: $indexCommitMaxAgeHours
             indexIntermediateCommits: $indexIntermediateCommits
-            lockfileIndexingEnabled: $lockfileIndexingEnabled
         ) {
             id
         }
@@ -49,9 +49,9 @@ const UPDATE_POLICY_CONFIGURATION = gql`
         $retentionDurationHours: Int
         $retainIntermediateCommits: Boolean!
         $indexingEnabled: Boolean!
+        $syntacticIndexingEnabled: Boolean!
         $indexCommitMaxAgeHours: Int
         $indexIntermediateCommits: Boolean!
-        $lockfileIndexingEnabled: Boolean!
     ) {
         updateCodeIntelligenceConfigurationPolicy(
             id: $id
@@ -63,9 +63,9 @@ const UPDATE_POLICY_CONFIGURATION = gql`
             retentionDurationHours: $retentionDurationHours
             retainIntermediateCommits: $retainIntermediateCommits
             indexingEnabled: $indexingEnabled
+            syntacticIndexingEnabled: $syntacticIndexingEnabled
             indexCommitMaxAgeHours: $indexCommitMaxAgeHours
             indexIntermediateCommits: $indexIntermediateCommits
-            lockfileIndexingEnabled: $lockfileIndexingEnabled
         ) {
             alwaysNil
         }
@@ -87,9 +87,8 @@ interface SavePolicyConfigurationResult {
 
 export const useSavePolicyConfiguration = (isNew: boolean): SavePolicyConfigurationResult => {
     const mutation = isNew ? CREATE_POLICY_CONFIGURATION : UPDATE_POLICY_CONFIGURATION
-    const [savePolicyConfiguration, { loading, error }] = useMutation<UpdateCodeIntelligenceConfigurationPolicyResult>(
-        mutation
-    )
+    const [savePolicyConfiguration, { loading, error }] =
+        useMutation<UpdateCodeIntelligenceConfigurationPolicyResult>(mutation)
 
     return {
         savePolicyConfiguration,

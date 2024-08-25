@@ -9,7 +9,7 @@ import (
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/definition"
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/runner"
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/schemas"
-	"github.com/sourcegraph/sourcegraph/internal/database/migration/storetypes"
+	"github.com/sourcegraph/sourcegraph/internal/database/migration/shared"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
@@ -17,6 +17,7 @@ import (
 // not passed to any underlying persistence layer.
 type memoryStore struct {
 	db              *sql.DB
+	tx              *sql.Tx
 	appliedVersions []int
 	pendingVersions []int
 	failedVersions  []int
@@ -28,11 +29,25 @@ func newMemoryStore(db *sql.DB) runner.Store {
 	}
 }
 
-func (s *memoryStore) Transact(ctx context.Context) (runner.Store, error) {
-	return s, nil
+func (s *memoryStore) Transact(ctx context.Context) (_ runner.Store, err error) {
+	if s.tx != nil {
+		return nil, errors.New("cannot start transaction when another transaction is in progress, call Done before")
+	}
+	s.tx, err = s.db.BeginTx(ctx, &sql.TxOptions{})
+	return s, err
 }
 
 func (s *memoryStore) Done(err error) error {
+	defer func() {
+		s.tx = nil
+	}()
+
+	if s.tx != nil {
+		if err != nil {
+			return errors.Append(err, s.tx.Rollback())
+		}
+		return s.tx.Commit()
+	}
 	return err
 }
 
@@ -42,6 +57,10 @@ func (s *memoryStore) Describe(ctx context.Context) (map[string]schemas.SchemaDe
 
 func (s *memoryStore) Versions(ctx context.Context) (appliedVersions, pendingVersions, failedVersions []int, _ error) {
 	return s.appliedVersions, s.pendingVersions, s.failedVersions, nil
+}
+
+func (s *memoryStore) RunDDLStatements(ctx context.Context, statements []string) error {
+	return nil
 }
 
 func (s *memoryStore) TryLock(ctx context.Context) (bool, func(err error) error, error) {
@@ -60,12 +79,20 @@ func (s *memoryStore) WithMigrationLog(_ context.Context, _ definition.Definitio
 	return f()
 }
 
-func (s *memoryStore) IndexStatus(_ context.Context, _, _ string) (storetypes.IndexStatus, bool, error) {
-	return storetypes.IndexStatus{}, false, nil
+func (s *memoryStore) IndexStatus(_ context.Context, _, _ string) (shared.IndexStatus, bool, error) {
+	return shared.IndexStatus{}, false, nil
+}
+
+type execContexter interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 func (s *memoryStore) exec(ctx context.Context, migration definition.Definition, query *sqlf.Query) error {
-	_, err := s.db.ExecContext(ctx, query.Query(sqlf.PostgresBindVar), query.Args()...)
+	var db execContexter = s.db
+	if s.tx != nil {
+		db = s.tx
+	}
+	_, err := db.ExecContext(ctx, query.Query(sqlf.PostgresBindVar), query.Args()...)
 	if err != nil {
 		s.failedVersions = append(s.failedVersions, migration.ID)
 		return err

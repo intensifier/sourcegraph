@@ -12,9 +12,10 @@ import (
 
 func DownTo(commandName string, factory RunnerFactory, outFactory OutputFactory, development bool) *cli.Command {
 	schemaNameFlag := &cli.StringFlag{
-		Name:     "db",
-		Usage:    "The target `schema` to modify.",
+		Name:     "schema",
+		Usage:    "The target `schema` to modify. Possible values are 'frontend', 'codeintel' and 'codeinsights'",
 		Required: true,
+		Aliases:  []string{"db"},
 	}
 	targetFlag := &cli.StringSliceFlag{
 		Name:     "target",
@@ -31,9 +32,19 @@ func DownTo(commandName string, factory RunnerFactory, outFactory OutputFactory,
 		Usage: "Skip application of privileged migrations, but record that they have been applied. This assumes the user has already applied the required privileged migrations with elevated permissions.",
 		Value: false,
 	}
+	privilegedHashFlag := &cli.StringFlag{
+		Name:  "privileged-hash",
+		Usage: "Running --noop-privileged without this flag will print instructions and supply a value for use in a second invocation. Future (distinct) downto operations will require a unique hash.",
+		Value: "",
+	}
 	ignoreSingleDirtyLogFlag := &cli.BoolFlag{
 		Name:  "ignore-single-dirty-log",
-		Usage: "Ignore a previously failed attempt if it will be immediately retried by this operation.",
+		Usage: "Ignore a single previously failed attempt if it will be immediately retried by this operation.",
+		Value: development,
+	}
+	ignoreSinglePendingLogFlag := &cli.BoolFlag{
+		Name:  "ignore-single-pending-log",
+		Usage: "Ignore a single pending migration attempt if it will be immediately retried by this operation.",
 		Value: development,
 	}
 
@@ -46,13 +57,15 @@ func DownTo(commandName string, factory RunnerFactory, outFactory OutputFactory,
 		return runner.Options{
 			Operations: []runner.MigrationOperation{
 				{
-					SchemaName:     schemaNameFlag.Get(cmd),
+					SchemaName:     TranslateSchemaNames(schemaNameFlag.Get(cmd), out),
 					Type:           runner.MigrationOperationTypeTargetedDown,
 					TargetVersions: versions,
 				},
 			},
-			PrivilegedMode:       privilegedMode,
-			IgnoreSingleDirtyLog: ignoreSingleDirtyLogFlag.Get(cmd),
+			PrivilegedMode:         privilegedMode,
+			MatchPrivilegedHash:    func(hash string) bool { return hash == privilegedHashFlag.Get(cmd) },
+			IgnoreSingleDirtyLog:   ignoreSingleDirtyLogFlag.Get(cmd),
+			IgnoreSinglePendingLog: ignoreSinglePendingLogFlag.Get(cmd),
 		}, nil
 	}
 
@@ -65,7 +78,7 @@ func DownTo(commandName string, factory RunnerFactory, outFactory OutputFactory,
 			return flagHelp(out, "supply a target via -target")
 		}
 
-		r, err := setupRunner(ctx, factory, schemaNameFlag.Get(cmd))
+		r, err := setupRunner(factory, TranslateSchemaNames(schemaNameFlag.Get(cmd), out))
 		if err != nil {
 			return err
 		}
@@ -89,7 +102,9 @@ func DownTo(commandName string, factory RunnerFactory, outFactory OutputFactory,
 			targetFlag,
 			unprivilegedOnlyFlag,
 			noopPrivilegedFlag,
+			privilegedHashFlag,
 			ignoreSingleDirtyLogFlag,
+			ignoreSinglePendingLogFlag,
 		},
 	}
 }

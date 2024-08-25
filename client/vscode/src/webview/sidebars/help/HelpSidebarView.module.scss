@@ -14,3 +14,12 @@
     width: calc(var(--vscode-font-size) * 1.05);
     height: auto;
 }
+
+.sidebar-view-button {
+    background-color: transparent;
+    color: inherit !important;
+
+    &::part(control) {
+        justify-content: flex-start;
+    }
+}

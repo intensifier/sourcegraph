@@ -1,5 +1,6 @@
 import pTimeout from 'p-timeout'
 import { Subject } from 'rxjs'
+import { describe, expect, it, test } from 'vitest'
 
 import { isAsyncIterable, isPromiseLike, isSubscribable, observableFromAsyncIterable, tryCatchPromise } from './util'
 

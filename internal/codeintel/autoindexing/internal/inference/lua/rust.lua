@@ -1,12 +1,12 @@
-local patterns = require "sg.patterns"
-local recognizers = require "sg.recognizers"
+local recognizer = require "sg.autoindex.recognizer"
+local pattern = require "sg.autoindex.patterns"
 
-local indexer = "sourcegraph/lsif-rust"
-local outfile = "dump.lsif"
+local indexer = require("sg.autoindex.indexes").get "rust"
+local outfile = "index.scip"
 
-return recognizers.path_recognizer {
+return recognizer.new_path_recognizer {
   patterns = {
-    patterns.path_basename "Cargo.toml",
+    pattern.new_path_basename "Cargo.toml",
   },
 
   -- Invoked when Cargo.toml exists anywhere in repository
@@ -15,7 +15,7 @@ return recognizers.path_recognizer {
       steps = {},
       root = "",
       indexer = indexer,
-      indexer_args = { "lsif-rust", "index" },
+      indexer_args = { "scip-rust", "index" },
       outfile = outfile,
     }
   end,

@@ -1,9 +1,16 @@
-$filter-input-height: 2.5rem;
+:root {
+    --filter-input-height: 2.5rem;
+    --filter-input-padding-y: 0.25rem;
+    --group-header-font-size: 0.875rem;
+    --group-divider-height: 0.25rem;
+    --card-header-height: 1.5rem;
+}
+
 .filter {
-    height: $filter-input-height;
+    height: var(--filter-input-height);
     padding-left: 1rem;
-    padding-top: 0.25rem;
-    padding-bottom: 0.25rem;
+    padding-top: var(--filter-input-padding-y);
+    padding-bottom: var(--filter-input-padding-y);
     padding-right: 1rem;
 
     input {
@@ -17,7 +24,7 @@ $filter-input-height: 2.5rem;
     }
 
     input::placeholder {
-        font-size: 0.6875rem;
+        font-size: 0.75rem;
         color: var(--gray-07);
     }
 
@@ -32,11 +39,8 @@ $filter-input-height: 2.5rem;
     }
 }
 
-$group-header-font-size: 0.75rem;
-$group-divider-height: 0.25rem;
-
 .repo-location-group {
-    margin-bottom: $group-divider-height;
+    margin-bottom: var(--group-divider-height);
 
     &:last-child {
         margin-bottom: 0;
@@ -53,13 +57,13 @@ $group-divider-height: 0.25rem;
 
         &--repo-name {
             padding-left: 0.6rem;
-            font-size: $group-header-font-size;
+            font-size: var(--group-header-font-size);
         }
     }
 }
 
 .location-group {
-    margin-bottom: $group-divider-height;
+    margin-bottom: var(--group-divider-height);
 
     &:last-child {
         margin-bottom: 0;
@@ -81,7 +85,7 @@ $group-divider-height: 0.25rem;
             justify-content: space-between;
 
             font-weight: 400;
-            font-size: $group-header-font-size;
+            font-size: var(--group-header-font-size);
 
             mark {
                 padding-left: 0;
@@ -93,7 +97,23 @@ $group-divider-height: 0.25rem;
 }
 
 .location {
-    button {
+    display: flex;
+    flex-direction: column;
+    min-height: 18px;
+    position: relative;
+
+    &:not(:last-child) > &--link {
+        border-bottom: 1px solid var(--body-bg);
+    }
+
+    &--link {
+        all: unset;
+
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        color: inherit;
+
         padding-top: 0;
         padding-bottom: 0;
         width: 100%;
@@ -104,16 +124,57 @@ $group-divider-height: 0.25rem;
         // Avoid line number and filename getting put on different lines
         white-space: nowrap;
         padding-left: 0;
+        font-family: var(--code-font-family);
+
         border: none;
-        font-family: 'SF Mono', monospace;
+
+        &--code-excerpt {
+            flex: 1;
+            width: 100%;
+
+            :global(.line) {
+                min-width: 2.5rem;
+            }
+        }
     }
 
-    button:hover {
+    &--active {
+        background-color: var(--color-bg-3);
+    }
+
+    &--active-icon {
+        width: 1.35rem;
+        // stylelint-disable-next-line declaration-property-unit-allowed-list
+        height: calc(100% - 1px);
+        position: absolute;
+        right: 0;
+        top: 0;
+        background-color: var(--color-bg-3);
+        padding-left: 0.25rem;
+        padding-right: 0.1rem;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+    }
+
+    &--link:hover {
+        all: unset;
+
         background-color: var(--color-bg-2);
+        cursor: pointer;
+    }
+
+    &--active:hover {
+        // Needed to override `&--link:hover`
+        background-color: var(--color-bg-3);
+    }
+
+    &--link:focus-visible {
+        box-shadow: var(--focus-box-shadow);
     }
 
     code {
-        font-family: 'SF Mono', monospace;
+        font-family: var(--code-font-family);
         overflow: hidden;
         color: var(--body-color);
         font-weight: 400;
@@ -121,31 +182,9 @@ $group-divider-height: 0.25rem;
     }
 
     mark {
-        font-family: 'SF Mono', monospace;
+        font-family: var(--code-font-family);
         font-weight: 400;
         font-size: 0.75rem;
-    }
-
-    &--active {
-        background-color: var(--color-bg-2);
-    }
-
-    &--link {
-        color: inherit;
-
-        &--line-number {
-            font-family: 'SF Mono', monospace;
-            font-weight: 400;
-            color: var(--line-number-color);
-            min-width: 2.5rem;
-            text-align: right;
-            display: inline-block;
-            margin-right: 0.5rem;
-
-            font-style: normal;
-            font-size: 0.75rem;
-            line-height: 136%;
-        }
     }
 }
 
@@ -161,20 +200,31 @@ $group-divider-height: 0.25rem;
         overflow: scroll;
         -ms-overflow-style: none;
     }
+
     ul::-webkit-scrollbar {
         display: none;
     }
 }
 
-$card-header-height: 1.5rem;
-.card-header {
+// The nested selector is required to bump the selector specificity and resolve the issue
+// with different selector-order in the production bundle.
+// See https://github.com/sourcegraph/sourcegraph/issues/46081.
+//
+// It's not possible to use the `:where()` selector in the `CardHeader` CSS module because the
+// `typed-scss-modules` package that generates Typescript type definitions for CSS modules
+// relies on the outdated PostCSS version, which doesn't generate `:exports` statements for pseudo selectors correctly.
+// See related issues:
+// - https://github.com/skovy/typed-scss-modules/pull/166
+// - https://github.com/css-modules/css-modules-loader-core/pull/231
+/* stylelint-disable-next-line selector-max-compound-selectors */
+.panel .card-header {
     padding-top: 0.1rem;
     padding-bottom: 0.1rem;
     padding-left: 1rem;
 
     border: none;
 
-    height: $card-header-height;
+    height: var(--card-header-height);
 
     background-color: var(--body-bg);
 
@@ -184,8 +234,6 @@ $card-header-height: 1.5rem;
         padding-left: 1rem;
 
         border: none;
-
-        height: 1.8rem;
 
         background-color: var(--body-bg);
 
@@ -209,7 +257,7 @@ $card-header-height: 1.5rem;
 // Left side of the panel, including token name, filter, list of locations
 .left-sub-panel {
     flex: 1;
-    overflow: auto;
+    overflow: hidden;
     height: 100%;
     background-color: var(--body-bg);
 }
@@ -222,7 +270,7 @@ $card-header-height: 1.5rem;
 
 // Lists of locations (definitions, references, implementations) on the left
 .location-lists {
-    height: calc(100% - #{$filter-input-height} - #{$card-header-height});
+    height: calc(100% - var(--filter-input-height) - 2 * var(--filter-input-padding-y));
     overflow: auto;
 }
 
@@ -239,6 +287,6 @@ $card-header-height: 1.5rem;
     &--code {
         // The code view needs to be scrollable.
         // Its height needs to be "100% - <size-of-header-that-has-filename>"
-        height: calc(100% - #{$card-header-height});
+        height: calc(100% - var(--card-header-height));
     }
 }

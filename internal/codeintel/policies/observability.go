@@ -8,46 +8,36 @@ import (
 )
 
 type operations struct {
-	// Not used yet.
-	commitsMatchingIndexingPolicies  *observation.Operation
-	commitsMatchingRetentionPolicies *observation.Operation
-	create                           *observation.Operation
-	delete                           *observation.Operation
-	get                              *observation.Operation
-	list                             *observation.Operation
-	update                           *observation.Operation
-
-	// Configurations
-	getConfigurationPolicies *observation.Operation
+	updateConfigurationPolicy  *observation.Operation
+	getRetentionPolicyOverview *observation.Operation
+	getPreviewRepositoryFilter *observation.Operation
+	getPreviewGitObjectFilter  *observation.Operation
 }
 
-func newOperations(observationContext *observation.Context) *operations {
-	metrics := metrics.NewREDMetrics(
-		observationContext.Registerer,
-		"codeintel_policies",
-		metrics.WithLabels("op"),
-		metrics.WithCountHelp("Total number of method invocations."),
-	)
+var m = new(metrics.SingletonREDMetrics)
+
+func newOperations(observationCtx *observation.Context) *operations {
+	redMetrics := m.Get(func() *metrics.REDMetrics {
+		return metrics.NewREDMetrics(
+			observationCtx.Registerer,
+			"codeintel_policies",
+			metrics.WithLabels("op"),
+			metrics.WithCountHelp("Total number of method invocations."),
+		)
+	})
 
 	op := func(name string) *observation.Operation {
-		return observationContext.Operation(observation.Op{
+		return observationCtx.Operation(observation.Op{
 			Name:              fmt.Sprintf("codeintel.policies.%s", name),
 			MetricLabelValues: []string{name},
-			Metrics:           metrics,
+			Metrics:           redMetrics,
 		})
 	}
 
 	return &operations{
-		// Not used yet.
-		commitsMatchingIndexingPolicies:  op("CommitsMatchingIndexingPolicies"),
-		commitsMatchingRetentionPolicies: op("CommitsMatchingRetentionPolicies"),
-		create:                           op("Create"),
-		delete:                           op("Delete"),
-		get:                              op("Get"),
-		list:                             op("List"),
-		update:                           op("Update"),
-
-		// Configurations
-		getConfigurationPolicies: op("GetConfigurationPolicies"),
+		updateConfigurationPolicy:  op("UpdateConfigurationPolicy"),
+		getRetentionPolicyOverview: op("GetRetentionPolicyOverview"),
+		getPreviewRepositoryFilter: op("GetPreviewRepositoryFilter"),
+		getPreviewGitObjectFilter:  op("GetPreviewGitObjectFilter"),
 	}
 }

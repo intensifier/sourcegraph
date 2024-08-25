@@ -1,6 +1,8 @@
 package repos
 
 import (
+	"context"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies"
 	"github.com/sourcegraph/sourcegraph/internal/conf/reposource"
@@ -13,13 +15,17 @@ import (
 )
 
 // NewRustPackagesSource returns a new RustPackagesSource from the given external service.
-func NewRustPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+func NewRustPackagesSource(ctx context.Context, svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+	rawConfig, err := svc.Config.Decrypt(ctx)
+	if err != nil {
+		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
+	}
 	var c schema.RustPackagesConnection
-	if err := jsonc.Unmarshal(svc.Config, &c); err != nil {
+	if err := jsonc.Unmarshal(rawConfig, &c); err != nil {
 		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
 	}
 
-	cli, err := cf.Doer()
+	client, err := crates.NewClient(svc.URN(), cf)
 	if err != nil {
 		return nil, err
 	}
@@ -28,7 +34,7 @@ func NewRustPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*Pa
 		svc:        svc,
 		configDeps: c.Dependencies,
 		scheme:     dependencies.RustPackagesScheme,
-		src:        &rustPackagesSource{client: crates.NewClient(svc.URN(), cli)},
+		src:        &rustPackagesSource{client},
 	}, nil
 }
 
@@ -39,12 +45,13 @@ type rustPackagesSource struct {
 var _ packagesSource = &rustPackagesSource{}
 
 func (rustPackagesSource) ParseVersionedPackageFromConfiguration(dep string) (reposource.VersionedPackage, error) {
-	return reposource.ParseRustVersionedPackage(dep)
+	return reposource.ParseRustVersionedPackage(dep), nil
 }
 
 func (rustPackagesSource) ParsePackageFromName(name reposource.PackageName) (reposource.Package, error) {
-	return reposource.ParseRustPackageFromName(name)
+	return reposource.ParseRustPackageFromName(name), nil
 }
+
 func (rustPackagesSource) ParsePackageFromRepoName(repoName api.RepoName) (reposource.Package, error) {
 	return reposource.ParseRustPackageFromRepoName(repoName)
 }

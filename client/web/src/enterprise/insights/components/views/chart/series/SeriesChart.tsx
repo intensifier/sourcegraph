@@ -1,9 +1,8 @@
-import React, { SVGProps, useCallback } from 'react'
+import React, { type SVGProps, useCallback } from 'react'
 
-import { LineChart, SeriesLikeChart } from '../../../../../../charts'
-import { LineChartProps } from '../../../../../../charts/components/line-chart/LineChart'
-import { SeriesWithData } from '../../../../../../charts/components/line-chart/utils'
-import { UseSeriesToggleReturn } from '../../../../../../insights/utils/use-series-toggle'
+import { LineChart, type SeriesLikeChart, type LineChartProps } from '@sourcegraph/wildcard'
+
+import type { UseSeriesToggleReturn } from '../../../../../../insights/utils/use-series-toggle'
 import { LockedChart } from '../locked/LockedChart'
 
 export enum SeriesBasedChartTypes {
@@ -14,6 +13,7 @@ export interface SeriesChartProps<D> extends SeriesLikeChart<D>, Omit<SVGProps<S
     type: SeriesBasedChartTypes
     width: number
     height: number
+    activeSeriesId?: string
     zeroYAxisMin?: boolean
     locked?: boolean
     seriesToggleState?: UseSeriesToggleReturn
@@ -26,8 +26,11 @@ const DEFAULT_TRUE_GETTER = (): true => true
 export function SeriesChart<Datum>(props: SeriesChartProps<Datum>): React.ReactElement {
     const { series, type, locked, seriesToggleState, ...otherProps } = props
 
-    const { isSeriesHovered = DEFAULT_TRUE_GETTER, isSeriesSelected = DEFAULT_TRUE_GETTER, hoveredId } =
-        seriesToggleState || {}
+    const {
+        isSeriesHovered = DEFAULT_TRUE_GETTER,
+        isSeriesSelected = DEFAULT_TRUE_GETTER,
+        hoveredId,
+    } = seriesToggleState || {}
 
     const getOpacity = (id: string, hasActivePoint: boolean, isActive: boolean): number => {
         if (hoveredId && !isSeriesHovered(id)) {
@@ -59,14 +62,15 @@ export function SeriesChart<Datum>(props: SeriesChartProps<Datum>): React.ReactE
 
         return {
             opacity,
-            transitionProperty: 'opacity',
-            transitionDuration: '200ms',
-            transitionTimingFunction: 'ease-out',
+            // TODO: Bring this animation back when https://github.com/sourcegraph/sourcegraph/issues/40162 is resolved
+            // transitionProperty: 'opacity',
+            // transitionDuration: '200ms',
+            // transitionTimingFunction: 'ease-out',
         }
     }
 
     const getActiveSeries = useCallback(
-        <D,>(dataSeries: SeriesWithData<D>[]): SeriesWithData<D>[] =>
+        <D extends { id: string | number }>(dataSeries: D[]): D[] =>
             dataSeries.filter(series => isSeriesSelected(`${series.id}`) || isSeriesHovered(`${series.id}`)),
         [isSeriesSelected, isSeriesHovered]
     )
@@ -77,9 +81,11 @@ export function SeriesChart<Datum>(props: SeriesChartProps<Datum>): React.ReactE
 
     return (
         <LineChart
+            aria-label="Line chart"
             series={series}
             getLineGroupStyle={getHoverStyle}
             getActiveSeries={getActiveSeries}
+            activeSeriesId={seriesToggleState?.hoveredId}
             {...otherProps}
         />
     )

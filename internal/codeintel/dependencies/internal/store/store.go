@@ -1,18 +1,21 @@
 package store
 
 import (
+	"cmp"
 	"context"
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+	"slices"
 	"time"
 
+	"github.com/jackc/pgconn"
 	"github.com/keegancsmith/sqlf"
 	"github.com/lib/pq"
-	"github.com/opentracing/opentracing-go/log"
+	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/sourcegraph/sourcegraph/internal/conf/reposource"
-
-	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies/shared"
-	"github.com/sourcegraph/sourcegraph/internal/codeintel/types"
+	"github.com/sourcegraph/sourcegraph/internal/conf/reposource"
 	"github.com/sourcegraph/sourcegraph/internal/database"
 	"github.com/sourcegraph/sourcegraph/internal/database/basestore"
 	"github.com/sourcegraph/sourcegraph/internal/database/batch"
@@ -23,17 +26,20 @@ import (
 
 // Store provides the interface for package dependencies storage.
 type Store interface {
-	PreciseDependencies(ctx context.Context, repoName, commit string) (deps map[api.RepoName]types.RevSpecSet, err error)
-	PreciseDependents(ctx context.Context, repoName, commit string) (deps map[api.RepoName]types.RevSpecSet, err error)
-	LockfileDependencies(ctx context.Context, opts LockfileDependenciesOpts) (deps []shared.PackageDependency, found bool, err error)
-	UpsertLockfileGraph(ctx context.Context, repoName, commit, lockfile string, deps []shared.PackageDependency, graph shared.DependencyGraph) (err error)
-	SelectRepoRevisionsToResolve(ctx context.Context, batchSize int, minimumCheckInterval time.Duration) (_ map[string][]string, err error)
-	UpdateResolvedRevisions(ctx context.Context, repoRevsToResolvedRevs map[string]map[string]string) (err error)
-	LockfileDependents(ctx context.Context, repoName, commit string) (deps []api.RepoCommit, err error)
-	ListDependencyRepos(ctx context.Context, opts ListDependencyReposOpts) (dependencyRepos []shared.Repo, err error)
-	UpsertDependencyRepos(ctx context.Context, deps []shared.Repo) (newDeps []shared.Repo, err error)
-	DeleteDependencyReposByID(ctx context.Context, ids ...int) (err error)
-	ListLockfileIndexes(ctx context.Context, opts ListLockfileIndexesOpts) (indexes []shared.LockfileIndex, totalCount int, err error)
+	WithTransact(context.Context, func(Store) error) error
+
+	ListPackageRepoRefs(ctx context.Context, opts ListDependencyReposOpts) (dependencyRepos []shared.PackageRepoReference, total int, hasMore bool, err error)
+	InsertPackageRepoRefs(ctx context.Context, deps []shared.MinimalPackageRepoRef) (newDeps []shared.PackageRepoReference, newVersions []shared.PackageRepoRefVersion, err error)
+	DeletePackageRepoRefsByID(ctx context.Context, ids ...int) (err error)
+	DeletePackageRepoRefVersionsByID(ctx context.Context, ids ...int) (err error)
+
+	ListPackageRepoRefFilters(ctx context.Context, opts ListPackageRepoRefFiltersOpts) ([]shared.PackageRepoFilter, bool, error)
+	CreatePackageRepoFilter(ctx context.Context, input shared.MinimalPackageFilter) (filter *shared.PackageRepoFilter, err error)
+	UpdatePackageRepoFilter(ctx context.Context, input shared.PackageRepoFilter) (err error)
+	DeletePacakgeRepoFilter(ctx context.Context, id int) (err error)
+
+	ShouldRefilterPackageRepoRefs(ctx context.Context) (exists bool, err error)
+	UpdateAllBlockedStatuses(ctx context.Context, pkgs []shared.PackageRepoReference, startTime time.Time) (pkgsUpdated, versionsUpdated int, err error)
 }
 
 // store manages the database tables for package dependencies.
@@ -43,791 +49,387 @@ type store struct {
 }
 
 // New returns a new store.
-func New(db database.DB, op *observation.Context) *store {
+func New(op *observation.Context, db database.DB) *store {
 	return &store{
 		db:         basestore.NewWithHandle(db.Handle()),
 		operations: newOperations(op),
 	}
 }
 
-// PreciseDependencies returns package dependencies from precise indexes. It is assumed that
-// the given commit is the canonical 40-character hash.
-func (s *store) PreciseDependencies(ctx context.Context, repoName, commit string) (deps map[api.RepoName]types.RevSpecSet, err error) {
-	ctx, _, endObservation := s.operations.preciseDependencies.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("repoName", repoName),
-		log.String("commit", commit),
-	}})
-	defer endObservation(1, observation.Args{})
-
-	return scanRepoRevSpecSets(s.db.Query(ctx, sqlf.Sprintf(preciseDependenciesQuery, repoName, commit)))
-}
-
-const preciseDependenciesQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:PreciseDependencies
-SELECT pr.name, pu.commit
-FROM lsif_packages lp
-JOIN lsif_uploads pu ON pu.id = lp.dump_id
-JOIN repo pr ON pr.id = pu.repository_id
-JOIN lsif_references lr ON lr.scheme = lp.scheme AND lr.name = lp.name AND lr.version = lp.version
-JOIN lsif_uploads ru ON ru.id = lr.dump_id
-JOIN repo rr ON rr.id = ru.repository_id
-WHERE rr.name = %s AND ru.commit = %s
-`
-
-// PreciseDependents returns package dependents from precise indexes. It is assumed that
-// the given commit is the canonical 40-character hash.
-func (s *store) PreciseDependents(ctx context.Context, repoName, commit string) (deps map[api.RepoName]types.RevSpecSet, err error) {
-	ctx, _, endObservation := s.operations.preciseDependents.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("repoName", repoName),
-		log.String("commit", commit),
-	}})
-	defer endObservation(1, observation.Args{})
-
-	return scanRepoRevSpecSets(s.db.Query(ctx, sqlf.Sprintf(preciseDependentsQuery, repoName, commit)))
-}
-
-const preciseDependentsQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:PreciseDependents
-SELECT rr.name, ru.commit
-FROM lsif_packages lp
-JOIN lsif_uploads pu ON pu.id = lp.dump_id
-JOIN repo pr ON pr.id = pu.repository_id
-JOIN lsif_references lr ON lr.scheme = lp.scheme AND lr.name = lp.name AND lr.version = lp.version
-JOIN lsif_uploads ru ON ru.id = lr.dump_id
-JOIN repo rr ON rr.id = ru.repository_id
-WHERE pr.name = %s AND pu.commit = %s
-`
-
-type LockfileDependenciesOpts struct {
-	RepoName string
-	Commit   string
-
-	// IncludeTransitive determines whether transitive dependencies are included in the result.
-	// NOTE: if a lockfile doesn't allow us to distinguish between
-	// transitive/direct all of the dependencies are persisted as direct
-	// dependencies.
-	IncludeTransitive bool
-
-	// Lockfile, if specified, causes only dependencies from that lockfile to
-	// be included.
-	Lockfile string
-}
-
-// LockfileDependencies returns package dependencies from a previous lockfiles result for
-// the given repository and commit. It is assumed that the given commit is the canonical
-// 40-character hash.
-func (s *store) LockfileDependencies(ctx context.Context, opts LockfileDependenciesOpts) (deps []shared.PackageDependency, found bool, err error) {
-	ctx, _, endObservation := s.operations.lockfileDependencies.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("repoName", opts.RepoName),
-		log.String("commit", opts.Commit),
-	}})
-	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Bool("found", found),
-			log.Int("numDeps", len(deps)),
-		}})
-	}()
-
-	tx, err := s.Transact(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	defer func() { err = tx.db.Done(err) }()
-
-	deps, err = scanPackageDependencies(tx.db.Query(ctx, lockfileDependenciesQuery(opts)))
-	if err != nil {
-		return nil, false, err
-	}
-	if len(deps) == 0 {
-		// No dependencies were found, but we could have already written a record
-		// that just had an empty references list. Check to see if this is the case
-		// so we don't attempt to re-parse the lockfiles of this repo/commit from the
-		// dependencies service.
-		_, found, err = basestore.ScanFirstInt(tx.db.Query(ctx, sqlf.Sprintf(
-			lockfileDependenciesExistsQuery,
-			opts.RepoName,
-			dbutil.CommitBytea(opts.Commit),
-		)))
-
-		return nil, found, err
-	}
-
-	return deps, true, nil
-}
-
-func lockfileDependenciesQuery(opts LockfileDependenciesOpts) *sqlf.Query {
-	maxDependencyLevel := 0
-	if opts.IncludeTransitive {
-		// TODO: We should improve SQL here to falsify instead of using this limit
-		maxDependencyLevel = 9999
-	}
-
-	// predicates to find the row in codeintel_lockfiles from which we get the dependencies
-	lockfilesPreds := []*sqlf.Query{
-		sqlf.Sprintf("repository_id = (SELECT id FROM repo WHERE name = %s)", opts.RepoName),
-		sqlf.Sprintf("commit_bytea = %s", dbutil.CommitBytea(opts.Commit)),
-	}
-
-	if opts.Lockfile != "" {
-		lockfilesPreds = append(lockfilesPreds, sqlf.Sprintf("lockfile = %s", opts.Lockfile))
-	}
-
-	return sqlf.Sprintf(
-		lockfileDependenciesQueryFmtStr,
-		maxDependencyLevel,
-		sqlf.Join(lockfilesPreds, "\n AND "),
-	)
-}
-
-const lockfileDependenciesQueryFmtStr = `
--- source: internal/codeintel/dependencies/internal/store/store.go:LockfileDependencies
-WITH RECURSIVE dependencies(id, resolution_repository_id, resolution_commit_bytea, resolution_lockfile, depends_on, level, max_level) AS (
-  SELECT
-    id, resolution_repository_id, resolution_commit_bytea, resolution_lockfile, depends_on, 0 AS level, %s::int AS max_level
-  FROM
-    codeintel_lockfile_references
-  WHERE
-    id IN (
-      SELECT
-        unnest(codeintel_lockfile_reference_ids)
-      FROM
-        codeintel_lockfiles
-      WHERE
-	    %s -- lockfilePreds
-    )
-
-  UNION ALL
-
-  SELECT
-    lr.id, lr.resolution_repository_id, lr.resolution_commit_bytea, lr.resolution_lockfile, lr.depends_on, (d.level+1) AS level, d.max_level
-  FROM
-    codeintel_lockfile_references lr
-  JOIN dependencies d ON (
-	  lr.id = ANY (d.depends_on) AND
-	  lr.resolution_repository_id = d.resolution_repository_id AND
-	  lr.resolution_commit_bytea = d.resolution_commit_bytea AND
-	  lr.resolution_lockfile = d.resolution_lockfile
-  )
-  WHERE
-    level < d.max_level
-)
-SELECT
-  -- We could also select dependencies.level here
-  lr.repository_name,
-  lr.revspec,
-  lr.package_scheme,
-  lr.package_name,
-  lr.package_version
-FROM
-  dependencies, codeintel_lockfile_references lr
-WHERE
-  dependencies.id = lr.id
-ORDER BY lr.package_name
-`
-
-const lockfileDependenciesExistsQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:LockfileDependencies
-SELECT 1
-FROM codeintel_lockfiles
-WHERE repository_id = (SELECT id FROM repo WHERE name = %s) AND commit_bytea = %s
-`
-
-// populatePackageDependencyChannel populates a channel with the given dependencies for bulk insertion.
-func populatePackageDependencyChannel(deps []shared.PackageDependency, lockfile, commit string) <-chan []any {
-	ch := make(chan []any, len(deps))
-
-	go func() {
-		defer close(ch)
-
-		for _, dep := range deps {
-			ch <- []any{
-				dep.RepoName(),
-				dep.GitTagFromVersion(),
-				dep.Scheme(),
-				dep.PackageSyntax(),
-				dep.PackageVersion(),
-				pq.Array([]int{}),
-				lockfile,
-				dbutil.CommitBytea(commit),
-			}
-		}
-	}()
-
-	return ch
-}
-
-// UpsertLockfileGraph insert the given `deps` as `codeintel_lockfile_references`
-// and creates an entry in `codeintel_lockfiles` with the given `repoName`,
-// `commit`, `lockfile` that references the inserted `deps`.
-//
-// If `graph` is not nil, only the direct dependencies are referenced in the
-// `codeintel_lockfiles` entry and the full graph is represented in
-// `codeintel_lockfile_references` as edges in the `depends_on` column.
-func (s *store) UpsertLockfileGraph(ctx context.Context, repoName, commit, lockfile string, deps []shared.PackageDependency, graph shared.DependencyGraph) (err error) {
-	ctx, _, endObservation := s.operations.upsertLockfileGraph.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("repoName", repoName),
-		log.String("commit", commit),
-	}})
-	defer endObservation(1, observation.Args{})
-
-	tx, err := s.Transact(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { err = tx.db.Done(err) }()
-
-	if err := tx.db.Exec(ctx, sqlf.Sprintf(temporaryLockfileReferencesTableQuery)); err != nil {
-		return err
-	}
-
-	//
-	// Step 1: Insert all packages into codeintel_lockfile_references table,
-	//         return their names and IDs.
-	//
-	if err := batch.InsertValues(
-		ctx,
-		tx.db.Handle(),
-		"t_codeintel_lockfile_references",
-		batch.MaxNumPostgresParameters,
-		[]string{
-			"repository_name",
-			"revspec",
-			"package_scheme",
-			"package_name",
-			"package_version",
-			"depends_on",
-			"resolution_lockfile",
-			"resolution_commit_bytea",
-			// resolution_repository_id missing because we don't insert that
-			// into the temp table and instead do a sub-select to get the repo
-			// ID.
-		},
-		populatePackageDependencyChannel(deps, lockfile, commit),
-	); err != nil {
-		return err
-	}
-
-	// Get IDs and name->ID mapping for upserted packages
-	nameIDs, ids, err := scanIdNames(tx.db.Query(ctx, sqlf.Sprintf(upsertLockfileReferencesQuery, repoName, repoName)))
-	if err != nil {
-		return err
-	}
-
-	// If we don't have a graph, we insert all of the dependencies as direct
-	// dependencies and return.
-	if graph == nil {
-		idsArray := pq.Array(ids)
-		return tx.db.Exec(ctx, sqlf.Sprintf(
-			insertLockfilesQuery,
-			dbutil.CommitBytea(commit),
-			idsArray,
-			lockfile,
-			shared.IndexFidelityFlat,
-			repoName,
-			idsArray,
-		))
-	}
-
-	//
-	// Step 2: Collect all the dependencies (i.e. A depends on B, C, D;
-	//         B depends on E, F) and map them to database IDs.
-	//
-	dependencies := make(map[int][]int)
-	for _, edge := range graph.AllEdges() {
-		sourceName, targetName := edge[0].PackageSyntax(), edge[1].PackageSyntax()
-
-		sourceID, ok := nameIDs[sourceName]
-		if !ok {
-			return errors.Newf("id for source %s not found", sourceName)
-		}
-
-		targetID, ok := nameIDs[targetName]
-		if !ok {
-			return errors.Newf("id for target %s not found", sourceName)
-		}
-
-		if ids, ok := dependencies[sourceID]; !ok {
-			dependencies[sourceID] = []int{targetID}
-		} else {
-			dependencies[sourceID] = append(ids, targetID)
-		}
-	}
-
-	// Insert edges into DB. TODO: We could/should batch this
-	for source, targets := range dependencies {
-		if err := tx.db.Exec(ctx, sqlf.Sprintf(
-			insertLockfilesEdgesQuery,
-			pq.Array(targets),
-			source,
-			repoName,
-			dbutil.CommitBytea(commit),
-			lockfile,
-		)); err != nil {
-			return err
-		}
-	}
-
-	//
-	// Step 3: Insert codeintel_lockfile entry, pointing to the rootIDs of the
-	//         graph (i.e. direct dependencies)
-	//
-	var (
-		roots, rootsUndeterminable = graph.Roots()
-		rootIDs                    = make([]int, len(roots))
-	)
-	for i, r := range roots {
-		name := r.PackageSyntax()
-		id, ok := nameIDs[name]
-		if !ok {
-			return errors.Newf("id for root %s not found", name)
-		}
-		rootIDs[i] = id
-	}
-
-	fidelity := shared.IndexFidelityGraph
-	if rootsUndeterminable {
-		fidelity = shared.IndexFidelityCircular
-	}
-
-	idsArray := pq.Array(rootIDs)
-	return tx.db.Exec(ctx, sqlf.Sprintf(
-		insertLockfilesQuery,
-		dbutil.CommitBytea(commit),
-		idsArray,
-		lockfile,
-		fidelity,
-		repoName,
-		idsArray,
-	))
-}
-
-const temporaryLockfileReferencesTableQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:UpsertLockfileGraph
-CREATE TEMPORARY TABLE t_codeintel_lockfile_references (
-	repository_name text NOT NULL,
-	revspec text NOT NULL,
-	package_scheme text NOT NULL,
-	package_name text NOT NULL,
-	package_version text NOT NULL,
-	depends_on integer[] NOT NULL,
-	resolution_lockfile text NOT NULL,
-	resolution_commit_bytea bytea NOT NULL
-) ON COMMIT DROP
-`
-
-const upsertLockfileReferencesQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:UpsertLockfileGraph
-WITH ins AS (
-	INSERT INTO codeintel_lockfile_references (repository_name, revspec, package_scheme, package_name, package_version, depends_on, resolution_lockfile, resolution_repository_id, resolution_commit_bytea)
-	SELECT repository_name, revspec, package_scheme, package_name, package_version, depends_on, resolution_lockfile, (SELECT id FROM repo WHERE name = %s), resolution_commit_bytea
-	FROM t_codeintel_lockfile_references
-	ON CONFLICT DO NOTHING
-	RETURNING id, package_name
-),
-duplicates AS (
-	SELECT r.id, r.package_name
-	FROM t_codeintel_lockfile_references t
-	JOIN codeintel_lockfile_references r
-	ON
-		r.repository_name = t.repository_name AND
-		r.revspec = t.revspec AND
-		r.package_scheme = t.package_scheme AND
-		r.package_name = t.package_name AND
-		r.package_version = t.package_version AND
-		r.resolution_lockfile = t.resolution_lockfile AND
-		r.resolution_repository_id = (SELECT id FROM repo WHERE name = %s) AND
-		r.resolution_commit_bytea = t.resolution_commit_bytea
-		-- We ignore depends_on since that is updated in a second query and we can't use it to compare
-)
-SELECT id, package_name FROM ins UNION
-SELECT id, package_name FROM duplicates
-ORDER BY id
-`
-
-const insertLockfilesQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:UpsertLockfileGraph
-INSERT INTO codeintel_lockfiles (
-	repository_id,
-	commit_bytea,
-	codeintel_lockfile_reference_ids,
-	lockfile,
-	fidelity
-)
-SELECT id, %s, %s, %s, %s
-FROM repo
-WHERE name = %s
--- Last write wins
-ON CONFLICT (repository_id, commit_bytea, lockfile) DO UPDATE
-SET codeintel_lockfile_reference_ids = %s
-`
-
-const insertLockfilesEdgesQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:UpsertLockfileGraph
-UPDATE codeintel_lockfile_references
-SET depends_on = %s
-WHERE
-	id = %s
-AND resolution_repository_id = (SELECT id FROM repo WHERE name = %s)
-AND resolution_commit_bytea = %s
-AND resolution_lockfile = %s
-`
-
-// SelectRepoRevisionsToResolve selects the references lockfile packages to
-// possibly resolve them to repositories on the Sourcegraph instance.
-func (s *store) SelectRepoRevisionsToResolve(ctx context.Context, batchSize int, minimumCheckInterval time.Duration) (_ map[string][]string, err error) {
-	return s.selectRepoRevisionsToResolve(ctx, batchSize, minimumCheckInterval, time.Now())
-}
-
-func (s *store) selectRepoRevisionsToResolve(ctx context.Context, batchSize int, minimumCheckInterval time.Duration, now time.Time) (_ map[string][]string, err error) {
-	var count int
-	ctx, _, endObservation := s.operations.selectRepoRevisionsToResolve.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{
-		LogFields: []log.Field{
-			log.Int("count", count),
-		},
+func (s *store) WithTransact(ctx context.Context, f func(tx Store) error) error {
+	return s.db.WithTransact(ctx, func(tx *basestore.Store) error {
+		return f(&store{
+			db:         tx,
+			operations: s.operations,
+		})
 	})
-
-	rows, err := s.db.Query(ctx, sqlf.Sprintf(selectRepoRevisionsToResolveQuery, now, int64(minimumCheckInterval/time.Hour), batchSize, now))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { err = basestore.CloseRows(rows, err) }()
-
-	m := map[string][]string{}
-	for rows.Next() {
-		var repositoryName, commit string
-		if err := rows.Scan(&repositoryName, &commit); err != nil {
-			return nil, err
-		}
-
-		count++
-		m[repositoryName] = append(m[repositoryName], commit)
-	}
-
-	return m, nil
 }
 
-const selectRepoRevisionsToResolveQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:SelectRepoRevisionsToResolve
-WITH candidates AS (
-	SELECT
-		repository_name,
-		revspec
-	FROM codeintel_lockfile_references
-	WHERE
-		last_check_at IS NULL OR
-		%s - last_check_at >= (%s * '1 hour'::interval)
-	GROUP BY repository_name, revspec
-	ORDER BY repository_name, revspec
-	-- TODO - select for update to reduce contention
-	LIMIT %s
-),
-updated AS (
-	UPDATE codeintel_lockfile_references
-	SET last_check_at = %s
-	WHERE (repository_name, revspec) IN (SELECT * FROM candidates)
+type fuzziness int
+
+const (
+	FuzzinessExactMatch fuzziness = iota
+	FuzzinessWildcard
+	FuzzinessRegex
 )
-SELECT * FROM candidates
-`
-
-// UpdateResolvedRevisions updates the lockfile packages that were resolved to
-// repositories/revisions pairs on the Sourcegraph instance.
-func (s *store) UpdateResolvedRevisions(ctx context.Context, repoRevsToResolvedRevs map[string]map[string]string) (err error) {
-	ctx, _, endObservation := s.operations.updateResolvedRevisions.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	for repoName, resolvedRevs := range repoRevsToResolvedRevs {
-		for commit, resolvedCommit := range resolvedRevs {
-			// TODO - batch these updates
-			if err := s.db.Exec(ctx, sqlf.Sprintf(
-				updateResolvedRevisionsQuery,
-				repoName,
-				dbutil.CommitBytea(resolvedCommit),
-				repoName,
-				commit,
-			)); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-const updateResolvedRevisionsQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:UpdateResolvedRevisions
-UPDATE
-	codeintel_lockfile_references
-SET
-	repository_id = (SELECT id FROM repo WHERE name = %s),
-	commit_bytea = %s
-WHERE
-	repository_name = %s AND
-	revspec = %s
--- TODO - order before update to reduce contention
-`
-
-// LockfileDependents returns the set of repositories that have lockfile results pointing to the
-// given repo and commit (related to a particular resolved repo/commit of a lockfile reference).
-func (s *store) LockfileDependents(ctx context.Context, repoName, commit string) (deps []api.RepoCommit, err error) {
-	ctx, _, endObservation := s.operations.lockfileDependents.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("repoName", repoName),
-		log.String("commit", commit),
-	}})
-	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("numDependencies", len(deps)),
-		}})
-	}()
-
-	return scanRepoCommits(s.db.Query(ctx, sqlf.Sprintf(lockfileDependentsQuery, repoName, dbutil.CommitBytea(commit))))
-}
-
-// TODO: This only returns direct dependents
-const lockfileDependentsQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:LockfileDependents
-SELECT r.name, encode(lf.commit_bytea, 'hex') AS commit
-FROM codeintel_lockfile_references lr
-JOIN codeintel_lockfiles lf ON lf.codeintel_lockfile_reference_ids @> ARRAY [lr.id]
-JOIN repo r ON r.id = lf.repository_id
-JOIN repo rr ON rr.id = lr.repository_id
-WHERE rr.name = %s AND lr.commit_bytea = %s
-ORDER BY r.name, lf.commit_bytea
-`
 
 // ListDependencyReposOpts are options for listing dependency repositories.
 type ListDependencyReposOpts struct {
-	Scheme          string
-	Name            reposource.PackageName
-	After           any
-	Limit           int
-	NewestFirst     bool
-	ExcludeVersions bool
+	Scheme         string
+	Name           reposource.PackageName
+	Fuzziness      fuzziness
+	After          int
+	Limit          int
+	IncludeBlocked bool
 }
 
 // ListDependencyRepos returns dependency repositories to be synced by gitserver.
-func (s *store) ListDependencyRepos(ctx context.Context, opts ListDependencyReposOpts) (dependencyRepos []shared.Repo, err error) {
-	ctx, _, endObservation := s.operations.listDependencyRepos.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("scheme", opts.Scheme),
+func (s *store) ListPackageRepoRefs(ctx context.Context, opts ListDependencyReposOpts) (dependencyRepos []shared.PackageRepoReference, total int, hasMore bool, err error) {
+	ctx, _, endObservation := s.operations.listPackageRepoRefs.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("scheme", opts.Scheme),
 	}})
 	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("numDependencyRepos", len(dependencyRepos)),
+		endObservation(1, observation.Args{Attrs: []attribute.KeyValue{
+			attribute.Int("numDependencyRepos", len(dependencyRepos)),
 		}})
 	}()
 
-	sortExpr := "id ASC"
-	switch {
-	case opts.NewestFirst && !opts.ExcludeVersions:
-		sortExpr = "id DESC"
-	case opts.ExcludeVersions:
-		sortExpr = "name ASC"
-	}
-
-	selectCols := sqlf.Sprintf("id, scheme, name, version")
-	if opts.ExcludeVersions {
-		// id is likely not stable here, so no one should actually use it. Should we set it to 0?
-		selectCols = sqlf.Sprintf("DISTINCT ON(name) id, scheme, name, '' AS version")
-	}
-
-	return scanDependencyRepos(s.db.Query(ctx, sqlf.Sprintf(
-		listDependencyReposQuery,
-		selectCols,
-		sqlf.Join(makeListDependencyReposConds(opts), "AND"),
-		sqlf.Sprintf(sortExpr),
-		makeLimit(opts.Limit),
-	)))
-}
-
-const listDependencyReposQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:ListDependencyRepos
-SELECT %s
-FROM lsif_dependency_repos
-WHERE %s
-ORDER BY %s
-%s
-`
-
-func makeListDependencyReposConds(opts ListDependencyReposOpts) []*sqlf.Query {
-	conds := make([]*sqlf.Query, 0, 3)
-	conds = append(conds, sqlf.Sprintf("scheme = %s", opts.Scheme))
+	orderBy := sqlf.Sprintf("ORDER BY lr.id ASC")
 
 	if opts.Name != "" {
-		conds = append(conds, sqlf.Sprintf("name = %s", opts.Name))
+		// this ordering ensures that the exact match will always be first on the list
+		orderBy = sqlf.Sprintf("ORDER BY (CASE WHEN lr.name = %s THEN 1 ELSE 2 END) ASC, lr.id ASC", opts.Name)
 	}
 
-	switch after := opts.After.(type) {
-	case nil:
-		break
-	case int:
-		switch {
-		case opts.ExcludeVersions:
-			panic("cannot set ExcludeVersions and pass ID-based offset")
-		case opts.NewestFirst && after > 0:
-			conds = append(conds, sqlf.Sprintf("id < %s", opts.After))
-		case !opts.NewestFirst && after > 0:
-			conds = append(conds, sqlf.Sprintf("id > %s", opts.After))
-		}
-	case string, reposource.PackageName:
-		switch {
-		case opts.NewestFirst:
-			panic("cannot set NewestFirst and pass name-based offset")
-		case opts.ExcludeVersions && after != "":
-			conds = append(conds, sqlf.Sprintf("name > %s", opts.After))
+	query := sqlf.Sprintf(
+		listDependencyReposQuery,
+		sqlf.Sprintf(groupedVersionedPackageReposColumns),
+		sqlf.Join([]*sqlf.Query{makeListDependencyReposConds(opts), makeOffset(opts.After)}, "AND"),
+		sqlf.Sprintf("GROUP BY lr.id"),
+		orderBy,
+		makeLimit(opts.Limit),
+	)
+	dependencyRepos, err = basestore.NewSliceScanner(scanDependencyRepoWithVersions)(s.db.Query(ctx, query))
+	if err != nil {
+		return nil, 0, false, errors.Wrap(err, "error listing dependency repos")
+	}
+
+	if opts.Limit != 0 && len(dependencyRepos) > opts.Limit {
+		dependencyRepos = dependencyRepos[:opts.Limit]
+		hasMore = true
+	}
+
+	query = sqlf.Sprintf(
+		listDependencyReposQuery,
+		sqlf.Sprintf("COUNT(DISTINCT(lr.id))"),
+		makeListDependencyReposConds(opts),
+		sqlf.Sprintf(""),
+		sqlf.Sprintf(""),
+		sqlf.Sprintf("LIMIT ALL"),
+	)
+	totalCount, _, err := basestore.ScanFirstInt(s.db.Query(ctx, query))
+	if err != nil {
+		return nil, 0, false, errors.Wrap(err, "error counting dependency repos")
+	}
+
+	return dependencyRepos, totalCount, hasMore, err
+}
+
+const groupedVersionedPackageReposColumns = `
+	lr.id,
+	lr.scheme,
+	lr.name,
+	lr.blocked,
+	lr.last_checked_at,
+	array_agg(prv.id ORDER BY prv.id) as vid,
+	array_agg(prv.version ORDER BY prv.id) as version,
+	array_agg(prv.blocked ORDER BY prv.id) as vers_blocked,
+	array_agg(prv.last_checked_at ORDER BY prv.id) as vers_last_checked_at
+`
+
+const listDependencyReposQuery = `
+SELECT %s
+FROM lsif_dependency_repos lr
+JOIN LATERAL (
+    SELECT id, package_id, version, blocked, last_checked_at
+    FROM package_repo_versions
+    WHERE package_id = lr.id
+    ORDER BY id
+) prv
+ON lr.id = prv.package_id
+WHERE %s
+%s -- group by
+%s -- order by
+%s -- limit
+`
+
+func makeListDependencyReposConds(opts ListDependencyReposOpts) *sqlf.Query {
+	conds := make([]*sqlf.Query, 0, 4)
+
+	if opts.Scheme != "" {
+		conds = append(conds, sqlf.Sprintf("scheme = %s", opts.Scheme))
+	}
+
+	if opts.Name != "" {
+		switch opts.Fuzziness {
+		case FuzzinessExactMatch:
+			conds = append(conds, sqlf.Sprintf("name = %s", opts.Name))
+		case FuzzinessWildcard:
+			conds = append(conds, sqlf.Sprintf("name LIKE ('%%%%' || %s || '%%%%')", opts.Name))
+		case FuzzinessRegex:
+			conds = append(conds, sqlf.Sprintf("name ~ %s", opts.Name))
 		}
 	}
 
-	return conds
+	if !opts.IncludeBlocked {
+		conds = append(conds, sqlf.Sprintf("lr.blocked <> true AND prv.blocked <> true"))
+	}
+
+	if len(conds) > 0 {
+		return sqlf.Sprintf("%s", sqlf.Join(conds, "AND"))
+	}
+
+	return sqlf.Sprintf("TRUE")
 }
 
 func makeLimit(limit int) *sqlf.Query {
 	if limit == 0 {
-		return sqlf.Sprintf("")
+		return sqlf.Sprintf("LIMIT ALL")
+	}
+	// + 1 to check if more pages
+	return sqlf.Sprintf("LIMIT %s", limit+1)
+}
+
+func makeOffset(id int) *sqlf.Query {
+	if id > 0 {
+		return sqlf.Sprintf("lr.id > %s", id)
 	}
 
-	return sqlf.Sprintf("LIMIT %s", limit)
+	return sqlf.Sprintf("TRUE")
 }
 
-// ListLockfileIndexesOpts are options for listing lockfile indexes.
-type ListLockfileIndexesOpts struct {
-	RepoName string
-	Commit   string
-	Lockfile string
-
-	After int
-	Limit int
-}
-
-// ListLockfileIndexes returns lockfile indexes.
-func (s *store) ListLockfileIndexes(ctx context.Context, opts ListLockfileIndexesOpts) (indexes []shared.LockfileIndex, totalCount int, err error) {
-	ctx, _, endObservation := s.operations.listLockfileIndexes.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.String("repoName", opts.RepoName),
-		log.String("commit", opts.Commit),
-		log.String("lockfile", opts.Commit),
-		log.Int("after", opts.After),
-		log.Int("limit", opts.Limit),
+// InsertDependencyRepos creates the given dependency repos if they don't yet exist. The values that did not exist previously are returned.
+// [{npm, @types/nodejs, [v0.0.1]}, {npm, @types/nodejs, [v0.0.2]}] will be collapsed into [{npm, @types/nodejs, [v0.0.1, v0.0.2]}]
+func (s *store) InsertPackageRepoRefs(ctx context.Context, deps []shared.MinimalPackageRepoRef) (newDeps []shared.PackageRepoReference, newVersions []shared.PackageRepoRefVersion, err error) {
+	ctx, _, endObservation := s.operations.insertPackageRepoRefs.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("numInputDeps", len(deps)),
 	}})
 	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("numIndexes", len(indexes)),
-			log.Int("totalCount", totalCount),
+		endObservation(1, observation.Args{Attrs: []attribute.KeyValue{
+			attribute.Int("newDependencies", len(newDeps)),
+			attribute.Int("newVersion", len(newVersions)),
+			attribute.Int("numDedupedDeps", len(deps)),
 		}})
 	}()
+
+	if len(deps) == 0 {
+		return
+	}
+
+	slices.SortStableFunc(deps, func(a, b shared.MinimalPackageRepoRef) int {
+		if a.Scheme != b.Scheme {
+			return cmp.Compare(a.Scheme, b.Scheme)
+		}
+
+		return cmp.Compare(a.Name, b.Name)
+	})
+
+	// first reduce
+	var lastCommon int
+	for i, dep := range deps[1:] {
+		if dep.Name == deps[lastCommon].Name && dep.Scheme == deps[lastCommon].Scheme {
+			deps[lastCommon].Versions = append(deps[lastCommon].Versions, dep.Versions...)
+			deps[i+1] = shared.MinimalPackageRepoRef{}
+		} else {
+			lastCommon = i + 1
+		}
+	}
+
+	// then collapse
+	nonDupes := deps[:0]
+	for _, dep := range deps {
+		if dep.Name != "" && dep.Scheme != "" {
+			nonDupes = append(nonDupes, dep)
+		}
+	}
+	// replace the originals :wave
+	deps = nonDupes
 
 	tx, err := s.db.Transact(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
-	defer func() { err = tx.Done(err) }()
-
-	totalCount, err = basestore.ScanInt(tx.QueryRow(ctx, sqlf.Sprintf(
-		countLockfileIndexesQuery,
-		sqlf.Join(makeListLockfileIndexesConds(opts, true), "AND"),
-	)))
-	if err != nil {
-		return nil, 0, err
-	}
-
-	indexes, err = scanLockfileIndexes(tx.Query(ctx, sqlf.Sprintf(
-		listLockfileIndexesQuery,
-		sqlf.Join(makeListLockfileIndexesConds(opts, false), "AND"),
-		makeLimit(opts.Limit),
-	)))
-	return indexes, totalCount, err
-}
-
-const listLockfileIndexesQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:ListLockfileIndexes
-SELECT id, repository_id, commit_bytea, codeintel_lockfile_reference_ids, lockfile, fidelity
-FROM codeintel_lockfiles
-WHERE %s
-ORDER BY id ASC
-%s
-`
-
-const countLockfileIndexesQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:CountLockfileIndexes
-SELECT COUNT(1)
-FROM codeintel_lockfiles
-WHERE %s
-`
-
-func makeListLockfileIndexesConds(opts ListLockfileIndexesOpts, forCount bool) []*sqlf.Query {
-	conds := make([]*sqlf.Query, 0, 2)
-
-	if opts.RepoName != "" {
-		conds = append(conds, sqlf.Sprintf("repository_id IN (SELECT id FROM repo WHERE name = %s)", opts.RepoName))
-	}
-
-	if opts.Commit != "" {
-		conds = append(conds, sqlf.Sprintf("commit_bytea = %s", dbutil.CommitBytea(opts.Commit)))
-	}
-
-	if opts.Lockfile != "" {
-		conds = append(conds, sqlf.Sprintf("lockfile = %s", opts.Lockfile))
-	}
-
-	if opts.After != 0 && !forCount {
-		conds = append(conds, sqlf.Sprintf("id > %s", opts.After))
-	}
-
-	if len(conds) == 0 {
-		conds = append(conds, sqlf.Sprintf("TRUE"))
-	}
-
-	return conds
-}
-
-// UpsertDependencyRepos creates the given dependency repos if they don't yet exist. The values
-// that did not exist previously are returned.
-func (s *store) UpsertDependencyRepos(ctx context.Context, deps []shared.Repo) (newDeps []shared.Repo, err error) {
-	ctx, _, endObservation := s.operations.upsertDependencyRepos.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.Int("numDeps", len(deps)),
-	}})
 	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("numNewDeps", len(newDeps)),
-		}})
+		err = tx.Done(err)
 	}()
 
-	callback := func(inserter *batch.Inserter) error {
-		for _, dep := range deps {
-			if err := inserter.Insert(ctx, dep.Scheme, dep.Name, dep.Version); err != nil {
-				return err
-			}
+	for _, tempTableQuery := range []string{temporaryPackageRepoRefsTableQuery, temporaryPackageRepoRefVersionsTableQuery} {
+		if err := tx.Exec(ctx, sqlf.Sprintf(tempTableQuery)); err != nil {
+			return nil, nil, errors.Wrap(err, "failed to create temporary tables")
 		}
-
-		return nil
 	}
 
-	returningScanner := func(rows dbutil.Scanner) error {
-		dependencyRepo, err := scanDependencyRepo(rows)
-		if err != nil {
-			return err
-		}
-
-		newDeps = append(newDeps, dependencyRepo)
-		return nil
-	}
-
-	err = batch.WithInserterWithReturn(
+	err = batch.WithInserter(
 		ctx,
-		s.db.Handle(),
-		"lsif_dependency_repos",
+		tx.Handle(),
+		"t_package_repo_refs",
 		batch.MaxNumPostgresParameters,
-		[]string{"scheme", "name", "version"},
-		"ON CONFLICT DO NOTHING",
-		[]string{"id", "scheme", "name", "version"},
-		returningScanner,
-		callback,
+		[]string{"scheme", "name", "blocked", "last_checked_at"},
+		func(inserter *batch.Inserter) error {
+			for _, pkg := range deps {
+				if err := inserter.Insert(ctx, pkg.Scheme, pkg.Name, pkg.Blocked, pkg.LastCheckedAt); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
 	)
-	return newDeps, err
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to insert package repos in temporary table")
+	}
+
+	newDeps, err = basestore.NewSliceScanner(func(rows dbutil.Scanner) (dep shared.PackageRepoReference, err error) {
+		err = rows.Scan(&dep.ID, &dep.Scheme, &dep.Name, &dep.Blocked, &dep.LastCheckedAt)
+		return
+	})(tx.Query(ctx, sqlf.Sprintf(transferPackageRepoRefsQuery)))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to transfer package repos from temporary table")
+	}
+
+	// we need the IDs of all newly inserted and already existing package repo references
+	// for all of the references in `deps`, so that we have the package repo reference ID that
+	// we need for the package repo reference versions table.
+	// We already have the IDs of newly inserted ones (in `newDeps`), but for simplicity we'll
+	// just search based on (scheme, name) tuple in `deps`.
+
+	// we slice into `deps`, which will continuously shrink as we batch based on the amount of
+	// postgres parameters we can fit. Divide by 2 because for each entry in the batch, we need 2 free params
+	const maxBatchSize = batch.MaxNumPostgresParameters / 2
+	remainingDeps := deps
+
+	allIDs := make([]int, 0, len(deps))
+
+	for len(remainingDeps) > 0 {
+		// avoid slice out of bounds nonsense
+		var batch []shared.MinimalPackageRepoRef
+		if len(remainingDeps) <= maxBatchSize {
+			batch, remainingDeps = remainingDeps, nil
+		} else {
+			batch, remainingDeps = remainingDeps[:maxBatchSize], remainingDeps[maxBatchSize:]
+		}
+
+		// dont over-allocate
+		max := maxBatchSize
+		if len(remainingDeps) < maxBatchSize {
+			max = len(remainingDeps)
+		}
+		params := make([]*sqlf.Query, 0, max)
+		for _, dep := range batch {
+			params = append(params, sqlf.Sprintf("(%s, %s)", dep.Scheme, dep.Name))
+		}
+
+		query := sqlf.Sprintf(
+			getAttemptedInsertDependencyReposQuery,
+			sqlf.Join(params, ", "),
+		)
+
+		allIDsWindow, err := basestore.ScanInts(tx.Query(ctx, query))
+		if err != nil {
+			return nil, nil, err
+		}
+		allIDs = append(allIDs, allIDsWindow...)
+	}
+
+	err = batch.WithInserter(
+		ctx,
+		tx.Handle(),
+		"t_package_repo_versions",
+		batch.MaxNumPostgresParameters,
+		[]string{"package_id", "version", "blocked", "last_checked_at"},
+		func(inserter *batch.Inserter) error {
+			for i, dep := range deps {
+				for _, version := range dep.Versions {
+					if err := inserter.Insert(ctx, allIDs[i], version.Version, version.Blocked, version.LastCheckedAt); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to insert package repo versions in temporary table")
+	}
+
+	newVersions, err = basestore.NewSliceScanner(func(rows dbutil.Scanner) (version shared.PackageRepoRefVersion, err error) {
+		err = rows.Scan(&version.ID, &version.PackageRefID, &version.Version, &version.Blocked, &version.LastCheckedAt)
+		return
+	})(tx.Query(ctx, sqlf.Sprintf(transferPackageRepoRefVersionsQuery)))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to transfer package repos from temporary table")
+	}
+
+	return newDeps, newVersions, err
 }
 
+const temporaryPackageRepoRefsTableQuery = `
+CREATE TEMPORARY TABLE t_package_repo_refs (
+	scheme TEXT NOT NULL,
+	name TEXT NOT NULL,
+	blocked BOOLEAN NOT NULL,
+	last_checked_at TIMESTAMPTZ
+) ON COMMIT DROP
+`
+
+const temporaryPackageRepoRefVersionsTableQuery = `
+CREATE TEMPORARY TABLE t_package_repo_versions (
+	package_id BIGINT NOT NULL,
+	version TEXT NOT NULL,
+	blocked BOOLEAN NOT NULL,
+	last_checked_at TIMESTAMPTZ
+) ON COMMIT DROP
+`
+
+const transferPackageRepoRefsQuery = `
+INSERT INTO lsif_dependency_repos (scheme, name, blocked, last_checked_at)
+SELECT scheme, name, blocked, last_checked_at
+FROM t_package_repo_refs t
+WHERE NOT EXISTS (
+	SELECT scheme, name
+	FROM lsif_dependency_repos
+	WHERE scheme = t.scheme AND
+	name = t.name
+)
+ORDER BY name
+RETURNING id, scheme, name, blocked, last_checked_at
+`
+
+const transferPackageRepoRefVersionsQuery = `
+INSERT INTO package_repo_versions (package_id, version, blocked, last_checked_at)
+-- we dont reduce package repo versions,
+-- so DISTINCT here to avoid conflict
+SELECT DISTINCT ON (package_id, version) package_id, version, blocked, last_checked_at
+FROM t_package_repo_versions t
+WHERE NOT EXISTS (
+	SELECT package_id, version
+	FROM package_repo_versions
+	WHERE package_id = t.package_id AND
+	version = t.version
+)
+-- unit tests rely on a certain order
+ORDER BY package_id, version
+RETURNING id, package_id, version, blocked, last_checked_at
+`
+
+const getAttemptedInsertDependencyReposQuery = `
+SELECT id FROM lsif_dependency_repos
+WHERE (scheme, name) IN (VALUES %s)
+ORDER BY (scheme, name)
+`
+
 // DeleteDependencyReposByID removes the dependency repos with the given ids, if they exist.
-func (s *store) DeleteDependencyReposByID(ctx context.Context, ids ...int) (err error) {
-	ctx, _, endObservation := s.operations.deleteDependencyReposByID.With(ctx, &err, observation.Args{LogFields: []log.Field{
-		log.Int("numIDs", len(ids)),
+func (s *store) DeletePackageRepoRefsByID(ctx context.Context, ids ...int) (err error) {
+	ctx, _, endObservation := s.operations.deletePackageRepoRefsByID.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("numIDs", len(ids)),
 	}})
 	defer endObservation(1, observation.Args{})
 
@@ -839,20 +441,406 @@ func (s *store) DeleteDependencyReposByID(ctx context.Context, ids ...int) (err 
 }
 
 const deleteDependencyReposByIDQuery = `
--- source: internal/codeintel/dependencies/internal/store/store.go:DeleteDependencyReposByID
 DELETE FROM lsif_dependency_repos
 WHERE id = ANY(%s)
 `
 
-// Transact returns a store in a transaction.
-func (s *store) Transact(ctx context.Context) (*store, error) {
-	txBase, err := s.db.Transact(ctx)
+func (s *store) DeletePackageRepoRefVersionsByID(ctx context.Context, ids ...int) (err error) {
+	ctx, _, endObservation := s.operations.deletePackageRepoRefVersionsByID.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("numIDs", len(ids)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	if len(ids) == 0 {
+		return nil
+	}
+
+	return s.db.Exec(ctx, sqlf.Sprintf(deleteDependencyRepoVersionsByID, pq.Array(ids)))
+}
+
+const deleteDependencyRepoVersionsByID = `
+DELETE FROM package_repo_versions
+WHERE id = ANY(%s)
+`
+
+type ListPackageRepoRefFiltersOpts struct {
+	IDs            []int
+	PackageScheme  string
+	Behaviour      string
+	IncludeDeleted bool
+	After          int
+	Limit          int
+}
+
+func (s *store) ListPackageRepoRefFilters(ctx context.Context, opts ListPackageRepoRefFiltersOpts) (_ []shared.PackageRepoFilter, hasMore bool, err error) {
+	ctx, _, endObservation := s.operations.listPackageRepoFilters.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("numPackageRepoFilterIDs", len(opts.IDs)),
+		attribute.String("packageScheme", opts.PackageScheme),
+		attribute.Int("after", opts.After),
+		attribute.Int("limit", opts.Limit),
+		attribute.String("behaviour", opts.Behaviour),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	conds := make([]*sqlf.Query, 0, 6)
+
+	if !opts.IncludeDeleted {
+		conds = append(conds, sqlf.Sprintf("deleted_at IS NULL"))
+	}
+
+	if len(opts.IDs) != 0 {
+		conds = append(conds, sqlf.Sprintf("id = ANY(%s)", pq.Array(opts.IDs)))
+	}
+
+	if opts.PackageScheme != "" {
+		conds = append(conds, sqlf.Sprintf("scheme = %s", opts.PackageScheme))
+	}
+
+	if opts.After != 0 {
+		conds = append(conds, sqlf.Sprintf("id > %s", opts.After))
+	}
+
+	if opts.Behaviour != "" {
+		conds = append(conds, sqlf.Sprintf("behaviour = %s", opts.Behaviour))
+	}
+
+	if len(conds) == 0 {
+		conds = append(conds, sqlf.Sprintf("TRUE"))
+	}
+
+	limit := sqlf.Sprintf("")
+	if opts.Limit != 0 {
+		// + 1 to check if more pages
+		limit = sqlf.Sprintf("LIMIT %s", opts.Limit+1)
+	}
+
+	filters, err := basestore.NewSliceScanner(scanPackageFilter)(
+		s.db.Query(ctx, sqlf.Sprintf(
+			listPackageRepoRefFiltersQuery,
+			sqlf.Join(conds, "AND"),
+			limit,
+		)),
+	)
+
+	if opts.Limit != 0 && len(filters) > opts.Limit {
+		filters = filters[:opts.Limit]
+		hasMore = true
+	}
+
+	return filters, hasMore, err
+}
+
+const listPackageRepoRefFiltersQuery = `
+SELECT id, behaviour, scheme, matcher, deleted_at, updated_at
+FROM package_repo_filters
+-- filter
+WHERE %s
+-- limit
+%s
+ORDER BY id
+`
+
+func (s *store) CreatePackageRepoFilter(ctx context.Context, input shared.MinimalPackageFilter) (filter *shared.PackageRepoFilter, err error) {
+	ctx, _, endObservation := s.operations.createPackageRepoFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("packageScheme", input.PackageScheme),
+		attribute.String("behaviour", *input.Behaviour),
+		attribute.String("versionFilter", fmt.Sprintf("%+v", input.VersionFilter)),
+		attribute.String("nameFilter", fmt.Sprintf("%+v", input.NameFilter)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	var matcherJSON driver.Value
+	if input.NameFilter != nil {
+		matcherJSON, err = json.Marshal(input.NameFilter)
+		err = errors.Wrapf(err, "error marshalling %+v", input.NameFilter)
+	} else if input.VersionFilter != nil {
+		matcherJSON, err = json.Marshal(input.VersionFilter)
+		err = errors.Wrapf(err, "error marshalling %+v", input.VersionFilter)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	return &store{
-		db:         txBase,
-		operations: s.operations,
-	}, nil
+	hydrated := &shared.PackageRepoFilter{
+		Behaviour:     *input.Behaviour,
+		PackageScheme: input.PackageScheme,
+		NameFilter:    input.NameFilter,
+		VersionFilter: input.VersionFilter,
+		DeletedAt:     nil,
+	}
+
+	err = basestore.NewCallbackScanner(func(s dbutil.Scanner) (bool, error) {
+		return false, s.Scan(&hydrated.ID, &hydrated.UpdatedAt)
+	})(s.db.Query(ctx, sqlf.Sprintf(createPackageRepoFilter, input.Behaviour, input.PackageScheme, matcherJSON)))
+	if err != nil {
+		return nil, errors.Wrap(err, "error inserting package repo filter")
+	}
+
+	return hydrated, nil
 }
+
+const createPackageRepoFilter = `
+INSERT INTO package_repo_filters (behaviour, scheme, matcher)
+VALUES (%s, %s, %s)
+ON CONFLICT (scheme, matcher)
+DO UPDATE
+	SET deleted_at = NULL,
+	updated_at = now(),
+	behaviour = EXCLUDED.behaviour
+RETURNING id, updated_at
+`
+
+func (s *store) UpdatePackageRepoFilter(ctx context.Context, filter shared.PackageRepoFilter) (err error) {
+	ctx, _, endObservation := s.operations.updatePackageRepoFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("id", filter.ID),
+		attribute.String("packageScheme", filter.PackageScheme),
+		attribute.String("behaviour", filter.Behaviour),
+		attribute.String("versionFilter", fmt.Sprintf("%+v", filter.VersionFilter)),
+		attribute.String("nameFilter", fmt.Sprintf("%+v", filter.NameFilter)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	var matcherJSON driver.Value
+	if filter.NameFilter != nil {
+		matcherJSON, err = json.Marshal(filter.NameFilter)
+		err = errors.Wrapf(err, "error marshalling %+v", filter.NameFilter)
+	} else if filter.VersionFilter != nil {
+		matcherJSON, err = json.Marshal(filter.VersionFilter)
+		err = errors.Wrapf(err, "error marshalling %+v", filter.VersionFilter)
+	}
+	if err != nil {
+		return err
+	}
+
+	result, err := s.db.ExecResult(ctx, sqlf.Sprintf(
+		updatePackageRepoFilterQuery,
+		filter.PackageScheme,
+		matcherJSON,
+		filter.ID,
+		filter.ID,
+		filter.Behaviour,
+		filter.PackageScheme,
+		matcherJSON,
+		filter.ID,
+	))
+	if err != nil {
+		var pgerr *pgconn.PgError
+		// check if conflict error code
+		if errors.As(err, &pgerr) && pgerr.Code == "23505" {
+			return errors.Newf("conflicting package repo filter found for (scheme=%s,matcher=%s)", filter.PackageScheme, string(matcherJSON.([]byte)))
+		}
+		return err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return errors.Newf("no package repo filters for ID %d", filter.ID)
+	}
+	return nil
+}
+
+const updatePackageRepoFilterQuery = `
+-- hard-delete a conflicting one if its soft-deleted
+WITH delete_conflicting_deleted AS (
+	DELETE FROM package_repo_filters
+	WHERE
+		scheme = %s AND
+		matcher = %s AND
+		deleted_at IS NOT NULL
+	RETURNING %s::integer AS id
+),
+-- if the above matches nothing, we still need to return something
+-- else we join on nothing below and attempt update nothing, hence union
+always_id AS (
+	SELECT id
+	FROM delete_conflicting_deleted
+	UNION
+	SELECT %s::integer AS id
+)
+UPDATE package_repo_filters prv
+SET
+	behaviour = %s,
+	scheme = %s,
+	matcher = %s
+FROM always_id
+WHERE prv.id = %s AND prv.id = always_id.id
+`
+
+func (s *store) DeletePacakgeRepoFilter(ctx context.Context, id int) (err error) {
+	ctx, _, endObservation := s.operations.deletePackageRepoFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("id", id),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	result, err := s.db.ExecResult(ctx, sqlf.Sprintf(deletePackagRepoFilterQuery, id))
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return errors.Newf("no package repo filters for ID %d", id)
+	}
+	return nil
+}
+
+const deletePackagRepoFilterQuery = `
+UPDATE package_repo_filters
+SET deleted_at = now()
+WHERE id = %s
+`
+
+func (s *store) ShouldRefilterPackageRepoRefs(ctx context.Context) (exists bool, err error) {
+	ctx, _, endObservation := s.operations.shouldRefilterPackageRepoRefs.With(ctx, &err, observation.Args{})
+	defer endObservation(1, observation.Args{})
+
+	_, exists, err = basestore.ScanFirstInt(s.db.Query(ctx, sqlf.Sprintf(doPackageRepoRefsRequireRefilteringQuery)))
+	return
+}
+
+const doPackageRepoRefsRequireRefilteringQuery = `
+WITH least_recently_checked AS (
+	-- select oldest last_checked_at from either package_repo_versions
+	-- or lsif_dependency_repos, prioritising NULL
+    SELECT * FROM (
+        (
+			SELECT last_checked_at FROM lsif_dependency_repos
+			ORDER BY last_checked_at ASC NULLS FIRST
+			LIMIT 1
+		)
+        UNION ALL
+        (
+			SELECT last_checked_at FROM package_repo_versions
+			ORDER BY last_checked_at ASC NULLS FIRST
+			LIMIT 1
+		)
+    ) p
+    ORDER BY last_checked_at ASC NULLS FIRST
+    LIMIT 1
+),
+most_recently_updated_filter AS (
+    SELECT COALESCE(deleted_at, updated_at)
+	FROM package_repo_filters
+	ORDER BY COALESCE(deleted_at, updated_at) DESC
+	LIMIT 1
+)
+SELECT 1
+WHERE
+	-- comparisons on empty table from either least_recently_checked or most_recently_updated_filter
+	-- will yield NULL, making the query return 1 if either CTE returns nothing
+    (SELECT COUNT(*) FROM most_recently_updated_filter) <> 0 AND
+    (SELECT COUNT(*) FROM least_recently_checked) <> 0 AND
+    (
+        (SELECT * FROM least_recently_checked) IS NULL OR
+        (SELECT * FROM least_recently_checked) < (SELECT * FROM most_recently_updated_filter)
+    );
+`
+
+func (s *store) UpdateAllBlockedStatuses(ctx context.Context, pkgs []shared.PackageRepoReference, startTime time.Time) (pkgsUpdated, versionsUpdated int, err error) {
+	ctx, _, endObservation := s.operations.updateAllBlockedStatuses.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("numPackages", len(pkgs)),
+		attribute.String("startTime", startTime.Format(time.RFC3339)),
+	}})
+	defer func() {
+		endObservation(1, observation.Args{Attrs: []attribute.KeyValue{
+			attribute.Int("packagesUpdated", pkgsUpdated),
+			attribute.Int("versionsUpdated", versionsUpdated),
+		}})
+	}()
+
+	err = s.db.WithTransact(ctx, func(tx *basestore.Store) error {
+		for _, tempTableQuery := range []string{temporaryPackageRepoRefsBlockStatusTableQuery, temporaryPackageRepoRefVersionsBlockStatusTableQuery} {
+			if err := tx.Exec(ctx, sqlf.Sprintf(tempTableQuery)); err != nil {
+				return errors.Wrap(err, "failed to create temporary tables")
+			}
+		}
+
+		err := batch.WithInserter(
+			ctx,
+			tx.Handle(),
+			"t_lsif_dependency_repos",
+			batch.MaxNumPostgresParameters,
+			[]string{"id", "blocked"},
+			func(inserter *batch.Inserter) error {
+				for _, pkg := range pkgs {
+					if err := inserter.Insert(ctx, pkg.ID, pkg.Blocked); err != nil {
+						return errors.Wrapf(err, "error inserting (id=%d,blocked=%t)", pkg.ID, pkg.Blocked)
+					}
+				}
+				return nil
+			},
+		)
+		if err != nil {
+			return errors.Wrap(err, "error inserting into temporary package repos table")
+		}
+
+		err = batch.WithInserter(ctx,
+			tx.Handle(),
+			"t_package_repo_versions",
+			batch.MaxNumPostgresParameters,
+			[]string{"id", "blocked"},
+			func(inserter *batch.Inserter) error {
+				for _, pkg := range pkgs {
+					for _, version := range pkg.Versions {
+						if err := inserter.Insert(ctx, version.ID, version.Blocked); err != nil {
+							return errors.Wrapf(err, "error inserting (id=%d,blocked=%t)", version.ID, version.Blocked)
+						}
+					}
+				}
+				return nil
+			},
+		)
+		if err != nil {
+			return errors.Wrap(err, "error inserting into temporary package repo versions table")
+		}
+
+		err = basestore.NewCallbackScanner(func(s dbutil.Scanner) (bool, error) {
+			return false, s.Scan(&pkgsUpdated, &versionsUpdated)
+		})(tx.Query(ctx, sqlf.Sprintf(updateAllBlockedStatusesQuery, startTime, startTime)))
+		return errors.Wrap(err, "error scanning update results")
+	})
+
+	return
+}
+
+const temporaryPackageRepoRefsBlockStatusTableQuery = `
+CREATE TEMPORARY TABLE t_lsif_dependency_repos (
+	id BIGINT NOT NULL,
+	blocked BOOLEAN NOT NULL
+) ON COMMIT DROP
+`
+
+const temporaryPackageRepoRefVersionsBlockStatusTableQuery = `
+CREATE TEMPORARY TABLE t_package_repo_versions (
+	id BIGINT NOT NULL,
+	blocked BOOLEAN NOT NULL
+) ON COMMIT DROP
+`
+
+const updateAllBlockedStatusesQuery = `
+WITH updated_package_repos AS (
+	UPDATE lsif_dependency_repos new
+	SET
+		blocked = temp.blocked,
+		last_checked_at = %s
+	FROM t_lsif_dependency_repos temp
+	JOIN lsif_dependency_repos old
+	ON temp.id = old.id
+	WHERE old.id = new.id
+	RETURNING old.blocked <> new.blocked AS changed
+),
+updated_package_repo_versions AS (
+	UPDATE package_repo_versions new
+	SET
+		blocked = temp.blocked,
+		last_checked_at = %s
+	FROM t_package_repo_versions temp
+	JOIN package_repo_versions old
+	ON temp.id = old.id
+	WHERE old.id = new.id
+	RETURNING old.blocked <> new.blocked AS changed
+)
+SELECT (
+	SELECT COUNT(*) FILTER (WHERE changed)
+	FROM updated_package_repos
+) AS packages_changed, (
+	SELECT COUNT(*) FILTER (WHERE changed)
+	FROM updated_package_repo_versions
+) AS versions_changed
+`

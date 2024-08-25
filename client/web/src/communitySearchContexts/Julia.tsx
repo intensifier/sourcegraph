@@ -2,8 +2,8 @@ import React from 'react'
 
 import { SearchPatternType } from '../graphql-operations'
 
-import { CommunitySearchContextPage, CommunitySearchContextPageProps } from './CommunitySearchContextPage'
-import { CommunitySearchContextMetadata } from './types'
+import { CommunitySearchContextPage, type CommunitySearchContextPageProps } from './CommunitySearchContextPage'
+import type { CommunitySearchContextMetadata } from './types'
 
 export const julia: CommunitySearchContextMetadata = {
     title: 'Julia',
@@ -14,12 +14,12 @@ export const julia: CommunitySearchContextMetadata = {
         {
             title: "List all TODO's in Julia code",
             query: 'lang:Julia TODO case:yes',
-            patternType: SearchPatternType.literal,
+            patternType: SearchPatternType.standard,
         },
         {
             title: 'Browse diffs for recent code changes',
             query: 'type:diff after:"1 week ago"',
-            patternType: SearchPatternType.literal,
+            patternType: SearchPatternType.standard,
         },
     ],
     homepageDescription: 'Search within the Julia community.',

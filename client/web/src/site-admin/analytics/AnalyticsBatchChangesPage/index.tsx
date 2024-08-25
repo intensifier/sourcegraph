@@ -1,39 +1,42 @@
-import React, { useMemo, useState, useEffect } from 'react'
+import React, { useMemo, useEffect } from 'react'
 
-import { RouteComponentProps } from 'react-router'
+import { startCase } from 'lodash'
 
 import { useQuery } from '@sourcegraph/http-client'
-import { Card, LoadingSpinner, H3, Text } from '@sourcegraph/wildcard'
+import type { TelemetryV2Props } from '@sourcegraph/shared/src/telemetry'
+import { EVENT_LOGGER } from '@sourcegraph/shared/src/telemetry/web/eventLogger'
+import { Card, LoadingSpinner, H2, Text, LineChart, type Series } from '@sourcegraph/wildcard'
 
-import { LineChart, Series } from '../../../charts'
-import {
-    AnalyticsDateRange,
-    BatchChangesStatisticsResult,
-    BatchChangesStatisticsVariables,
-} from '../../../graphql-operations'
-import { eventLogger } from '../../../tracking/eventLogger'
+import type { BatchChangesStatisticsResult, BatchChangesStatisticsVariables } from '../../../graphql-operations'
 import { AnalyticsPageTitle } from '../components/AnalyticsPageTitle'
 import { ChartContainer } from '../components/ChartContainer'
 import { HorizontalSelect } from '../components/HorizontalSelect'
-import { TimeSavedCalculator } from '../components/TimeSavedCalculatorGroup'
-import { ValueLegendList, ValueLegendListProps } from '../components/ValueLegendList'
-import { StandardDatum } from '../utils'
+import { TimeSavedCalculator, type TimeSavedCalculatorProps } from '../components/TimeSavedCalculatorGroup'
+import { ValueLegendList, type ValueLegendListProps } from '../components/ValueLegendList'
+import { useChartFilters } from '../useChartFilters'
+import type { StandardDatum } from '../utils'
 
 import { BATCHCHANGES_STATISTICS } from './queries'
 
-export const AnalyticsBatchChangesPage: React.FunctionComponent<RouteComponentProps<{}>> = () => {
-    const [dateRange, setDateRange] = useState<AnalyticsDateRange>(AnalyticsDateRange.LAST_MONTH)
+export const DEFAULT_MINS_SAVED_PER_CHANGESET = 15
+
+interface Props extends TelemetryV2Props {}
+
+export const AnalyticsBatchChangesPage: React.FunctionComponent<Props> = ({ telemetryRecorder }) => {
+    const { dateRange, grouping } = useChartFilters({ name: 'BatchChanges', telemetryRecorder })
     const { data, error, loading } = useQuery<BatchChangesStatisticsResult, BatchChangesStatisticsVariables>(
         BATCHCHANGES_STATISTICS,
         {
             variables: {
-                dateRange,
+                dateRange: dateRange.value,
+                grouping: grouping.value,
             },
         }
     )
     useEffect(() => {
-        eventLogger.logPageView('AdminAnalyticsBatchChanges')
-    }, [])
+        EVENT_LOGGER.logPageView('AdminAnalyticsBatchChanges')
+        telemetryRecorder.recordEvent('admin.analytics.batchChanges', 'view')
+    }, [telemetryRecorder])
     const [stats, legends, calculatorProps] = useMemo(() => {
         if (!data) {
             return []
@@ -49,7 +52,7 @@ export const AnalyticsBatchChangesPage: React.FunctionComponent<RouteComponentPr
                         date: new Date(node.date),
                         value: node.count,
                     }),
-                    dateRange
+                    dateRange.value
                 ),
                 getXValue: ({ date }) => date,
                 getYValue: ({ value }) => value,
@@ -63,7 +66,7 @@ export const AnalyticsBatchChangesPage: React.FunctionComponent<RouteComponentPr
                         date: new Date(node.date),
                         value: node.count,
                     }),
-                    dateRange
+                    dateRange.value
                 ),
                 getXValue: ({ date }) => date,
                 getYValue: ({ value }) => value,
@@ -74,26 +77,32 @@ export const AnalyticsBatchChangesPage: React.FunctionComponent<RouteComponentPr
                 value: changesetsCreated.summary.totalCount,
                 description: 'Changesets created',
                 color: 'var(--orange)',
+                tooltip:
+                    'The number of changesets created on a code host during the timeframe. This does not include changesets that are unpublished.',
             },
             {
                 value: changesetsMerged.summary.totalCount,
                 description: 'Changesets merged',
                 color: 'var(--cyan)',
+                tooltip: 'The number of changesets merged on the code host during the timeframe.',
             },
         ]
 
-        const calculatorProps = {
+        const calculatorProps: TimeSavedCalculatorProps = {
             page: 'BatchChanges',
+            dateRange: dateRange.value,
             label: 'Changesets merged',
             color: 'var(--cyan)',
             value: changesetsMerged.summary.totalCount,
-            minPerItem: 15,
+            defaultMinPerItem: DEFAULT_MINS_SAVED_PER_CHANGESET,
             description:
                 'Batch Changes automates opening changesets across many repositories and codehosts. It also significantly reduces the time required to manage cross-repository changes via tracking and management functions that are superior to custom solutions, spreadsheets and manually reaching out to developers.',
+            temporarySettingsKey: 'batches.minSavedPerChangeset',
+            telemetryRecorder,
         }
 
         return [stats, legends, calculatorProps]
-    }, [data, dateRange])
+    }, [data, dateRange.value, telemetryRecorder])
 
     if (error) {
         throw error
@@ -103,36 +112,30 @@ export const AnalyticsBatchChangesPage: React.FunctionComponent<RouteComponentPr
         return <LoadingSpinner />
     }
 
+    const groupingLabel = startCase(grouping.value.toLowerCase())
+
     return (
         <>
-            <AnalyticsPageTitle>Analytics / Batch Changes</AnalyticsPageTitle>
+            <AnalyticsPageTitle>Batch Changes</AnalyticsPageTitle>
 
             <Card className="p-3 position-relative">
-                <div className="d-flex justify-content-end align-items-stretch mb-2">
-                    <HorizontalSelect<AnalyticsDateRange>
-                        value={dateRange}
-                        label="Date&nbsp;range"
-                        onChange={value => {
-                            setDateRange(value)
-                            eventLogger.log(`AdminAnalyticsBatchChangesDateRange${value}Selected`)
-                        }}
-                        items={[
-                            { value: AnalyticsDateRange.LAST_WEEK, label: 'Last week' },
-                            { value: AnalyticsDateRange.LAST_MONTH, label: 'Last month' },
-                            { value: AnalyticsDateRange.LAST_THREE_MONTHS, label: 'Last 3 months' },
-                            { value: AnalyticsDateRange.CUSTOM, label: 'Custom (coming soon)', disabled: true },
-                        ]}
-                    />
+                <div className="d-flex justify-content-end align-items-stretch mb-2 text-nowrap">
+                    <HorizontalSelect<typeof dateRange.value> {...dateRange} />
                 </div>
                 {legends && <ValueLegendList className="mb-3" items={legends} />}
                 {stats && (
                     <div>
-                        <ChartContainer title="Activity by day" labelX="Time" labelY="Activity">
+                        <ChartContainer title={`${groupingLabel} activity`} labelX="Time" labelY="Activity">
                             {width => <LineChart width={width} height={300} series={stats} />}
                         </ChartContainer>
                     </div>
                 )}
-                <H3 className="my-3">Time saved</H3>
+                <div>
+                    <div className="d-flex justify-content-end align-items-stretch mb-4 text-nowrap">
+                        <HorizontalSelect<typeof grouping.value> {...grouping} />
+                    </div>
+                </div>
+                <H2 className="my-3">Total time saved</H2>
                 {calculatorProps && <TimeSavedCalculator {...calculatorProps} />}
             </Card>
             <Text className="font-italic text-center mt-2">

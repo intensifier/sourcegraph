@@ -24,41 +24,44 @@ func Postgres() *monitoring.Dashboard {
 		Groups: []monitoring.Group{
 			{
 				Title: "General",
-				Rows: []monitoring.Row{{
-					monitoring.Observable{
-						Name:          "connections",
-						Description:   "active connections",
-						Owner:         monitoring.ObservableOwnerDevOps,
-						DataMustExist: false, // not deployed on docker-compose
-						Query:         `sum by (job) (pg_stat_activity_count{datname!~"template.*|postgres|cloudsqladmin"}) OR sum by (job) (pg_stat_activity_count{job="codeinsights-db", datname!~"template.*|cloudsqladmin"})`,
-						Panel:         monitoring.Panel().LegendFormat("{{datname}}"),
-						Warning:       monitoring.Alert().LessOrEqual(5).For(5 * time.Minute),
-						NextSteps:     "none",
-					},
-					monitoring.Observable{
-						Name:          "usage_connections_percentage",
-						Description:   "connection in use",
-						Owner:         monitoring.ObservableOwnerDevOps,
-						DataMustExist: false,
-						Query:         `sum(pg_stat_activity_count) by (job) / (sum(pg_settings_max_connections) by (job) - sum(pg_settings_superuser_reserved_connections) by (job)) * 100`,
-						Panel:         monitoring.Panel().LegendFormat("{{job}}").Unit(monitoring.Percentage).Max(100).Min(0),
-						Warning:       monitoring.Alert().GreaterOrEqual(80).For(5 * time.Minute),
-						Critical:      monitoring.Alert().GreaterOrEqual(100).For(5 * time.Minute),
-						NextSteps: `
-							- Consider increasing [max_connections](https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-MAX-CONNECTIONS) of the database instance, [learn more](https://docs.sourcegraph.com/admin/config/postgres-conf)
+				Rows: []monitoring.Row{
+					{
+						monitoring.Observable{
+							Name:          "connections",
+							Description:   "active connections",
+							Owner:         monitoring.ObservableOwnerInfraOrg,
+							DataMustExist: false, // not deployed on docker-compose
+							Query:         `sum by (job) (pg_stat_activity_count{datname!~"template.*|postgres|cloudsqladmin"}) OR sum by (job) (pg_stat_activity_count{job="codeinsights-db", datname!~"template.*|cloudsqladmin"})`,
+							Panel:         monitoring.Panel().LegendFormat("{{datname}}"),
+							Warning:       monitoring.Alert().LessOrEqual(5).For(5 * time.Minute),
+							NextSteps:     "none",
+						},
+						monitoring.Observable{
+							Name:          "usage_connections_percentage",
+							Description:   "connection in use",
+							Owner:         monitoring.ObservableOwnerInfraOrg,
+							DataMustExist: false,
+							Query:         `sum(pg_stat_activity_count) by (job) / (sum(pg_settings_max_connections) by (job) - sum(pg_settings_superuser_reserved_connections) by (job)) * 100`,
+							Panel:         monitoring.Panel().LegendFormat("{{job}}").Unit(monitoring.Percentage).Max(100).Min(0),
+							Warning:       monitoring.Alert().GreaterOrEqual(80).For(5 * time.Minute),
+							Critical:      monitoring.Alert().GreaterOrEqual(100).For(5 * time.Minute),
+							NextSteps: `
+							- Consider increasing [max_connections](https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-MAX-CONNECTIONS) of the database instance, [learn more](https://sourcegraph.com/docs/admin/config/postgres-conf)
 						`,
+						},
+						monitoring.Observable{
+							Name:          "transaction_durations",
+							Description:   "maximum transaction durations",
+							Owner:         monitoring.ObservableOwnerInfraOrg,
+							DataMustExist: false, // not deployed on docker-compose
+							// Ignore in codeintel-db because Rockskip processing involves long transactions
+							// during normal operation.
+							Query:     `sum by (job) (pg_stat_activity_max_tx_duration{datname!~"template.*|postgres|cloudsqladmin",job!="codeintel-db"}) OR sum by (job) (pg_stat_activity_max_tx_duration{job="codeinsights-db", datname!~"template.*|cloudsqladmin"})`,
+							Panel:     monitoring.Panel().LegendFormat("{{datname}}").Unit(monitoring.Seconds),
+							Warning:   monitoring.Alert().GreaterOrEqual(0.3).For(5 * time.Minute),
+							NextSteps: "none",
+						},
 					},
-					monitoring.Observable{
-						Name:          "transaction_durations",
-						Description:   "maximum transaction durations",
-						Owner:         monitoring.ObservableOwnerDevOps,
-						DataMustExist: false, // not deployed on docker-compose
-						Query:         `sum by (job) (pg_stat_activity_max_tx_duration{datname!~"template.*|postgres|cloudsqladmin"}) OR sum by (job) (pg_stat_activity_max_tx_duration{job="codeinsights-db", datname!~"template.*|cloudsqladmin"})`,
-						Panel:         monitoring.Panel().LegendFormat("{{datname}}").Unit(monitoring.Seconds),
-						Warning:       monitoring.Alert().GreaterOrEqual(0.3).For(5 * time.Minute),
-						NextSteps:     "none",
-					},
-				},
 				},
 			},
 			{
@@ -69,7 +72,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:          "postgres_up",
 							Description:   "database availability",
-							Owner:         monitoring.ObservableOwnerDevOps,
+							Owner:         monitoring.ObservableOwnerInfraOrg,
 							DataMustExist: false, // not deployed on docker-compose
 							Query:         "pg_up",
 							Panel:         monitoring.Panel().LegendFormat("{{app}}"),
@@ -92,7 +95,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:          "invalid_indexes",
 							Description:   "invalid indexes (unusable by the query planner)",
-							Owner:         monitoring.ObservableOwnerDevOps,
+							Owner:         monitoring.ObservableOwnerInfraOrg,
 							DataMustExist: false, // not deployed on docker-compose
 							Query:         "max by (relname)(pg_invalid_index_count)",
 							Panel:         monitoring.Panel().LegendFormat("{{relname}}"),
@@ -107,7 +110,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:          "pg_exporter_err",
 							Description:   "errors scraping postgres exporter",
-							Owner:         monitoring.ObservableOwnerDevOps,
+							Owner:         monitoring.ObservableOwnerInfraOrg,
 							DataMustExist: false, // not deployed on docker-compose
 							Query:         "pg_exporter_last_scrape_error",
 							Panel:         monitoring.Panel().LegendFormat("{{app}}"),
@@ -121,7 +124,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:           "migration_in_progress",
 							Description:    "active schema migration",
-							Owner:          monitoring.ObservableOwnerDevOps,
+							Owner:          monitoring.ObservableOwnerInfraOrg,
 							DataMustExist:  false, // not deployed on docker-compose
 							Query:          "pg_sg_migration_status",
 							Panel:          monitoring.Panel().LegendFormat("{{app}}"),
@@ -154,7 +157,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:           "pg_table_size",
 							Description:    "table size",
-							Owner:          monitoring.ObservableOwnerDevOps,
+							Owner:          monitoring.ObservableOwnerInfraOrg,
 							Query:          `max by (relname)(pg_table_bloat_size)`,
 							Panel:          monitoring.Panel().LegendFormat("{{relname}}").Unit(monitoring.Bytes),
 							NoAlert:        true,
@@ -163,7 +166,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:           "pg_table_bloat_ratio",
 							Description:    "table bloat ratio",
-							Owner:          monitoring.ObservableOwnerDevOps,
+							Owner:          monitoring.ObservableOwnerInfraOrg,
 							Query:          `max by (relname)(pg_table_bloat_ratio) * 100`,
 							Panel:          monitoring.Panel().LegendFormat("{{relname}}").Unit(monitoring.Percentage),
 							NoAlert:        true,
@@ -174,7 +177,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:           "pg_index_size",
 							Description:    "index size",
-							Owner:          monitoring.ObservableOwnerDevOps,
+							Owner:          monitoring.ObservableOwnerInfraOrg,
 							Query:          `max by (relname)(pg_index_bloat_size)`,
 							Panel:          monitoring.Panel().LegendFormat("{{relname}}").Unit(monitoring.Bytes),
 							NoAlert:        true,
@@ -183,7 +186,7 @@ func Postgres() *monitoring.Dashboard {
 						monitoring.Observable{
 							Name:           "pg_index_bloat_ratio",
 							Description:    "index bloat ratio",
-							Owner:          monitoring.ObservableOwnerDevOps,
+							Owner:          monitoring.ObservableOwnerInfraOrg,
 							Query:          `max by (relname)(pg_index_bloat_ratio) * 100`,
 							Panel:          monitoring.Panel().LegendFormat("{{relname}}").Unit(monitoring.Percentage),
 							NoAlert:        true,
@@ -193,8 +196,8 @@ func Postgres() *monitoring.Dashboard {
 				},
 			},
 
-			shared.NewProvisioningIndicatorsGroup(containerName, monitoring.ObservableOwnerDevOps, nil),
-			shared.NewKubernetesMonitoringGroup(containerName, monitoring.ObservableOwnerDevOps, nil),
+			shared.NewProvisioningIndicatorsGroup(containerName, monitoring.ObservableOwnerInfraOrg, nil),
+			shared.NewKubernetesMonitoringGroup(containerName, monitoring.ObservableOwnerInfraOrg, nil),
 		},
 	}
 }

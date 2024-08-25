@@ -16,7 +16,7 @@ import (
 func TestSandboxHasNoIO(t *testing.T) {
 	ctx := context.Background()
 
-	sandbox, err := newService(&observation.TestContext).CreateSandbox(ctx, CreateOptions{})
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error creating sandbox: %s", err)
 	}
@@ -46,10 +46,32 @@ func TestSandboxHasNoIO(t *testing.T) {
 	})
 }
 
+func TestSandboxHasFun(t *testing.T) {
+	ctx := context.Background()
+
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error creating sandbox: %s", err)
+	}
+	defer sandbox.Close()
+
+	script := `
+		return require("fun")
+	`
+
+	if val, err := sandbox.RunScript(ctx, RunOptions{}, script); err == nil {
+		if val.Type() != lua.LTTable {
+			t.Fatalf("expected 'fun' to be a table: %s", val)
+		}
+	} else if strings.Contains(err.Error(), "module fun not found") {
+		t.Fatalf("unexpected error running script: %s", err)
+	}
+}
+
 func TestSandboxMaxTimeout(t *testing.T) {
 	ctx := context.Background()
 
-	sandbox, err := newService(&observation.TestContext).CreateSandbox(ctx, CreateOptions{})
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error creating sandbox: %s", err)
 	}
@@ -68,7 +90,7 @@ func TestSandboxMaxTimeout(t *testing.T) {
 func TestRunScript(t *testing.T) {
 	ctx := context.Background()
 
-	sandbox, err := newService(&observation.TestContext).CreateSandbox(ctx, CreateOptions{})
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error creating sandbox: %s", err)
 	}
@@ -102,8 +124,8 @@ func TestModule(t *testing.T) {
 
 	ctx := context.Background()
 
-	sandbox, err := newService(&observation.TestContext).CreateSandbox(ctx, CreateOptions{
-		Modules: map[string]lua.LGFunction{
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{
+		GoModules: map[string]lua.LGFunction{
 			"testmod": util.CreateModule(api),
 		},
 	})
@@ -132,7 +154,7 @@ func TestModule(t *testing.T) {
 func TestCall(t *testing.T) {
 	ctx := context.Background()
 
-	sandbox, err := newService(&observation.TestContext).CreateSandbox(ctx, CreateOptions{})
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error creating sandbox: %s", err)
 	}
@@ -170,7 +192,7 @@ func TestCall(t *testing.T) {
 func TestCallGenerator(t *testing.T) {
 	ctx := context.Background()
 
-	sandbox, err := newService(&observation.TestContext).CreateSandbox(ctx, CreateOptions{})
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error creating sandbox: %s", err)
 	}
@@ -218,5 +240,28 @@ func TestCallGenerator(t *testing.T) {
 	}
 	if diff := cmp.Diff(expectedValues, values); diff != "" {
 		t.Errorf("unexpected file contents (-want +got):\n%s", diff)
+	}
+}
+
+func TestDefaultLuaModulesFilesLoad(t *testing.T) {
+	ctx := context.Background()
+
+	modules, err := DefaultGoModules.Init()
+	if err != nil {
+		t.Fatalf("unexpected error loading modules: %s", err)
+	}
+	sandbox, err := newService(observation.TestContextTB(t)).CreateSandbox(ctx, CreateOptions{
+		GoModules: modules,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating sandbox: %s", err)
+	}
+	defer sandbox.Close()
+
+	for mod, script := range DefaultLuaModules {
+		_, err := sandbox.RunScript(ctx, RunOptions{}, script)
+		if err != nil {
+			t.Fatalf("unexpected error loading runtime file %s: %s", mod, err)
+		}
 	}
 }

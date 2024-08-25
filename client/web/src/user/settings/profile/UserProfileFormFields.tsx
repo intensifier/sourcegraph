@@ -2,21 +2,22 @@ import React, { useCallback } from 'react'
 
 import classNames from 'classnames'
 
-import * as GQL from '@sourcegraph/shared/src/schema'
+import { UserAvatar } from '@sourcegraph/shared/src/components/UserAvatar'
 import { Input, Label } from '@sourcegraph/wildcard'
 
 import { USER_DISPLAY_NAME_MAX_LENGTH } from '../..'
 import { UsernameInput } from '../../../auth/SignInSignUpCommon'
-import { UserAvatar } from '../../UserAvatar'
+import type { EditUserProfilePage } from '../../../graphql-operations'
 
 import styles from './UserProfileFormFields.module.scss'
 
-export type UserProfileFormFieldsValue = Pick<GQL.IUser, 'username' | 'displayName' | 'avatarURL'>
+export type UserProfileFormFieldsValue = Pick<EditUserProfilePage, 'username' | 'displayName' | 'avatarURL'>
 
 interface Props {
     value: UserProfileFormFieldsValue
     onChange: (newValue: UserProfileFormFieldsValue) => void
     usernameFieldDisabled?: boolean
+    displayNameFieldDisabled?: boolean
     disabled?: boolean
 }
 
@@ -24,6 +25,7 @@ export const UserProfileFormFields: React.FunctionComponent<React.PropsWithChild
     value,
     onChange,
     usernameFieldDisabled,
+    displayNameFieldDisabled,
     disabled,
 }) => {
     const onUsernameChange = useCallback<React.ChangeEventHandler<HTMLInputElement>>(
@@ -53,8 +55,8 @@ export const UserProfileFormFields: React.FunctionComponent<React.PropsWithChild
                     aria-describedby="UserProfileFormFields__username-help"
                 />
                 <small id="UserProfileFormFields__username-help" className="form-text text-muted">
-                    A username consists of letters, numbers, hyphens (-), dots (.) and may not begin or end with a dot,
-                    nor begin with a hyphen.
+                    A username consists of letters, numbers, hyphens (-), dots (.), underscore (_) and may not begin or
+                    end with a dot, nor begin with a hyphen.
                 </small>
             </div>
             <Input
@@ -62,7 +64,7 @@ export const UserProfileFormFields: React.FunctionComponent<React.PropsWithChild
                 data-testid="test-UserProfileFormFields__displayName"
                 value={value.displayName || ''}
                 onChange={onDisplayNameChange}
-                disabled={disabled}
+                disabled={displayNameFieldDisabled || disabled}
                 spellCheck={false}
                 placeholder="Display name"
                 maxLength={USER_DISPLAY_NAME_MAX_LENGTH}

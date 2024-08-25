@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
+	"github.com/Masterminds/semver"
+
+	"github.com/sourcegraph/sourcegraph/internal/errcode"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
@@ -25,25 +27,31 @@ const (
 )
 
 type MergeRequest struct {
-	ID                     ID `json:"id"`
-	IID                    ID `json:"iid"`
-	ProjectID              ID `json:"project_id"`
-	SourceProjectID        ID `json:"source_project_id"`
-	SourceProjectNamespace string
-	Title                  string            `json:"title"`
-	Description            string            `json:"description"`
-	State                  MergeRequestState `json:"state"`
-	CreatedAt              Time              `json:"created_at"`
-	UpdatedAt              Time              `json:"updated_at"`
-	MergedAt               *Time             `json:"merged_at"`
-	ClosedAt               *Time             `json:"closed_at"`
-	HeadPipeline           *Pipeline         `json:"head_pipeline"`
-	Labels                 []string          `json:"labels"`
-	SourceBranch           string            `json:"source_branch"`
-	TargetBranch           string            `json:"target_branch"`
-	WebURL                 string            `json:"web_url"`
-	WorkInProgress         bool              `json:"work_in_progress"`
-	Author                 User              `json:"author"`
+	ID                      ID `json:"id"`
+	IID                     ID `json:"iid"`
+	ProjectID               ID `json:"project_id"`
+	SourceProjectID         ID `json:"source_project_id"`
+	SourceProjectNamespace  string
+	SourceProjectName       string
+	Title                   string            `json:"title"`
+	Description             string            `json:"description"`
+	State                   MergeRequestState `json:"state"`
+	CreatedAt               Time              `json:"created_at"`
+	UpdatedAt               Time              `json:"updated_at"`
+	MergedAt                *Time             `json:"merged_at"`
+	ClosedAt                *Time             `json:"closed_at"`
+	HeadPipeline            *Pipeline         `json:"head_pipeline"`
+	Labels                  []string          `json:"labels"`
+	SourceBranch            string            `json:"source_branch"`
+	TargetBranch            string            `json:"target_branch"`
+	WebURL                  string            `json:"web_url"`
+	WorkInProgress          bool              `json:"work_in_progress"`
+	Draft                   bool              `json:"draft"`
+	ForceRemoveSourceBranch bool              `json:"force_remove_source_branch"`
+	// We only get a partial User object back from the REST API. For example, it lacks
+	// `Email` and `Identities`. If we need more, we need to issue an additional API
+	// request. Otherwise, we should use a different type here.
+	Author User `json:"author"`
 
 	DiffRefs DiffRefs `json:"diff_refs"`
 
@@ -56,23 +64,36 @@ type MergeRequest struct {
 	ResourceStateEvents []*ResourceStateEvent
 }
 
-// IsWIP returns true if the given title would result in GitLab rendering the MR as 'work in progress'.
-func IsWIP(title string) bool {
+// IsWIPOrDraft returns true if the given title would result in GitLab rendering the MR as 'work in progress'.
+func IsWIPOrDraft(title string) bool {
 	return strings.HasPrefix(title, "Draft:") || strings.HasPrefix(title, "WIP:")
 }
 
-// SetWIP ensures a "WIP:" prefix on the given title. If a "Draft:" prefix is found, that one is retained instead.
-func SetWIP(title string) string {
-	if IsWIP(title) {
-		return title
+// SetWIPOrDraft ensures the title is prefixed with either "WIP:" or "Draft: " depending on the Gitlab version.
+func SetWIPOrDraft(t string, v *semver.Version) string {
+	// Gitlab >=14.0 requires the prefix of a draft MR to be "Draft:"
+	if v.Major() >= 14 {
+		return setDraft(t)
 	}
-	return "WIP: " + title
+	return setWIP(t)
+}
+
+// SetWIP ensures a "WIP:" prefix on the given title. If a "Draft:" prefix is found, that one is retained instead.
+func setWIP(title string) string {
+	t := UnsetWIPOrDraft(title)
+	return "WIP: " + t
+}
+
+// SetDraft ensures a "Draft:" prefix on the given title. If a "WIP:" prefix is found, we strip it off.
+func setDraft(title string) string {
+	t := UnsetWIPOrDraft(title)
+	return "Draft: " + t
 }
 
 // UnsetWIP removes "WIP:" and "Draft:" prefixes from the given title.
 // Depending on the GitLab version, either of them are used so we need to strip them both.
-func UnsetWIP(title string) string {
-	return strings.TrimPrefix(strings.TrimPrefix(title, "WIP: "), "Draft: ")
+func UnsetWIPOrDraft(title string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(title, "Draft: "), "WIP: ")
 }
 
 type DiffRefs struct {
@@ -87,11 +108,12 @@ var (
 )
 
 type CreateMergeRequestOpts struct {
-	SourceBranch    string `json:"source_branch"`
-	TargetBranch    string `json:"target_branch"`
-	TargetProjectID int    `json:"target_project_id,omitempty"`
-	Title           string `json:"title"`
-	Description     string `json:"description,omitempty"`
+	SourceBranch       string `json:"source_branch"`
+	TargetBranch       string `json:"target_branch"`
+	TargetProjectID    int    `json:"target_project_id,omitempty"`
+	Title              string `json:"title"`
+	Description        string `json:"description,omitempty"`
+	RemoveSourceBranch bool   `json:"remove_source_branch,omitempty"`
 	// TODO: other fields at
 	// https://docs.gitlab.com/ee/api/merge_requests.html#create-mr as needed.
 }
@@ -106,8 +128,6 @@ func (c *Client) CreateMergeRequest(ctx context.Context, project *Project, opts 
 		return nil, errors.Wrap(err, "marshalling options")
 	}
 
-	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
-
 	req, err := http.NewRequest("POST", fmt.Sprintf("projects/%d/merge_requests", project.ID), bytes.NewBuffer(data))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request to create a merge request")
@@ -118,11 +138,12 @@ func (c *Client) CreateMergeRequest(ctx context.Context, project *Project, opts 
 		if code == http.StatusConflict {
 			return nil, ErrMergeRequestAlreadyExists
 		}
+
 		if aerr := c.convertToArchivedError(ctx, err, project); aerr != nil {
 			return nil, aerr
 		}
 
-		return nil, errors.Wrap(err, "sending request to create a merge request")
+		return nil, errors.Wrap(errcode.MaybeMakeNonRetryable(code, err), "sending request to create a merge request")
 	}
 
 	return resp, nil
@@ -132,8 +153,6 @@ func (c *Client) GetMergeRequest(ctx context.Context, project *Project, iid ID) 
 	if MockGetMergeRequest != nil {
 		return MockGetMergeRequest(c, ctx, project, iid)
 	}
-
-	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("projects/%d/merge_requests/%d", project.ID, iid), nil)
 	if err != nil {
@@ -179,8 +198,6 @@ func (c *Client) GetOpenMergeRequestByRefs(ctx context.Context, project *Project
 		Path: fmt.Sprintf("projects/%d/merge_requests", project.ID), RawQuery: values.Encode(),
 	}
 
-	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
-
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request to get merge request by refs")
@@ -201,10 +218,11 @@ func (c *Client) GetOpenMergeRequestByRefs(ctx context.Context, project *Project
 }
 
 type UpdateMergeRequestOpts struct {
-	TargetBranch string                       `json:"target_branch,omitempty"`
-	Title        string                       `json:"title,omitempty"`
-	Description  string                       `json:"description,omitempty"`
-	StateEvent   UpdateMergeRequestStateEvent `json:"state_event,omitempty"`
+	TargetBranch       string                       `json:"target_branch,omitempty"`
+	Title              string                       `json:"title,omitempty"`
+	Description        string                       `json:"description,omitempty"`
+	StateEvent         UpdateMergeRequestStateEvent `json:"state_event,omitempty"`
+	RemoveSourceBranch bool                         `json:"remove_source_branch,omitempty"`
 }
 
 type UpdateMergeRequestStateEvent string
@@ -231,8 +249,6 @@ func (c *Client) UpdateMergeRequest(ctx context.Context, project *Project, mr *M
 	if err != nil {
 		return nil, errors.Wrap(err, "marshalling options")
 	}
-
-	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
 
 	req, err := http.NewRequest("PUT", fmt.Sprintf("projects/%d/merge_requests/%d", project.ID, mr.IID), bytes.NewBuffer(data))
 	if err != nil {
@@ -273,8 +289,6 @@ func (c *Client) MergeMergeRequest(ctx context.Context, project *Project, mr *Me
 		return nil, errors.Wrap(err, "marshalling options")
 	}
 
-	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
-
 	req, err := http.NewRequest("PUT", fmt.Sprintf("projects/%d/merge_requests/%d/merge", project.ID, mr.IID), bytes.NewBuffer(data))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request to merge a merge request")
@@ -306,8 +320,6 @@ func (c *Client) CreateMergeRequestNote(ctx context.Context, project *Project, m
 	if err != nil {
 		return errors.Wrap(err, "marshalling payload")
 	}
-
-	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
 
 	req, err := http.NewRequest("POST", fmt.Sprintf("projects/%d/merge_requests/%d/notes", project.ID, mr.IID), bytes.NewBuffer(data))
 	if err != nil {

@@ -68,6 +68,13 @@ func TestNew(t *testing.T) {
 			dsn: "postgres://foo@bar/bam",
 		},
 		{
+			name: "datasource search_path",
+			env: map[string]string{
+				"PGDATASOURCE": "postgres://sg:REDACTED@pgsql:5432/sg?sslmode=disable&search_path=application",
+			},
+			dsn: "postgres://sg:REDACTED@pgsql:5432/sg?sslmode=disable&search_path=application",
+		},
+		{
 			name: "datasource ignore",
 			env: map[string]string{
 				"PGHOST":       "pgsql",
@@ -111,6 +118,18 @@ func TestNew(t *testing.T) {
 				"PGUSER":     "sg",
 			},
 			dsn: "postgres://sg:REDACTED@pgsql:5432/sg?sslmode=disable",
+		},
+
+		// #54858 fixes previous incorrect output that cannot be parsed
+		// as a legal URL due to the double port:
+		//
+		// postgres://testuser@127.0.0.1:5432:5333
+		{
+			name: "overwritten port",
+			env: map[string]string{
+				"PGPORT": "5333",
+			},
+			dsn: "postgres://testuser@127.0.0.1:5333",
 		},
 	}
 

@@ -1,27 +1,17 @@
 import * as React from 'react'
 
+import { displayRepoName } from '@sourcegraph/shared/src/components/RepoLink'
 import { parseRepoRevision } from '@sourcegraph/shared/src/util/url'
-import { useIsTruncated } from '@sourcegraph/wildcard'
+import { Button, Tooltip, useIsTruncated } from '@sourcegraph/wildcard'
 
 import { useOpenSearchResultsContext } from '../MatchHandlersContext'
-
-/**
- * Returns the friendly display form of the repository name (e.g., removing "github.com/").
- */
-export function displayRepoName(repoName: string): string {
-    let parts = repoName.split('/')
-    if (parts.length >= 3 && parts[0].includes('.')) {
-        parts = parts.slice(1) // remove hostname from repo name (reduce visual noise)
-    }
-    return parts.join('/')
-}
 
 /**
  * Splits the repository name into the dir and base components.
  */
 export function splitPath(path: string): [string, string] {
     const components = path.split('/')
-    return [components.slice(0, -1).join('/'), components[components.length - 1]]
+    return [components.slice(0, -1).join('/'), components.at(-1)!]
 }
 
 interface Props {
@@ -87,20 +77,19 @@ export const RepoFileLink: React.FunctionComponent<React.PropsWithChildren<Props
     }
 
     return (
-        <div
-            ref={titleReference}
-            className={className}
-            onMouseEnter={checkTruncation}
-            data-tooltip={truncated ? (fileBase ? `${fileBase}/${fileName}` : fileName) : null}
-        >
-            <button onClick={onRepoClick} type="button" className="btn btn-text-link">
-                {repoDisplayName || displayRepoName(repoName)}
-            </button>{' '}
-            ›{' '}
-            <button onClick={onFileClick} type="button" className="btn btn-text-link">
-                {fileBase ? `${fileBase}/` : null}
-                <strong>{fileName}</strong>
-            </button>
-        </div>
+        <Tooltip content={truncated ? (fileBase ? `${fileBase}/${fileName}` : fileName) : null}>
+            <span>
+                <div ref={titleReference} className={className} onMouseEnter={checkTruncation}>
+                    <Button onClick={onRepoClick} className="btn-text-link">
+                        {repoDisplayName || displayRepoName(repoName)}
+                    </Button>{' '}
+                    ›{' '}
+                    <Button onClick={onFileClick} className="btn-text-link">
+                        {fileBase ? `${fileBase}/` : null}
+                        <strong>{fileName}</strong>
+                    </Button>
+                </div>
+            </span>
+        </Tooltip>
     )
 }

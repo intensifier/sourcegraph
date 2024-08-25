@@ -79,6 +79,9 @@ type ObservationGroupOptions struct {
 // These metrics can be created via internal/metrics.NewREDMetrics in the Go backend.
 func (observationConstructor) NewGroup(containerName string, owner monitoring.ObservableOwner, options ObservationGroupOptions) monitoring.Group {
 	rows := make([]monitoring.Row, 0, 2)
+	if options.JobLabel == "" {
+		options.JobLabel = "job"
+	}
 
 	if len(options.By) == 0 {
 		if options.Aggregate != nil {

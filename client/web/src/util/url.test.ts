@@ -1,6 +1,8 @@
-import { RepoFile } from '@sourcegraph/shared/src/util/url'
+import { describe, expect, test } from 'vitest'
 
-import { parseBrowserRepoURL, toTreeURL } from './url'
+import type { RepoFile } from '@sourcegraph/shared/src/util/url'
+
+import { getURLToFileCommit, parseBrowserRepoURL, toTreeURL } from './url'
 
 /**
  * Asserts deep object equality using node's assert.deepEqual, except it (1) ignores differences in the
@@ -24,6 +26,17 @@ describe('toTreeURL', () => {
     })
 
     // other cases are gratuitous given tests for other URL functions
+})
+
+describe('getURLToFileCommit', () => {
+    test('should return valid URL', () => {
+        const newURL = getURLToFileCommit(
+            'https://sourcegraph.com/github.com/gorilla/mux@foo/baz/bar/-/blob/mux.go',
+            'newfile.go',
+            'somerev'
+        )
+        expect(newURL).toEqual('/github.com/gorilla/mux@somerev/-/blob/newfile.go')
+    })
 })
 
 describe('parseBrowserRepoURL', () => {
@@ -181,6 +194,15 @@ describe('parseBrowserRepoURL', () => {
                 line: 3,
                 character: 5,
             },
+        })
+    })
+
+    test('should parse repo with revisions containing @', () => {
+        const parsed = parseBrowserRepoURL('https://sourcegraph.com/github.com/emotion-js/emotion@@emotion/core@11.0.0')
+        assertDeepStrictEqual(parsed, {
+            repoName: 'github.com/emotion-js/emotion',
+            revision: '@emotion/core@11.0.0',
+            rawRevision: '@emotion/core@11.0.0',
         })
     })
 })

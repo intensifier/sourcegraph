@@ -1,11 +1,12 @@
-import React, { useCallback, useMemo } from 'react'
+import React, { type FC, useMemo } from 'react'
 
-import { mdiLock, mdiChevronUp, mdiChevronDown, mdiDomain, mdiWeb } from '@mdi/js'
+import { mdiChevronDown, mdiChevronUp, mdiDomain, mdiLock, mdiWeb } from '@mdi/js'
 
-import { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
-import { Menu, MenuButton, MenuItem, MenuList, Icon } from '@sourcegraph/wildcard'
+import { TelemetryV2Props } from '@sourcegraph/shared/src/telemetry'
+import type { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import { Icon, Menu, MenuButton, MenuItem, MenuList } from '@sourcegraph/wildcard'
 
-import { AuthenticatedUser } from '../../auth'
+import type { AuthenticatedUser } from '../../auth'
 import { OrgAvatar } from '../../org/OrgAvatar'
 
 import styles from './NotebookShareOptionsDropdown.module.scss'
@@ -17,7 +18,7 @@ export interface ShareOption {
     isPublic: boolean
 }
 
-interface NotebookShareOptionsDropdownProps extends TelemetryProps {
+interface NotebookShareOptionsDropdownProps extends TelemetryProps, TelemetryV2Props {
     isSourcegraphDotCom: boolean
     authenticatedUser: AuthenticatedUser
     selectedShareOption: ShareOption
@@ -65,12 +66,20 @@ const ShareOptionComponent: React.FunctionComponent<
     )
 }
 
-export const NotebookShareOptionsDropdown: React.FunctionComponent<
-    React.PropsWithChildren<NotebookShareOptionsDropdownProps>
-> = ({ isSourcegraphDotCom, telemetryService, authenticatedUser, selectedShareOption, onSelectShareOption }) => {
-    const handleToggle = useCallback(() => {
+export const NotebookShareOptionsDropdown: FC<NotebookShareOptionsDropdownProps> = props => {
+    const {
+        isSourcegraphDotCom,
+        telemetryService,
+        telemetryRecorder,
+        authenticatedUser,
+        selectedShareOption,
+        onSelectShareOption,
+    } = props
+
+    const handleTriggerClick = (): void => {
         telemetryService.log('NotebookVisibilitySettingsDropdownToggled')
-    }, [telemetryService])
+        telemetryRecorder.recordEvent('notebook.visibilitySettingsDropdown', 'toggle')
+    }
 
     const shareOptions: ShareOption[] = useMemo(
         () => [
@@ -98,15 +107,15 @@ export const NotebookShareOptionsDropdown: React.FunctionComponent<
 
     return (
         <Menu>
-            {({ isOpen }) => (
-                <>
-                    <MenuButton
-                        onClick={handleToggle}
-                        className={styles.button}
-                        outline={true}
-                        variant="secondary"
-                        data-testid="share-notebook-options-dropdown-toggle"
-                    >
+            <MenuButton
+                outline={true}
+                variant="secondary"
+                data-testid="share-notebook-options-dropdown-toggle"
+                className={styles.button}
+                onClick={handleTriggerClick}
+            >
+                {isOpen => (
+                    <>
                         <span className="d-flex align-items-center">
                             <ShareOptionComponent {...selectedShareOption} isSourcegraphDotCom={isSourcegraphDotCom} />
                         </span>
@@ -117,21 +126,27 @@ export const NotebookShareOptionsDropdown: React.FunctionComponent<
                                 <Icon svgPath={mdiChevronDown} inline={false} aria-hidden={true} />
                             )}
                         </span>
-                    </MenuButton>
-                    <MenuList>
-                        {shareOptions.map(option => (
-                            <MenuItem
-                                key={`${option.namespaceId}-${option.isPublic}`}
-                                className="d-flex align-items-center"
-                                onSelect={() => onSelectShareOption(option)}
-                                data-testid={`share-notebook-option-${option.namespaceName}-${option.isPublic}`}
-                            >
-                                <ShareOptionComponent {...option} isSourcegraphDotCom={isSourcegraphDotCom} />
-                            </MenuItem>
-                        ))}
-                    </MenuList>
-                </>
-            )}
+                    </>
+                )}
+            </MenuButton>
+
+            <MenuList
+                // Stop keydown event bubbling in order to prevent a global notebook keyboard
+                // navigation. Global notebook navigation breaks this menu keyboard navigation
+                // see https://github.com/sourcegraph/sourcegraph/pull/41654#issuecomment-1246672813
+                onKeyDown={event => event.stopPropagation()}
+            >
+                {shareOptions.map(option => (
+                    <MenuItem
+                        key={`${option.namespaceId}-${option.isPublic}`}
+                        data-testid={`share-notebook-option-${option.namespaceName}-${option.isPublic}`}
+                        className="d-flex align-items-center"
+                        onSelect={() => onSelectShareOption(option)}
+                    >
+                        <ShareOptionComponent {...option} isSourcegraphDotCom={isSourcegraphDotCom} />
+                    </MenuItem>
+                ))}
+            </MenuList>
         </Menu>
     )
 }

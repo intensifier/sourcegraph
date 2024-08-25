@@ -1,9 +1,9 @@
 {
   "private": true,
   "name": "@sourcegraph/vscode",
-  "displayName": "Sourcegraph",
-  "version": "2.2.7",
-  "description": "Sourcegraph for VS Code",
+  "displayName": "Search by Sourcegraph",
+  "version": "2.2.17",
+  "description": "Search all of your repositories across all branches and all code hosts",
   "publisher": "sourcegraph",
   "sideEffects": true,
   "license": "Apache-2.0",
@@ -25,8 +25,8 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "main": "./dist/node/main.js",
-  "browser": "./dist/webworker/main.js",
+  "main": "./dist/node/extension.js",
+  "browser": "./dist/webworker/extension.js",
   "contributes": {
     "commands": [
       {
@@ -64,11 +64,17 @@
         "icon": "$(trash)"
       }
     ],
+    "authentication": [
+      {
+        "id": "sourcegraphauth",
+        "label": "Sourcegraph Auth"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "sourcegraph-view",
-          "title": "Sourcegraph",
+          "title": "Sourcegraph Search",
           "icon": "images/logomark_dark.svg"
         }
       ]
@@ -104,20 +110,6 @@
       "type": "object",
       "title": "Sourcegraph extension configuration",
       "properties": {
-        "sourcegraph.url": {
-          "type": [
-            "string"
-          ],
-          "default": "https://sourcegraph.com",
-          "description": "The base URL of the Sourcegraph instance to use."
-        },
-        "sourcegraph.accessToken": {
-          "type": [
-            "string"
-          ],
-          "default": "",
-          "description": "The access token to query the Sourcegraph API. Create a new access token at ${SOURCEGRAPH_URL}/users/settings/tokens"
-        },
         "sourcegraph.remoteUrlReplacements": {
           "type": [
             "object"
@@ -157,6 +149,43 @@
           "default": null,
           "examples": [
             "/Users/USERNAME/Documents/"
+          ]
+        },
+        "sourcegraph.proxyProtocol": {
+          "description": "The protocol to use when proxying requests to the Sourcegraph instance.",
+          "type": "string",
+          "default": "",
+          "examples": [
+            "http",
+            "https"
+          ]
+        },
+        "sourcegraph.proxyHost": {
+          "description": "The host to use when proxying requests to the Sourcegraph instance. It shouldn't include a protocol (like \"http://\") or a port (like \":7080\"). When this is set, port must be set as well.",
+          "type": "string",
+          "default": "",
+          "examples": [
+            "localhost",
+            "1.2.3.4"
+          ]
+        },
+        "sourcegraph.proxyPort": {
+          "description": "The port to use when proxying requests to the Sourcegraph instance. When this is set, host must be set as well.",
+          "type": "number",
+          "default": 0,
+          "examples": [
+            80,
+            443,
+            7080,
+            9090
+          ]
+        },
+        "sourcegraph.proxyPath": {
+          "description": "The full path to a file when proxying requests to the Sourcegraph instance via a UNIX domain socket.",
+          "type": "string",
+          "default": "",
+          "examples": [
+            "/home/user/path/unix.socket"
           ]
         }
       }
@@ -217,27 +246,33 @@
     }
   },
   "scripts": {
-    "eslint": "eslint --cache '**/*.[jt]s?(x)'",
-    "test": "ts-node ./tests/runTests.ts",
+    "lint:js": "eslint --cache '**/*.[jt]s?(x)'",
     "package": "ts-node ./scripts/package.ts",
-    "vscode:prepublish": "yarn build",
-    "task:gulp": "cross-env NODE_OPTIONS=\"--max_old_space_size=8192\" gulp",
-    "build:esbuild": "NODE_ENV=development yarn task:gulp esbuild",
-    "build:esbuild:web": "NODE_ENV=development TARGET_TYPE=webworker yarn task:gulp esbuild",
-    "watch:esbuild": "NODE_ENV=development WATCH=true yarn task:gulp esbuild",
-    "build": "NODE_ENV=production yarn task:gulp webpack",
-    "build:node": "NODE_ENV=production TARGET_TYPE=node yarn task:gulp webpack",
-    "build:web": "NODE_ENV=production TARGET_TYPE=webworker yarn task:gulp webpack",
-    "build:test": "NODE_ENV=production TARGET_TYPE=webworker IS_TEST=true yarn task:gulp webpack",
-    "watch": "yarn task:gulp watchWebpack",
-    "watch:node": "NODE_ENV=development TARGET_TYPE=node yarn task:gulp watchWebpack",
-    "watch:web": "NODE_ENV=development TARGET_TYPE=webworker yarn task:gulp watchWebpack",
-    "watch:test": "NODE_ENV=development TARGET_TYPE=webworker IS_TEST=true yarn task:gulp watchWebpack",
-    "test-integration": "TS_NODE_PROJECT=tests/tsconfig.json mocha --parallel=$CI --retries=2 ./tests/**/*.test.ts",
+    "prebuild": "pnpm -w run generate && pnpm build-inline-extensions",
+    "build-inline-extensions": "node scripts/build-inline-extensions",
+    "build": "pnpm run prebuild && NODE_ENV=development ts-node-transpile-only scripts/build.ts",
+    "build:test": "IS_TEST=1 pnpm run build",
+    "watch": "WATCH=1 pnpm run build",
+    "watch:test": "IS_TEST=1 pnpm run watch",
+    "test-integration": "TS_NODE_PROJECT=tests/tsconfig.json mocha --parallel=${CI:-\"false\"} --retries=2 ./tests/**/*.test.ts",
     "release": "ts-node ./scripts/publish.ts",
     "release:major": "VSCE_RELEASE_TYPE=major ts-node ./scripts/release.ts",
     "release:minor": "VSCE_RELEASE_TYPE=minor ts-node ./scripts/release.ts",
     "release:patch": "VSCE_RELEASE_TYPE=patch ts-node ./scripts/release.ts",
     "release:pre": "VSCE_RELEASE_TYPE=prerelease ts-node ./scripts/release.ts"
+  },
+  "devDependencies": {
+    "vsce": "^2.7.0",
+    "@sourcegraph/build-config": "workspace:*",
+    "@sourcegraph/extension-api-types": "workspace:*"
+  },
+  "dependencies": {
+    "@sourcegraph/branded": "workspace:*",
+    "@sourcegraph/client-api": "workspace:*",
+    "@sourcegraph/codeintellify": "workspace:*",
+    "@sourcegraph/common": "workspace:*",
+    "@sourcegraph/http-client": "workspace:*",
+    "@sourcegraph/shared": "workspace:*",
+    "@sourcegraph/wildcard": "workspace:*"
   }
 }

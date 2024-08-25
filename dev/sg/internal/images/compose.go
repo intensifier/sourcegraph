@@ -2,43 +2,44 @@ package images
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/docker/docker-credential-helpers/credentials"
+	"github.com/sourcegraph/conc/pool"
 	"gopkg.in/yaml.v3"
 
 	"github.com/sourcegraph/sourcegraph/dev/sg/internal/std"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
-	"github.com/sourcegraph/sourcegraph/lib/group"
 	"github.com/sourcegraph/sourcegraph/lib/output"
 )
 
-// UpdateCompose walks all `*docker-compose.yaml` files and updates Sourcegraph images
-// in each.
-func UpdateCompose(path string, creds credentials.Credentials, pinTag string) error {
+func UpdateComposeManifests(ctx context.Context, registry Registry, path string, op UpdateOperation) error {
 	var checked int
 	if err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 		if d.IsDir() {
 			return nil
 		}
-		if !strings.Contains(d.Name(), "docker-compose.yaml") {
-			std.Out.WriteWarningf("%s is not a docker-compose.yaml file but we will still try to update it anyway", path)
+		if filepath.Ext(d.Name()) != ".yaml" {
+			return nil
 		}
 
 		std.Out.WriteNoticef("Checking %q", path)
 
-		composeFile, err := os.ReadFile(path)
-		if err != nil {
-			return errors.Wrapf(err, "couldn't read %s", path)
+		composeFile, innerErr := os.ReadFile(path)
+		if innerErr != nil {
+			return errors.Wrapf(innerErr, "couldn't read %s", path)
 		}
 
 		checked++
-		newComposeFile, err := updateComposeFile(composeFile, creds, pinTag)
-		if err != nil {
-			return err
+		newComposeFile, innerErr := updateComposeFile(registry, op, composeFile)
+		if innerErr != nil {
+			return innerErr
 		}
 		if newComposeFile == nil {
 			std.Out.WriteSkippedf("No updates to make to %s", d.Name())
@@ -61,10 +62,9 @@ func UpdateCompose(path string, creds credentials.Credentials, pinTag string) er
 	return nil
 }
 
-// updateComposeFile updates composeFile data and returns it.
-func updateComposeFile(composeFile []byte, creds credentials.Credentials, pinTag string) ([]byte, error) {
+func updateComposeFile(registry Registry, op UpdateOperation, fileContent []byte) ([]byte, error) {
 	var compose map[string]any
-	if err := yaml.Unmarshal(composeFile, &compose); err != nil {
+	if err := yaml.Unmarshal(fileContent, &compose); err != nil {
 		return nil, err
 	}
 	services, ok := compose["services"].(map[string]any)
@@ -76,7 +76,8 @@ func updateComposeFile(composeFile []byte, creds credentials.Credentials, pinTag
 		original string
 		new      string
 	}
-	checks := group.NewWithResults[*replace]().WithMaxConcurrency(10)
+
+	checks := pool.NewWithResults[*replace]().WithMaxGoroutines(10).WithErrors()
 	for name, entry := range services {
 		name := name
 		service, ok := entry.(map[string]any)
@@ -85,39 +86,62 @@ func updateComposeFile(composeFile []byte, creds credentials.Credentials, pinTag
 			continue
 		}
 
-		checks.Go(func() *replace {
-			originalImage, ok := service["image"].(string)
+		checks.Go(func() (*replace, error) {
+			imageField, set := service["image"]
+			if !set {
+				std.Out.Verbosef("%s: no image", name)
+				return nil, nil
+			}
+			originalImage, ok := imageField.(string)
 			if !ok {
 				std.Out.WriteWarningf("%s: invalid image", name)
-				return nil
+				return nil, nil
 			}
 
-			newImage, err := getUpdatedSourcegraphImage(originalImage, creds, pinTag)
+			r, err := ParseRepository(originalImage)
 			if err != nil {
-				std.Out.WriteWarningf("%s: %s", name, err)
-				return nil
+				if errors.Is(err, ErrNoUpdateNeeded) {
+					std.Out.WriteLine(output.Styled(output.StyleWarning, fmt.Sprintf("skipping %q", originalImage)))
+					return nil, nil
+				} else {
+					return nil, err
+				}
 			}
 
-			std.Out.VerboseLine(output.Styledf(output.StylePending, "%s: will update to %s", name, newImage))
+			newR, err := op(registry, r)
+			if err != nil {
+				if errors.Is(err, ErrNoUpdateNeeded) {
+					std.Out.WriteLine(output.Styled(output.StyleWarning, fmt.Sprintf("skipping %q.", r.Ref())))
+					return nil, nil
+				} else {
+					std.Out.WriteLine(output.Styled(output.StyleWarning, fmt.Sprintf("error on %q: %v", originalImage, err)))
+					return nil, err
+				}
+			}
+
+			std.Out.VerboseLine(output.Styledf(output.StylePending, "%s: will update to %s", name, newR.Ref()))
 			return &replace{
 				original: originalImage,
-				new:      newImage,
-			}
+				new:      newR.Ref(),
+			}, nil
 		})
 	}
 
-	replaceOps := checks.Wait()
+	replaceOps, err := checks.Wait()
+	if err != nil {
+		return nil, err
+	}
 	var updates int
 	for _, r := range replaceOps {
 		if r == nil {
 			continue
 		}
-		composeFile = bytes.ReplaceAll(composeFile, []byte(r.original), []byte(r.new))
+		fileContent = bytes.ReplaceAll(fileContent, []byte(r.original), []byte(r.new))
 		updates++
 	}
 	if updates == 0 {
 		return nil, nil
 	}
 
-	return composeFile, nil
+	return fileContent, nil
 }

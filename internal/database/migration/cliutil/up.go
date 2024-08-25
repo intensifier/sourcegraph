@@ -2,22 +2,28 @@ package cliutil
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/urfave/cli/v2"
 
+	"github.com/sourcegraph/sourcegraph/internal/database/migration/multiversion"
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/runner"
+	"github.com/sourcegraph/sourcegraph/internal/database/migration/store"
 	"github.com/sourcegraph/sourcegraph/internal/oobmigration"
 	"github.com/sourcegraph/sourcegraph/internal/version"
 	"github.com/sourcegraph/sourcegraph/internal/version/upgradestore"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 	"github.com/sourcegraph/sourcegraph/lib/output"
 )
 
 func Up(commandName string, factory RunnerFactory, outFactory OutputFactory, development bool) *cli.Command {
 	schemaNamesFlag := &cli.StringSliceFlag{
-		Name:  "db",
-		Usage: "The target `schema(s)` to modify. Comma-separated values are accepted. Supply \"all\" to migrate all schemas.",
-		Value: cli.NewStringSlice("all"),
+		Name:    "schema",
+		Usage:   "The target `schema(s)` to modify. Comma-separated values are accepted. Possible values are 'frontend', 'codeintel', 'codeinsights' and 'all'.",
+		Value:   cli.NewStringSlice("all"),
+		Aliases: []string{"db"},
 	}
 	unprivilegedOnlyFlag := &cli.BoolFlag{
 		Name:  "unprivileged-only",
@@ -29,19 +35,24 @@ func Up(commandName string, factory RunnerFactory, outFactory OutputFactory, dev
 		Usage: "Skip application of privileged migrations, but record that they have been applied. This assumes the user has already applied the required privileged migrations with elevated permissions.",
 		Value: false,
 	}
-	privilegedHashFlag := &cli.StringFlag{
+	privilegedHashesFlag := &cli.StringSliceFlag{
 		Name:  "privileged-hash",
-		Usage: "Running -noop-privileged without this value will supply a value that will unlock migration application for the current upgrade operation. Future (distinct) upgrade operations will require a unique hash.",
-		Value: "",
+		Usage: "Running --noop-privileged without this flag will print instructions and supply a value for use in a second invocation. Multiple privileged hash flags (for distinct schemas) may be supplied. Future (distinct) up operations will require a unique hash.",
+		Value: nil,
 	}
 	ignoreSingleDirtyLogFlag := &cli.BoolFlag{
 		Name:  "ignore-single-dirty-log",
-		Usage: "Ignore a previously failed attempt if it will be immediately retried by this operation.",
+		Usage: "Ignore a single previously failed attempt if it will be immediately retried by this operation.",
+		Value: development,
+	}
+	ignoreSinglePendingLogFlag := &cli.BoolFlag{
+		Name:  "ignore-single-pending-log",
+		Usage: "Ignore a single pending migration attempt if it will be immediately retried by this operation.",
 		Value: development,
 	}
 	skipUpgradeValidationFlag := &cli.BoolFlag{
 		Name:  "skip-upgrade-validation",
-		Usage: "Do not attempt to compare the previous instance version with the target instance version for upgrade compatibility. Please refer to https://docs.sourcegraph.com/admin/updates#update-policy for our instance upgrade compatibility policy.",
+		Usage: "Do not attempt to compare the previous instance version with the target instance version for upgrade compatibility. Please refer to https://sourcegraph.com/docs/admin/updates#update-policy for our instance upgrade compatibility policy.",
 		// NOTE: version 0.0.0+dev (the development version) effectively skips this check as well
 		Value: development,
 	}
@@ -67,23 +78,29 @@ func Up(commandName string, factory RunnerFactory, outFactory OutputFactory, dev
 		}
 
 		return runner.Options{
-			Operations:           operations,
-			PrivilegedMode:       privilegedMode,
-			PrivilegedHash:       privilegedHashFlag.Get(cmd),
-			IgnoreSingleDirtyLog: ignoreSingleDirtyLogFlag.Get(cmd),
+			Operations:     operations,
+			PrivilegedMode: privilegedMode,
+			MatchPrivilegedHash: func(hash string) bool {
+				for _, candidate := range privilegedHashesFlag.Get(cmd) {
+					if hash == candidate {
+						return true
+					}
+				}
+
+				return false
+			},
+			IgnoreSingleDirtyLog:   ignoreSingleDirtyLogFlag.Get(cmd),
+			IgnoreSinglePendingLog: ignoreSinglePendingLogFlag.Get(cmd),
 		}, nil
 	}
 
 	action := makeAction(outFactory, func(ctx context.Context, cmd *cli.Context, out *output.Output) error {
-		schemaNames, err := sanitizeSchemaNames(schemaNamesFlag.Get(cmd))
-		if err != nil {
-			return err
-		}
+		schemaNames := sanitizeSchemaNames(schemaNamesFlag.Get(cmd), out)
 		if len(schemaNames) == 0 {
 			return flagHelp(out, "supply a schema via -db")
 		}
 
-		r, err := setupRunner(ctx, factory, schemaNames...)
+		r, err := setupRunner(factory, schemaNames...)
 		if err != nil {
 			return err
 		}
@@ -93,12 +110,25 @@ func Up(commandName string, factory RunnerFactory, outFactory OutputFactory, dev
 			return err
 		}
 
-		db, err := extractDatabase(ctx, r)
+		db, err := store.ExtractDatabase(ctx, r)
 		if err != nil {
 			return err
 		}
+
+		upgradestore := upgradestore.New(db)
+
+		_, dbShouldAutoUpgrade, err := upgradestore.GetAutoUpgrade(ctx)
+		if err != nil && !errors.HasPostgresCode(err, pgerrcode.UndefinedTable) && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		if multiversion.EnvShouldAutoUpgrade || dbShouldAutoUpgrade {
+			out.WriteLine(output.Emoji(output.EmojiInfo, "Auto-upgrade flag is set, delegating upgrade to frontend instance"))
+			return nil
+		}
+
 		if !skipUpgradeValidationFlag.Get(cmd) {
-			if err := upgradestore.New(db).ValidateUpgrade(ctx, "frontend", version.Version()); err != nil {
+			if err := upgradestore.ValidateUpgrade(ctx, "frontend", version.Version()); err != nil {
 				return err
 			}
 		}
@@ -127,8 +157,9 @@ func Up(commandName string, factory RunnerFactory, outFactory OutputFactory, dev
 			schemaNamesFlag,
 			unprivilegedOnlyFlag,
 			noopPrivilegedFlag,
-			privilegedHashFlag,
+			privilegedHashesFlag,
 			ignoreSingleDirtyLogFlag,
+			ignoreSinglePendingLogFlag,
 			skipUpgradeValidationFlag,
 			skipOutOfBandMigrationValidationFlag,
 		},

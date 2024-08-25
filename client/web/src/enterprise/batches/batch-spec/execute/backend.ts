@@ -1,16 +1,16 @@
-import { MutationTuple } from '@apollo/client'
-import { Observable } from 'rxjs'
+import type { MutationTuple } from '@apollo/client'
+import type { Observable } from 'rxjs'
 import { map } from 'rxjs/operators'
 
-import { asError, ErrorLike } from '@sourcegraph/common'
+import { asError, type ErrorLike } from '@sourcegraph/common'
 import { dataOrThrowErrors, gql, useMutation, useQuery } from '@sourcegraph/http-client'
 
 import { fileDiffFields } from '../../../../backend/diff'
 import { requestGraphQL } from '../../../../backend/graphql'
-import { useConnection, UseConnectionResult } from '../../../../components/FilteredConnection/hooks/useConnection'
-import {
+import type {
     BatchSpecWorkspaceByIDResult,
     BatchSpecWorkspaceByIDVariables,
+    BatchSpecWorkspacesConnectionFields,
     BatchSpecWorkspacesResult,
     BatchSpecWorkspaceStepFileDiffsResult,
     BatchSpecWorkspaceStepFileDiffsVariables,
@@ -19,14 +19,23 @@ import {
     CancelBatchSpecExecutionVariables,
     Scalars,
     WorkspaceStepFileDiffConnectionFields,
-    BatchSpecWorkspaceState,
     VisibleBatchSpecWorkspaceFields,
     HiddenBatchSpecWorkspaceFields,
-    VisibleBatchSpecWorkspaceListFields,
-    HiddenBatchSpecWorkspaceListFields,
     RetryWorkspaceExecutionResult,
     RetryWorkspaceExecutionVariables,
 } from '../../../../graphql-operations'
+
+export const batchSpecWorkspaceStepOutputLinesFieldsFragment = gql`
+    fragment BatchSpecWorkspaceStepOutputLines on BatchSpecWorkspaceStepOutputLineConnection {
+        __typename
+        nodes
+        totalCount
+        pageInfo {
+            hasNextPage
+            endCursor
+        }
+    }
+`
 
 const batchSpecWorkspaceFieldsFragment = gql`
     fragment BatchSpecWorkspaceFields on BatchSpecWorkspace {
@@ -38,7 +47,6 @@ const batchSpecWorkspaceFieldsFragment = gql`
         state
         diffStat {
             added
-            changed
             deleted
         }
         placeInQueue
@@ -83,9 +91,11 @@ const batchSpecWorkspaceFieldsFragment = gql`
             __typename
             id
             queueName
+            queueNames
             hostname
             active
             os
+            compatibility
             architecture
             dockerVersion
             executorVersion
@@ -106,14 +116,12 @@ const batchSpecWorkspaceFieldsFragment = gql`
         run
         diffStat {
             added
-            changed
             deleted
         }
         container
         ifCondition
         cachedResultFound
         skipped
-        outputLines
         startedAt
         finishedAt
         exitCode
@@ -155,7 +163,6 @@ const batchSpecWorkspaceFieldsFragment = gql`
                     headRef
                     diffStat {
                         added
-                        changed
                         deleted
                     }
                 }
@@ -239,6 +246,23 @@ export const BATCH_SPEC_WORKSPACE_BY_ID = gql`
         }
     }
     ${batchSpecWorkspaceFieldsFragment}
+`
+
+export const BATCH_SPEC_WORKSPACE_STEP = gql`
+    query BatchSpecWorkspaceStep($workspaceID: ID!, $stepIndex: Int!, $first: Int!, $after: String) {
+        node(id: $workspaceID) {
+            __typename
+            ... on VisibleBatchSpecWorkspace {
+                step(index: $stepIndex) {
+                    outputLines(first: $first, after: $after) {
+                        ...BatchSpecWorkspaceStepOutputLines
+                    }
+                }
+            }
+        }
+    }
+
+    ${batchSpecWorkspaceStepOutputLinesFieldsFragment}
 `
 
 interface BatchSpecWorkspaceHookResult {
@@ -366,13 +390,13 @@ export const queryBatchSpecWorkspaceStepFileDiffs = ({
 
 export const BATCH_SPEC_WORKSPACES = gql`
     query BatchSpecWorkspaces(
-        $node: ID!
+        $batchSpecID: ID!
         $first: Int
         $after: String
         $search: String
         $state: BatchSpecWorkspaceState
     ) {
-        node(id: $node) {
+        node(id: $batchSpecID) {
             __typename
             ... on BatchSpec {
                 id
@@ -408,7 +432,6 @@ export const BATCH_SPEC_WORKSPACES = gql`
         state
         diffStat {
             added
-            changed
             deleted
         }
         placeInQueue
@@ -436,44 +459,38 @@ export const BATCH_SPEC_WORKSPACES = gql`
     }
 `
 
-export const useWorkspacesListConnection = (
-    batchSpecID: Scalars['ID'],
-    search: string | null,
-    state: BatchSpecWorkspaceState | null
-): UseConnectionResult<HiddenBatchSpecWorkspaceListFields | VisibleBatchSpecWorkspaceListFields> =>
-    useConnection<
-        BatchSpecWorkspacesResult,
-        BatchSpecWorkspacesVariables,
-        HiddenBatchSpecWorkspaceListFields | VisibleBatchSpecWorkspaceListFields
-    >({
-        query: BATCH_SPEC_WORKSPACES,
-        variables: {
-            node: batchSpecID,
-            after: null,
-            first: 20,
-            search,
-            state,
-        },
-        options: {
-            useURL: true,
-            fetchPolicy: 'cache-and-network',
-            pollInterval: 2500,
-        },
-        getConnection: result => {
-            const data = dataOrThrowErrors(result)
-
-            if (!data.node) {
+// NOTE: The workspaces list connection query was implemented with Apollo but has been
+// migrated back to `requestGraphQL` and observables due to polling + pagination not
+// playing well together with the cache. See
+// https://github.com/sourcegraph/sourcegraph/pull/40717 for more context. 😢😢
+export const queryWorkspacesList = ({
+    batchSpecID,
+    first,
+    after,
+    search,
+    state,
+}: BatchSpecWorkspacesVariables): Observable<BatchSpecWorkspacesConnectionFields> =>
+    requestGraphQL<BatchSpecWorkspacesResult, BatchSpecWorkspacesVariables>(BATCH_SPEC_WORKSPACES, {
+        batchSpecID,
+        first,
+        after,
+        search,
+        state,
+    }).pipe(
+        map(dataOrThrowErrors),
+        map(({ node }) => {
+            if (!node) {
                 throw new Error(`Batch spec with ID ${batchSpecID} does not exist`)
             }
-            if (data.node.__typename !== 'BatchSpec') {
-                throw new Error(`The given ID is a ${data.node.__typename as string}, not a BatchSpec`)
+            if (node.__typename !== 'BatchSpec') {
+                throw new Error(`The given ID is a ${node.__typename}, not a BatchSpec`)
             }
-            if (!data.node.workspaceResolution) {
+            if (!node.workspaceResolution) {
                 throw new Error('No workspace resolution in batch spec')
             }
-            return data.node.workspaceResolution.workspaces
-        },
-    })
+            return node.workspaceResolution.workspaces
+        })
+    )
 
 const RETRY_WORKSPACE_EXECUTION = gql`
     mutation RetryWorkspaceExecution($id: ID!) {

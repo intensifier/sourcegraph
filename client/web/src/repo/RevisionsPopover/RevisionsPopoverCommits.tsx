@@ -1,16 +1,15 @@
 import React, { useState } from 'react'
 
-import classNames from 'classnames'
-import * as H from 'history'
-import { useLocation } from 'react-router'
+import type * as H from 'history'
+import { useLocation } from 'react-router-dom'
 
 import { dataOrThrowErrors, gql } from '@sourcegraph/http-client'
-import { Scalars } from '@sourcegraph/shared/src/graphql-operations'
+import type { Scalars } from '@sourcegraph/shared/src/graphql-operations'
 import { Badge, useDebounce } from '@sourcegraph/wildcard'
 
-import { useConnection } from '../../components/FilteredConnection/hooks/useConnection'
+import { useShowMorePagination } from '../../components/FilteredConnection/hooks/useShowMorePagination'
 import { ConnectionSummary } from '../../components/FilteredConnection/ui'
-import {
+import type {
     GitCommitAncestorFields,
     RepositoryGitCommitResult,
     RepositoryGitCommitVariables,
@@ -83,14 +82,13 @@ const GitCommitNode: React.FunctionComponent<React.PropsWithChildren<GitCommitNo
 }) => {
     const isCurrent = currentCommitID === node.oid
     return (
-        <ConnectionPopoverNode key={node.oid} className={classNames(styles.link, styles.message)}>
+        <ConnectionPopoverNode key={node.oid}>
             <ConnectionPopoverNodeLink
                 to={getPathFromRevision(location.pathname + location.search + location.hash, node.oid)}
                 active={isCurrent}
-                className={styles.link}
                 onClick={onClick}
             >
-                <Badge title={node.oid} as="code">
+                <Badge title={node.oid} className="px-1 py-0" as="code">
                     {node.abbreviatedOID}
                 </Badge>
                 <small title={node.author.date} className={styles.message}>
@@ -138,11 +136,14 @@ export const RevisionsPopoverCommits: React.FunctionComponent<
     const query = useDebounce(searchValue, 200)
     const location = useLocation()
 
-    const response = useConnection<RepositoryGitCommitResult, RepositoryGitCommitVariables, GitCommitAncestorFields>({
+    const response = useShowMorePagination<
+        RepositoryGitCommitResult,
+        RepositoryGitCommitVariables,
+        GitCommitAncestorFields
+    >({
         query: REPOSITORY_GIT_COMMIT,
         variables: {
             query,
-            first: BATCH_COUNT,
             repo,
             revision: currentRev || defaultBranch,
         },
@@ -173,13 +174,13 @@ export const RevisionsPopoverCommits: React.FunctionComponent<
         },
         options: {
             fetchPolicy: 'cache-first',
+            pageSize: BATCH_COUNT,
         },
     })
 
     const summary = response.connection && (
         <ConnectionSummary
             connection={response.connection}
-            first={BATCH_COUNT}
             noun={noun}
             pluralNoun={pluralNoun}
             hasNextPage={response.hasNextPage}

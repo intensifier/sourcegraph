@@ -1,20 +1,22 @@
-import { render, act, RenderResult } from '@testing-library/react'
+import { render, act, type RenderResult } from '@testing-library/react'
 import * as H from 'history'
 import { of, NEVER } from 'rxjs'
+import { describe, expect, test, vi } from 'vitest'
 
 import { ContributableMenu } from '@sourcegraph/client-api'
 
-import { FlatExtensionHostAPI } from '../api/contract'
+import type { FlatExtensionHostAPI } from '../api/contract'
 import { pretendProxySubscribable, pretendRemote } from '../api/util'
+import { noOpTelemetryRecorder } from '../telemetry'
 import { NOOP_TELEMETRY_SERVICE } from '../telemetry/telemetryService'
 import { extensionsController } from '../testing/searchTestHelpers'
 
 import { ActionsNavItems } from './ActionsNavItems'
 
-jest.mock('mdi-react/OpenInNewIcon', () => 'OpenInNewIcon')
+vi.mock('mdi-react/OpenInNewIcon', () => 'OpenInNewIcon')
 
 describe('ActionItem', () => {
-    const NOOP_PLATFORM_CONTEXT = { forceUpdateTooltip: () => undefined, settings: NEVER }
+    const NOOP_PLATFORM_CONTEXT = { settings: NEVER }
     const location = H.createLocation(
         'https://github.com/sourcegraph/sourcegraph/pull/5287/files#diff-eb9883bb910397a210512a13fd7384ac'
     )
@@ -41,6 +43,9 @@ describe('ActionItem', () => {
                                                         label: 'Action A',
                                                         description: 'This is Action A',
                                                     },
+                                                    telemetryProps: {
+                                                        feature: 'a',
+                                                    },
                                                 },
                                             ],
                                             menus: {
@@ -57,6 +62,7 @@ describe('ActionItem', () => {
                     }}
                     platformContext={NOOP_PLATFORM_CONTEXT}
                     telemetryService={NOOP_TELEMETRY_SERVICE}
+                    telemetryRecorder={noOpTelemetryRecorder}
                 />
             )
         })

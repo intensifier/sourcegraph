@@ -1,16 +1,23 @@
-import { DecoratorFn, Meta, Story } from '@storybook/react'
+import type { Decorator, Meta, StoryFn } from '@storybook/react'
 import classNames from 'classnames'
 
 import { Container } from '@sourcegraph/wildcard'
 
 import { WebStory } from '../../components/WebStory'
+import type { WebhookLogFields } from '../../graphql-operations'
 
-import { webhookLogNode } from './story/fixtures'
+import {
+    webhookLogNode,
+    LARGE_HEADERS_JSON,
+    LARGE_BODY_JSON,
+    LARGE_HEADERS_PLAIN,
+    LARGE_BODY_PLAIN,
+} from './story/fixtures'
 import { WebhookLogNode } from './WebhookLogNode'
 
-import gridStyles from './WebhookLogPage.module.scss'
+import gridStyles from '../SiteAdminWebhookPage.module.scss'
 
-const decorator: DecoratorFn = story => (
+const decorator: Decorator = story => (
     <Container>
         <div className={classNames('p-3', 'container', gridStyles.logs)}>{story()}</div>
     </Container>
@@ -18,12 +25,22 @@ const decorator: DecoratorFn = story => (
 
 const config: Meta = {
     title: 'web/site-admin/webhooks/WebhookLogNode',
-    parameters: {
-        chromatic: {
-            viewports: [320, 576, 978, 1440],
+    parameters: {},
+    decorators: [decorator],
+    argTypes: {
+        receivedAt: {
+            name: 'received at',
+            control: { type: 'text' },
+        },
+        statusCode: {
+            name: 'status code',
+            control: { type: 'number', min: 100, max: 599 },
         },
     },
-    decorators: [decorator],
+    args: {
+        receivedAt: 'Sun Nov 07 2021 14:31:00 GMT-0500 (Eastern Standard Time)',
+        statusCode: 204,
+    },
 }
 
 export default config
@@ -34,30 +51,86 @@ export default config
 // the external service name is handled properly when there isn't an external
 // service.
 //
-// Some bonus knobs are provided for the tinkerers.
+// Some bonus controls are provided for the tinkerers.
 
-export const Collapsed: Story = () => (
+type StoryArguments = Pick<WebhookLogFields, 'receivedAt' | 'statusCode'>
+
+export const Collapsed: StoryFn<StoryArguments> = args => (
     <WebStory>
         {() => (
-            <WebhookLogNode
-                node={webhookLogNode({
-                    externalService: {
-                        displayName: 'GitLab',
-                    },
-                })}
-            />
+            <>
+                <WebhookLogNode
+                    node={webhookLogNode(args, {
+                        externalService: {
+                            displayName: 'GitLab',
+                        },
+                    })}
+                />
+                <WebhookLogNode
+                    node={webhookLogNode(args, {
+                        externalService: {
+                            displayName: 'BitBucket Server',
+                        },
+                        response: {
+                            headers: LARGE_HEADERS_PLAIN,
+                            body: LARGE_BODY_PLAIN,
+                        },
+                        request: {
+                            headers: LARGE_HEADERS_JSON,
+                            body: LARGE_BODY_JSON,
+                            method: 'POST',
+                            url: '/my/awesome/url',
+                            version: 'HTTP/1.1',
+                        },
+                    })}
+                />
+            </>
         )}
     </WebStory>
 )
 
-export const ExpandedRequest: Story = () => (
-    <WebStory>{() => <WebhookLogNode node={webhookLogNode()} initiallyExpanded={true} />}</WebStory>
+export const ExpandedRequest: StoryFn<StoryArguments> = args => (
+    <WebStory>
+        {() => (
+            <>
+                <WebhookLogNode node={webhookLogNode(args)} initiallyExpanded={true} />
+                <WebhookLogNode
+                    node={webhookLogNode(args, {
+                        request: {
+                            headers: LARGE_HEADERS_JSON,
+                            body: LARGE_BODY_JSON,
+                            method: 'POST',
+                            url: '/my/awesome/url',
+                            version: 'HTTP/1.1',
+                        },
+                    })}
+                    initiallyExpanded={true}
+                />
+            </>
+        )}
+    </WebStory>
 )
 
 ExpandedRequest.storyName = 'expanded request'
 
-export const ExpandedResponse: Story = () => (
-    <WebStory>{() => <WebhookLogNode node={webhookLogNode()} initiallyExpanded={true} initialTabIndex={1} />}</WebStory>
+export const ExpandedResponse: StoryFn<StoryArguments> = args => (
+    <WebStory>
+        {() => (
+            <>
+                <WebhookLogNode node={webhookLogNode(args)} initiallyExpanded={true} initialTabIndex={1} />
+                <WebhookLogNode
+                    node={webhookLogNode(args, {
+                        response: {
+                            headers: LARGE_HEADERS_PLAIN,
+                            body: LARGE_BODY_PLAIN,
+                        },
+                    })}
+                    initiallyExpanded={true}
+                    initialTabIndex={1}
+                />
+            </>
+        )}
+    </WebStory>
 )
 
 ExpandedResponse.storyName = 'expanded response'

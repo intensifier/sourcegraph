@@ -1,56 +1,68 @@
 import React, { useEffect } from 'react'
 
-import classNames from 'classnames'
-import { Navigate, useLocation } from 'react-router-dom-v5-compat'
+import { Navigate, useLocation } from 'react-router-dom'
 
-import { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
-import { ThemeProps } from '@sourcegraph/shared/src/theme'
-import { Link, Text } from '@sourcegraph/wildcard'
+import type { TelemetryV2Props } from '@sourcegraph/shared/src/telemetry'
+import type { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import { EVENT_LOGGER } from '@sourcegraph/shared/src/telemetry/web/eventLogger'
+import { useIsLightTheme } from '@sourcegraph/shared/src/theme'
+import { Container, Link, Text } from '@sourcegraph/wildcard'
 
-import { AuthenticatedUser } from '../auth'
-import { HeroPage } from '../components/HeroPage'
+import type { AuthenticatedUser } from '../auth'
 import { PageTitle } from '../components/PageTitle'
-import { SourcegraphContext } from '../jscontext'
-import { eventLogger } from '../tracking/eventLogger'
+import type { SourcegraphContext } from '../jscontext'
+import { PageRoutes } from '../routes.constants'
+import { EventName } from '../util/constants'
 
+import { AuthPageWrapper } from './AuthPageWrapper'
 import { CloudSignUpPage, ShowEmailFormQueryParameter } from './CloudSignUpPage'
-import { SourcegraphIcon } from './icons'
-import { getReturnTo, maybeAddPostSignUpRedirect } from './SignInSignUpCommon'
-import { SignUpArguments, SignUpForm } from './SignUpForm'
+import { getReturnTo } from './SignInSignUpCommon'
+import { type SignUpArguments, SignUpForm } from './SignUpForm'
 import { VsCodeSignUpPage } from './VsCodeSignUpPage'
 
-import signInSignUpCommonStyles from './SignInSignUpCommon.module.scss'
+import styles from './SignUpPage.module.scss'
 
-export interface SignUpPageProps extends ThemeProps, TelemetryProps {
+export interface SignUpPageProps extends TelemetryProps, TelemetryV2Props {
     authenticatedUser: AuthenticatedUser | null
     context: Pick<
         SourcegraphContext,
-        'allowSignup' | 'experimentalFeatures' | 'authProviders' | 'sourcegraphDotComMode' | 'xhrHeaders'
+        | 'allowSignup'
+        | 'externalURL'
+        | 'authProviders'
+        | 'sourcegraphDotComMode'
+        | 'xhrHeaders'
+        | 'authPasswordPolicy'
+        | 'authMinPasswordLength'
     >
 }
 
 export const SignUpPage: React.FunctionComponent<React.PropsWithChildren<SignUpPageProps>> = ({
     authenticatedUser,
     context,
-    isLightTheme,
     telemetryService,
+    telemetryRecorder,
 }) => {
     const location = useLocation()
     const query = new URLSearchParams(location.search)
     const invitedBy = query.get('invitedBy')
     const returnTo = getReturnTo(location)
 
+    const isLightTheme = useIsLightTheme()
+
     useEffect(() => {
-        eventLogger.logViewEvent('SignUp', null, false)
+        EVENT_LOGGER.logViewEvent('SignUp', null, false)
+        telemetryRecorder.recordEvent('auth.signUp', 'view', {
+            metadata: { 'invited-by-user': invitedBy !== null ? 1 : 0 },
+        })
 
         if (invitedBy !== null) {
             const parameters = {
                 isAuthenticated: !!authenticatedUser,
                 allowSignup: context.allowSignup,
             }
-            eventLogger.log('SignUpInvitedByUser', parameters, parameters)
+            EVENT_LOGGER.log('SignUpInvitedByUser', parameters, parameters)
         }
-    }, [invitedBy, authenticatedUser, context.allowSignup])
+    }, [invitedBy, authenticatedUser, context.allowSignup, telemetryRecorder])
 
     if (authenticatedUser) {
         return <Navigate to={returnTo} replace={true} />
@@ -58,11 +70,6 @@ export const SignUpPage: React.FunctionComponent<React.PropsWithChildren<SignUpP
 
     if (!context.allowSignup) {
         return <Navigate to="/sign-in" replace={true} />
-    }
-
-    let newUserFromEmailInvitation = false
-    if (context.sourcegraphDotComMode && returnTo.includes('/organizations/invitation/')) {
-        newUserFromEmailInvitation = true
     }
 
     const handleSignUp = (args: SignUpArguments): Promise<void> =>
@@ -80,14 +87,13 @@ export const SignUpPage: React.FunctionComponent<React.PropsWithChildren<SignUpP
                 return response.text().then(text => Promise.reject(new Error(text)))
             }
 
-            // if sign up is successful and enablePostSignupFlow feature is ON
-            // and user is not signing up from an email invitation to join an org -
-            // redirect user to the /post-sign-up page
-            if (context.experimentalFeatures.enablePostSignupFlow && !newUserFromEmailInvitation) {
-                window.location.replace(new URL(maybeAddPostSignUpRedirect(), window.location.href).pathname)
-            } else {
-                window.location.replace(returnTo)
-            }
+            const source = query.get('editor') === 'vscode' ? 'ide_extension' : 'web'
+            telemetryService.log(EventName.SIGNUP_COMPLETED, { source }, { source })
+            const v2Source = query.get('editor') === 'vscode' ? 0 : 1
+            telemetryRecorder.recordEvent('auth.signUp', 'complete', { metadata: { source: v2Source } })
+
+            // Redirects to the /post-sign-up after successful signup on sourcegraphDotCom.
+            window.location.replace(context.sourcegraphDotComMode ? PageRoutes.PostSignUp : returnTo)
 
             return Promise.resolve()
         })
@@ -97,10 +103,10 @@ export const SignUpPage: React.FunctionComponent<React.PropsWithChildren<SignUpP
             <VsCodeSignUpPage
                 source={query.get('src')}
                 onSignUp={handleSignUp}
-                isLightTheme={isLightTheme}
                 showEmailForm={query.has(ShowEmailFormQueryParameter)}
                 context={context}
                 telemetryService={telemetryService}
+                telemetryRecorder={telemetryRecorder}
             />
         )
     }
@@ -114,33 +120,31 @@ export const SignUpPage: React.FunctionComponent<React.PropsWithChildren<SignUpP
                 showEmailForm={query.has(ShowEmailFormQueryParameter)}
                 context={context}
                 telemetryService={telemetryService}
+                telemetryRecorder={telemetryRecorder}
+                isSourcegraphDotCom={context.sourcegraphDotComMode}
             />
         )
     }
 
     return (
-        <div className={signInSignUpCommonStyles.signinSignupPage}>
+        <>
             <PageTitle title="Sign up" />
-            <HeroPage
-                icon={SourcegraphIcon}
-                iconLinkTo={context.sourcegraphDotComMode ? '/search' : undefined}
-                iconClassName="bg-transparent"
-                title={
-                    context.sourcegraphDotComMode ? 'Sign up for Sourcegraph Cloud' : 'Sign up for Sourcegraph Server'
+            <AuthPageWrapper
+                title="Welcome to Sourcegraph"
+                description={
+                    context.sourcegraphDotComMode ? 'Sign up for Sourcegraph.com' : 'Sign up for Sourcegraph Server'
                 }
-                lessPadding={true}
-                body={
-                    <div className={classNames('pb-5', signInSignUpCommonStyles.signupPageContainer)}>
-                        {context.sourcegraphDotComMode && (
-                            <Text className="pt-1 pb-2">Start searching public code now</Text>
-                        )}
-                        <SignUpForm context={context} onSignUp={handleSignUp} />
-                        <Text className="mt-3">
-                            Already have an account? <Link to={`/sign-in${location.search}`}>Sign in</Link>
-                        </Text>
-                    </div>
-                }
-            />
-        </div>
+                sourcegraphDotComMode={context.sourcegraphDotComMode}
+                className={styles.wrapper}
+            >
+                {context.sourcegraphDotComMode && <Text className="pt-1 pb-2">Start searching public code now</Text>}
+                <Container>
+                    <SignUpForm context={context} onSignUp={handleSignUp} telemetryRecorder={telemetryRecorder} />
+                </Container>
+                <Text className="text-center mt-3">
+                    Already have an account? <Link to={`/sign-in${location.search}`}>Sign in</Link>
+                </Text>
+            </AuthPageWrapper>
+        </>
     )
 }

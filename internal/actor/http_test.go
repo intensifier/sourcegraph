@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/sourcegraph/log/logtest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +39,13 @@ func TestHTTPTransport(t *testing.T) {
 		actor: &Actor{UID: 1234},
 		wantHeaders: map[string]string{
 			headerKeyActorUID: "1234",
+		},
+	}, {
+		name:  "user actor with anonymous UID",
+		actor: &Actor{UID: 1234, AnonymousUID: "foobar"},
+		wantHeaders: map[string]string{
+			headerKeyActorUID:          "1234",
+			headerKeyActorAnonymousUID: "foobar",
 		},
 	}}
 	for _, tt := range tests {
@@ -112,10 +120,17 @@ func TestHTTPMiddleware(t *testing.T) {
 			headerKeyActorAnonymousUID: "anonymousUID",
 		},
 		wantActor: &Actor{AnonymousUID: "anonymousUID"},
+	}, {
+		name: "anonymous UID for authed actor",
+		headers: map[string]string{
+			headerKeyActorUID:          "123",
+			headerKeyActorAnonymousUID: "anonymousUID",
+		},
+		wantActor: &Actor{UID: 123, AnonymousUID: "anonymousUID"},
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := HTTPMiddleware(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			handler := HTTPMiddleware(logtest.Scoped(t), http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 				got := FromContext(r.Context())
 				// Compare string representation
 				if diff := cmp.Diff(tt.wantActor.String(), got.String()); diff != "" {
@@ -147,11 +162,23 @@ func TestAnonymousUIDMiddleware(t *testing.T) {
 		handler.ServeHTTP(httptest.NewRecorder(), req)
 	})
 
+	t.Run("header value is respected", func(t *testing.T) {
+		handler := AnonymousUIDMiddleware(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			got := FromContext(r.Context())
+			require.Equal(t, "anon", got.AnonymousUID)
+		}))
+
+		req, err := http.NewRequest(http.MethodGet, "/test", nil)
+		require.NoError(t, err)
+		req.Header.Set(headerKeyActorAnonymousUID, "anon")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	})
+
 	t.Run("cookie doesn't overwrite existing middleware", func(t *testing.T) {
 		handler := http.Handler(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			got := FromContext(r.Context())
 			require.Equal(t, int32(132), got.UID)
-			require.Equal(t, "", got.AnonymousUID)
+			require.Equal(t, "anon", got.AnonymousUID) // preserve the anonymous UID!
 		}))
 		anonHandler := AnonymousUIDMiddleware(handler)
 		userHandler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {

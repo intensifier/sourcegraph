@@ -1,13 +1,14 @@
 import assert from 'assert'
 
 import delay from 'delay'
+import { afterEach, beforeEach, describe, it } from 'mocha'
 import { Key } from 'ts-key-enum'
 
-import { createDriverForTest, Driver } from '@sourcegraph/shared/src/testing/driver'
+import { createDriverForTest, type Driver } from '@sourcegraph/shared/src/testing/driver'
 import { afterEachSaveScreenshotIfFailed } from '@sourcegraph/shared/src/testing/screenshotReporter'
 
-import { InsightViewNode } from '../../graphql-operations'
-import { createWebIntegrationTestContext, WebIntegrationTestContext } from '../context'
+import type { InsightViewNode } from '../../graphql-operations'
+import { createWebIntegrationTestContext, type WebIntegrationTestContext } from '../context'
 
 import { MIGRATION_TO_GQL_INSIGHT_DATA_FIXTURE } from './fixtures/calculated-insights'
 import { createJITMigrationToGQLInsightMetadataFixture } from './fixtures/insights-metadata'
@@ -26,10 +27,6 @@ describe('Backend insight drill down filters', () => {
             driver,
             currentTest: this.currentTest!,
             directory: __dirname,
-            customContext: {
-                // Enforce using a new gql API for code insights pages
-                codeInsightsGqlApiEnabled: true,
-            },
         })
     })
 
@@ -42,11 +39,13 @@ describe('Backend insight drill down filters', () => {
             testContext,
             overrides: {
                 // Mock back-end insights with standard gql API handler
-                GetInsights: () => ({
+                GetAllInsightConfigurations: () => ({
                     __typename: 'Query',
                     insightViews: {
                         __typename: 'InsightViewConnection',
                         nodes: [createJITMigrationToGQLInsightMetadataFixture({ type: 'calculated' })],
+                        pageInfo: { __typename: 'PageInfo', endCursor: null, hasNextPage: false },
+                        totalCount: 1,
                     },
                 }),
 
@@ -73,7 +72,13 @@ describe('Backend insight drill down filters', () => {
                 GetSearchContextByName: () => ({
                     searchContexts: {
                         __typename: 'SearchContextConnection',
-                        nodes: [{ __typename: 'SearchContext', spec: '@sourcegraph/sourcegraph' }],
+                        nodes: [
+                            {
+                                __typename: 'SearchContext',
+                                spec: '@sourcegraph/sourcegraph',
+                                query: 'repo:github.com/sourcegraph/sourcegraph',
+                            },
+                        ],
                     },
                 }),
 
@@ -87,7 +92,7 @@ describe('Backend insight drill down filters', () => {
             },
         })
 
-        await driver.page.goto(driver.sourcegraphBaseUrl + '/insights/dashboards/all')
+        await driver.page.goto(driver.sourcegraphBaseUrl + '/insights/all')
         await driver.page.waitForSelector('svg circle')
 
         await driver.page.click('button[aria-label="Filters"]')
@@ -126,7 +131,8 @@ describe('Backend insight drill down filters', () => {
                 excludeRepoRegex: 'github.com/sourcegraph/sourcegraph',
             },
             seriesDisplayOptions: {
-                limit: 20,
+                limit: null,
+                numSamples: null,
                 sortOptions: {
                     direction: 'DESC',
                     mode: 'RESULT_COUNT',
@@ -137,8 +143,8 @@ describe('Backend insight drill down filters', () => {
 
     it('should create a new insight with predefined filters via drill-down flow insight creation', async () => {
         const insightWithFilters: InsightViewNode = {
-            ...createJITMigrationToGQLInsightMetadataFixture({ type: 'calculated' }),
-            appliedFilters: {
+            ...createJITMigrationToGQLInsightMetadataFixture({ type: 'calculated', id: 'view_1' }),
+            defaultFilters: {
                 __typename: 'InsightViewFilters',
                 searchContexts: [],
                 includeRepoRegex: '',
@@ -150,11 +156,13 @@ describe('Backend insight drill down filters', () => {
             testContext,
             overrides: {
                 // Mock back-end insights with standard gql API handler
-                GetInsights: () => ({
+                GetAllInsightConfigurations: () => ({
                     __typename: 'Query',
                     insightViews: {
                         __typename: 'InsightViewConnection',
                         nodes: [insightWithFilters],
+                        pageInfo: { __typename: 'PageInfo', endCursor: null, hasNextPage: false },
+                        totalCount: 1,
                     },
                 }),
 
@@ -178,25 +186,17 @@ describe('Backend insight drill down filters', () => {
                     },
                 }),
 
-                FirstStepCreateSearchBasedInsight: () => ({
+                SaveInsightAsNewView: () => ({
                     __typename: 'Mutation',
-                    createLineChartSearchInsight: {
+                    saveInsightAsNewView: {
                         __typename: 'InsightViewPayload',
-                        view: createJITMigrationToGQLInsightMetadataFixture({ type: 'calculated' }),
-                    },
-                }),
-
-                UpdateLineChartSearchInsight: () => ({
-                    __typename: 'Mutation',
-                    updateLineChartSearchInsight: {
-                        __typename: 'InsightViewPayload',
-                        view: createJITMigrationToGQLInsightMetadataFixture({ type: 'calculated' }),
+                        view: createJITMigrationToGQLInsightMetadataFixture({ id: 'view_2', type: 'calculated' }),
                     },
                 }),
             },
         })
 
-        await driver.page.goto(driver.sourcegraphBaseUrl + '/insights/dashboards/all')
+        await driver.page.goto(driver.sourcegraphBaseUrl + '/insights/all')
         await driver.page.waitForSelector('svg circle')
 
         await driver.page.click('button[aria-label="Active filters"]')
@@ -218,56 +218,23 @@ describe('Backend insight drill down filters', () => {
 
         const variables = await testContext.waitForGraphQLRequest(async () => {
             await driver.page.click('[role="dialog"][aria-label="Drill-down filters panel"] button[type="submit"]')
-        }, 'UpdateLineChartSearchInsight')
+        }, 'SaveInsightAsNewView')
 
         assert.deepStrictEqual(variables.input, {
-            dataSeries: [
-                {
-                    seriesId: '001',
-                    query: 'patternType:regex case:yes \\*\\sas\\sGQL',
-                    options: {
-                        label: 'Imports of old GQL.* types',
-                        lineColor: 'var(--oc-red-7)',
-                    },
-                    repositoryScope: {
-                        repositories: ['github.com/sourcegraph/sourcegraph'],
-                    },
-                    timeScope: {
-                        stepInterval: {
-                            unit: 'WEEK',
-                            value: 6,
-                        },
-                    },
-                },
-                {
-                    seriesId: '002',
-                    query: "patternType:regexp case:yes /graphql-operations'",
-                    options: {
-                        label: 'Imports of new graphql-operations types',
-                        lineColor: 'var(--oc-blue-7)',
-                    },
-                    repositoryScope: {
-                        repositories: ['github.com/sourcegraph/sourcegraph'],
-                    },
-                    timeScope: {
-                        stepInterval: {
-                            unit: 'WEEK',
-                            value: 6,
-                        },
-                    },
-                },
-            ],
-            presentationOptions: {
-                title: 'Migration to new GraphQL TS types',
+            insightViewId: 'view_1',
+            dashboard: null,
+            options: {
+                title: 'Insight with filters',
             },
             viewControls: {
                 filters: {
-                    searchContexts: [],
                     includeRepoRegex: 'github.com/sourcegraph/sourcegraph',
                     excludeRepoRegex: 'github.com/sourcegraph/sourcegraph',
+                    searchContexts: [''],
                 },
                 seriesDisplayOptions: {
-                    limit: 20,
+                    limit: null,
+                    numSamples: null,
                     sortOptions: {
                         direction: 'DESC',
                         mode: 'RESULT_COUNT',

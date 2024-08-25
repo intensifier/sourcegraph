@@ -10,27 +10,23 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/bmatcuk/doublestar"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/sourcegraph/log"
+	"github.com/sourcegraph/mountinfo"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/database"
 	"github.com/sourcegraph/sourcegraph/internal/diskcache"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/limiter"
 	"github.com/sourcegraph/sourcegraph/internal/metrics"
-	"github.com/sourcegraph/sourcegraph/internal/mutablelimiter"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
-	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
+	"github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
@@ -46,10 +42,10 @@ const maxFileSize = 2 << 20 // 2MB; match https://sourcegraph.com/search?q=repo:
 //
 // We use an LRU to do cache eviction:
 //
-//  * When to evict is based on the total size of *.zip on disk.
-//  * What to evict uses the LRU algorithm.
-//  * We touch files when opening them, so can do LRU based on file
-//    modification times.
+//   - When to evict is based on the total size of *.zip on disk.
+//   - What to evict uses the LRU algorithm.
+//   - We touch files when opening them, so can do LRU based on file
+//     modification times.
 //
 // Note: The store fetches tarballs but stores zips. We want to be able to
 // filter which files we cache, so we need a format that supports streaming
@@ -59,17 +55,11 @@ type Store struct {
 	// FetchTar returns an io.ReadCloser to a tar archive of repo at commit.
 	// If the error implements "BadRequest() bool", it will be used to
 	// determine if the error is a bad request (eg invalid repo).
-	FetchTar func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error)
-
-	// FetchTarPaths is the future version of FetchTar, but for now exists as
-	// its own function to minimize changes.
-	//
-	// If paths is non-empty, the archive will only contain files from paths.
 	// If a path is missing the first Read call will fail with an error.
-	FetchTarPaths func(ctx context.Context, repo api.RepoName, commit api.CommitID, paths []string) (io.ReadCloser, error)
+	FetchTar func(ctx context.Context, repo api.RepoName, commit api.CommitID, paths []string) (io.ReadCloser, error)
 
 	// FilterTar returns a FilterFunc that filters out files we don't want to write to disk
-	FilterTar func(ctx context.Context, db database.DB, repo api.RepoName, commit api.CommitID) (FilterFunc, error)
+	FilterTar func(ctx context.Context, repo api.RepoName, commit api.CommitID) (FilterFunc, error)
 
 	// Path is the directory to store the cache
 	Path string
@@ -80,11 +70,16 @@ type Store struct {
 	// MaxCacheSizeBytes.
 	MaxCacheSizeBytes int64
 
-	// Log is the Logger to use.
-	Log log.Logger
+	// BackgroundTimeout is the maximum time spent fetching a working copy
+	// from gitserver. If zero then we will respect the passed in context of a
+	// request.
+	BackgroundTimeout time.Duration
 
-	// ObservationContext is used to configure observability in diskcache.
-	ObservationContext *observation.Context
+	// Logger is the Logger to use.
+	Logger log.Logger
+
+	// ObservationCtx is used to configure observability in diskcache.
+	ObservationCtx *observation.Context
 
 	// once protects Start
 	once sync.Once
@@ -93,13 +88,10 @@ type Store struct {
 	cache diskcache.Store
 
 	// fetchLimiter limits concurrent calls to FetchTar.
-	fetchLimiter *mutablelimiter.Limiter
+	fetchLimiter *limiter.MutableLimiter
 
 	// zipCache provides efficient access to repo zip files.
 	zipCache zipCache
-
-	// DB is a connection to frontend database
-	DB database.DB
 }
 
 // FilterFunc filters tar files based on their header.
@@ -112,36 +104,35 @@ type FilterFunc func(hdr *tar.Header) bool
 // search request paying the cost of initializing.
 func (s *Store) Start() {
 	s.once.Do(func() {
-		s.fetchLimiter = mutablelimiter.New(15)
+		s.fetchLimiter = limiter.NewMutable(15)
 		s.cache = diskcache.NewStore(s.Path, "store",
-			diskcache.WithBackgroundTimeout(10*time.Minute),
+			diskcache.WithBackgroundTimeout(s.BackgroundTimeout),
 			diskcache.WithBeforeEvict(s.zipCache.delete),
-			diskcache.WithObservationContext(s.ObservationContext),
+			diskcache.WithobservationCtx(s.ObservationCtx),
 		)
-		_ = os.MkdirAll(s.Path, 0700)
+		_ = os.MkdirAll(s.Path, 0o700)
 		metrics.MustRegisterDiskMonitor(s.Path)
+
+		logger := s.Logger
+		o := mountinfo.CollectorOpts{Namespace: "searcher"}
+		m := mountinfo.NewCollector(logger, o, map[string]string{"cacheDir": s.Path})
+		s.ObservationCtx.Registerer.MustRegister(m)
+
 		go s.watchAndEvict()
-		go s.watchConfig()
+		s.watchConfig()
 	})
 }
 
 // PrepareZip returns the path to a local zip archive of repo at commit.
 // It will first consult the local cache, otherwise will fetch from the network.
-func (s *Store) PrepareZip(ctx context.Context, repo api.RepoName, commit api.CommitID) (path string, err error) {
-	return s.PrepareZipPaths(ctx, repo, commit, nil)
-}
+// If paths is non-empty, the archive will only contain files from paths.
+func (s *Store) PrepareZip(ctx context.Context, repo api.RepoName, commit api.CommitID, paths []string) (path string, err error) {
+	tr, ctx := trace.New(ctx, "ArchiveStore.PrepareZip")
+	defer tr.EndWithErr(&err)
 
-func (s *Store) PrepareZipPaths(ctx context.Context, repo api.RepoName, commit api.CommitID, paths []string) (path string, err error) {
-	span, ctx := ot.StartSpanFromContext(ctx, "Store.prepareZip")
-	ext.Component.Set(span, "store")
 	var cacheHit bool
 	start := time.Now()
 	defer func() {
-		if err != nil {
-			ext.Error.Set(span, true)
-			span.SetTag("err", err.Error())
-		}
-		span.Finish()
 		duration := time.Since(start).Seconds()
 		if cacheHit {
 			metricZipAccess.WithLabelValues("true").Observe(duration)
@@ -159,17 +150,19 @@ func (s *Store) PrepareZipPaths(ctx context.Context, repo api.RepoName, commit a
 		return "", errors.Errorf("commit must be resolved (repo=%q, commit=%q)", repo, commit)
 	}
 
-	largeFilePatterns := conf.Get().SearchLargeFiles
+	filter := newSearchableFilter(conf.Get().SiteConfiguration.SearchLargeFiles)
 
 	// key is a sha256 hash since we want to use it for the disk name
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%q %q %q", repo, commit, largeFilePatterns)
+	_, _ = fmt.Fprintf(h, "%q %q", repo, commit)
+	filter.HashKey(h)
+	_, _ = io.WriteString(h, "\x00Paths")
 	for _, p := range paths {
 		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(p))
+		_, _ = io.WriteString(h, p)
 	}
 	key := hex.EncodeToString(h.Sum(nil))
-	span.LogKV("key", key)
+	tr.AddEvent("calculated key", attribute.String("key", key))
 
 	// Our fetch can take a long time, and the frontend aggressively cancels
 	// requests. So we open in the background to give it extra time.
@@ -184,10 +177,10 @@ func (s *Store) PrepareZipPaths(ctx context.Context, repo api.RepoName, commit a
 		// TODO: consider adding a cache method that doesn't actually bother opening the file,
 		// since we're just going to close it again immediately.
 		cacheHit := true
-		bgctx := opentracing.ContextWithSpan(context.Background(), opentracing.SpanFromContext(ctx))
+		bgctx := context.WithoutCancel(ctx)
 		f, err := s.cache.Open(bgctx, []string{key}, func(ctx context.Context) (io.ReadCloser, error) {
 			cacheHit = false
-			return s.fetch(ctx, repo, commit, largeFilePatterns, paths)
+			return s.fetch(ctx, repo, commit, filter, paths)
 		})
 		var path string
 		if f != nil {
@@ -197,7 +190,7 @@ func (s *Store) PrepareZipPaths(ctx context.Context, repo api.RepoName, commit a
 			}
 		}
 		if err != nil {
-			s.Log.Error("failed to fetch archive", log.String("repo", string(repo)), log.String("commit", string(commit)), log.Duration("duration", time.Since(start)), log.Error(err))
+			s.Logger.Error("failed to fetch archive", log.String("repo", string(repo)), log.String("commit", string(commit)), log.Duration("duration", time.Since(start)), log.Error(err))
 		}
 		resC <- result{path, err, cacheHit}
 	}()
@@ -218,7 +211,11 @@ func (s *Store) PrepareZipPaths(ctx context.Context, repo api.RepoName, commit a
 // fetch fetches an archive from the network and stores it on disk. It does
 // not populate the in-memory cache. You should probably be calling
 // prepareZip.
-func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitID, largeFilePatterns []string, paths []string) (rc io.ReadCloser, err error) {
+func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitID, filter *searchableFilter, paths []string) (rc io.ReadCloser, err error) {
+	tr, ctx := trace.New(ctx, "ArchiveStore.fetch",
+		repo.Attr(),
+		commit.Attr())
+
 	metricFetchQueueSize.Inc()
 	ctx, releaseFetchLimiter, err := s.fetchLimiter.Acquire(ctx) // Acquire concurrent fetches semaphore
 	if err != nil {
@@ -229,10 +226,6 @@ func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitI
 	ctx, cancel := context.WithCancel(ctx)
 
 	metricFetching.Inc()
-	span, ctx := ot.StartSpanFromContext(ctx, "Store.fetch")
-	ext.Component.Set(span, "store")
-	span.SetTag("repo", repo)
-	span.SetTag("commit", commit)
 
 	// Done is called when the returned reader is closed, or if this function
 	// returns an error. It should always be called once.
@@ -246,12 +239,10 @@ func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitI
 		releaseFetchLimiter() // Release concurrent fetches semaphore
 		cancel()              // Release context resources
 		if err != nil {
-			ext.Error.Set(span, true)
-			span.SetTag("err", err.Error())
 			metricFetchFailed.Inc()
 		}
 		metricFetching.Dec()
-		span.Finish()
+		defer tr.EndWithErr(&err)
 	}
 	defer func() {
 		if rc == nil {
@@ -259,25 +250,15 @@ func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitI
 		}
 	}()
 
-	var r io.ReadCloser
-	if len(paths) == 0 {
-		r, err = s.FetchTar(ctx, repo, commit)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		r, err = s.FetchTarPaths(ctx, repo, commit, paths)
-		if err != nil {
-			return nil, err
-		}
+	r, err := s.FetchTar(ctx, repo, commit, paths)
+	if err != nil {
+		return nil, errors.Wrapf(err, "fetching tar")
 	}
 
-	filter := func(hdr *tar.Header) bool { return false } // default: don't filter
-	if s.FilterTar != nil {
-		filter, err = s.FilterTar(ctx, s.DB, repo, commit)
-		if err != nil {
-			return nil, errors.Errorf("error while calling FilterTar: %w", err)
-		}
+	filter.CommitIgnore, err = s.FilterTar(ctx, repo, commit)
+	if err != nil {
+		r.Close()
+		return nil, errors.Errorf("error while calling FilterTar: %w", err)
 	}
 
 	pr, pw := io.Pipe()
@@ -292,7 +273,7 @@ func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitI
 		defer r.Close()
 		tr := tar.NewReader(r)
 		zw := zip.NewWriter(pw)
-		err := copySearchable(tr, zw, largeFilePatterns, filter)
+		err := copySearchable(tr, zw, filter)
 		if err1 := zw.Close(); err == nil {
 			err = err1
 		}
@@ -306,7 +287,7 @@ func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitI
 
 // copySearchable copies searchable files from tr to zw. A searchable file is
 // any file that is under size limit, non-binary, and not matching the filter.
-func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string, filter FilterFunc) error {
+func copySearchable(tr *tar.Reader, zw *zip.Writer, filter *searchableFilter) error {
 	// 32*1024 is the same size used by io.Copy
 	buf := make([]byte, 32*1024)
 	for {
@@ -328,9 +309,10 @@ func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string, 
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeRegA:
 			// ignore files if they match the filter
-			if filter(hdr) {
+			if filter.Ignore(hdr) {
 				continue
 			}
+
 			// We are happy with the file, so we can write it to zw.
 			w, err := zw.CreateHeader(&zip.FileHeader{
 				Name:   hdr.Name,
@@ -338,6 +320,12 @@ func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string, 
 			})
 			if err != nil {
 				return err
+			}
+
+			// We do not search the content of large files unless they are
+			// allowed.
+			if filter.SkipContent(hdr) {
+				continue
 			}
 
 			n, err := tr.Read(buf)
@@ -349,12 +337,6 @@ func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string, 
 			case nil:
 			default:
 				return err
-			}
-
-			// We do not search the content of large files unless they are
-			// allowed.
-			if hdr.Size > maxFileSize && !ignoreSizeMax(hdr.Name, largeFilePatterns) {
-				continue
 			}
 
 			// Heuristic: Assume file is binary if first 256 bytes contain a
@@ -382,7 +364,7 @@ func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string, 
 			// writing the link's target path as content.
 
 			// ignore symlinks if they match the filter
-			if filter(hdr) {
+			if filter.Ignore(hdr) {
 				continue
 			}
 			fh := &zip.FileHeader{
@@ -419,7 +401,7 @@ func (s *Store) watchAndEvict() {
 
 		stats, err := s.cache.Evict(s.MaxCacheSizeBytes)
 		if err != nil {
-			s.Log.Error("failed to Evict", log.Error(err))
+			s.Logger.Error("failed to Evict", log.Error(err))
 			continue
 		}
 		metricCacheSizeBytes.Set(float64(stats.CacheSize))
@@ -429,28 +411,14 @@ func (s *Store) watchAndEvict() {
 
 // watchConfig updates fetchLimiter as the number of gitservers change.
 func (s *Store) watchConfig() {
-	for {
+	conf.Watch(func() {
 		// Allow roughly 10 fetches per gitserver
-		limit := 10 * len(gitserver.NewClient(s.DB).Addrs())
+		limit := 10 * len(conf.Get().ServiceConnections().GitServers)
 		if limit == 0 {
 			limit = 15
 		}
 		s.fetchLimiter.SetLimit(limit)
-
-		time.Sleep(10 * time.Second)
-	}
-}
-
-// ignoreSizeMax determines whether the max size should be ignored. It uses
-// the glob syntax found here: https://golang.org/pkg/path/filepath/#Match.
-func ignoreSizeMax(name string, patterns []string) bool {
-	for _, pattern := range patterns {
-		pattern = strings.TrimSpace(pattern)
-		if m, _ := doublestar.Match(pattern, name); m {
-			return true
-		}
-	}
-	return false
+	})
 }
 
 var (

@@ -15,13 +15,17 @@ import (
 )
 
 // NewPythonPackagesSource returns a new PythonPackagesSource from the given external service.
-func NewPythonPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+func NewPythonPackagesSource(ctx context.Context, svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+	rawConfig, err := svc.Config.Decrypt(ctx)
+	if err != nil {
+		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
+	}
 	var c schema.PythonPackagesConnection
-	if err := jsonc.Unmarshal(svc.Config, &c); err != nil {
+	if err := jsonc.Unmarshal(rawConfig, &c); err != nil {
 		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
 	}
 
-	cli, err := cf.Doer()
+	client, err := pypi.NewClient(svc.URN(), c.Urls, cf)
 	if err != nil {
 		return nil, err
 	}
@@ -30,7 +34,7 @@ func NewPythonPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*
 		svc:        svc,
 		configDeps: c.Dependencies,
 		scheme:     dependencies.PythonPackagesScheme,
-		src:        &pythonPackagesSource{client: pypi.NewClient(svc.URN(), c.Urls, cli)},
+		src:        &pythonPackagesSource{client},
 	}, nil
 }
 
@@ -49,11 +53,11 @@ func (s *pythonPackagesSource) Get(ctx context.Context, name reposource.PackageN
 }
 
 func (pythonPackagesSource) ParseVersionedPackageFromConfiguration(dep string) (reposource.VersionedPackage, error) {
-	return reposource.ParseVersionedPackage(dep)
+	return reposource.ParseVersionedPackage(dep), nil
 }
 
 func (pythonPackagesSource) ParsePackageFromName(name reposource.PackageName) (reposource.Package, error) {
-	return reposource.ParsePythonPackageFromName(name)
+	return reposource.ParsePythonPackageFromName(name), nil
 }
 
 func (pythonPackagesSource) ParsePackageFromRepoName(repoName api.RepoName) (reposource.Package, error) {

@@ -1,9 +1,14 @@
-import { getAuthenticatedUser } from '../sourcegraph-api-access/api-gateway'
-
+import {
+    applyConfig,
+    applyTheme,
+    getAuthenticatedUser,
+    renderReactApp,
+    retrySearch,
+    updateVersionAndAuthDataFromServer,
+    wasServerAccessSuccessful,
+} from './index'
 import { indicateFinishedLoading } from './js-to-java-bridge'
-import { PluginConfig, Theme } from './types'
-
-import { applyConfig, applyTheme, renderReactApp } from './index'
+import type { PluginConfig, Theme } from './types'
 
 export type ActionName = 'themeChanged' | 'pluginSettingsChanged'
 
@@ -27,12 +32,18 @@ export async function handleRequest(
     if (action === 'pluginSettingsChanged') {
         const pluginConfig = argumentsAsObject as PluginSettingsChangedRequestArguments
         applyConfig(pluginConfig)
-        try {
-            const authenticatedUser = await getAuthenticatedUser(pluginConfig.instanceURL, pluginConfig.accessToken)
-            await indicateFinishedLoading(true, !!authenticatedUser)
-        } catch {
-            await indicateFinishedLoading(false, false)
+        await updateVersionAndAuthDataFromServer()
+        await indicateFinishedLoading(wasServerAccessSuccessful() || false, !!getAuthenticatedUser())
+        renderReactApp()
+        return callback(JSON.stringify(null))
+    }
+
+    if (action === 'retrySearch') {
+        if (!wasServerAccessSuccessful()) {
+            await updateVersionAndAuthDataFromServer()
         }
+        await indicateFinishedLoading(wasServerAccessSuccessful() || false, !!getAuthenticatedUser())
+        retrySearch()
         renderReactApp()
         return callback(JSON.stringify(null))
     }

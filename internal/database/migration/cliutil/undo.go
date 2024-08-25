@@ -12,35 +12,32 @@ import (
 
 func Undo(commandName string, factory RunnerFactory, outFactory OutputFactory, development bool) *cli.Command {
 	schemaNameFlag := &cli.StringFlag{
-		Name:     "db",
-		Usage:    "The target `schema` to modify.",
+		Name:     "schema",
+		Usage:    "The target `schema` to modify. Possible values are 'frontend', 'codeintel' and 'codeinsights'",
 		Required: true,
-	}
-	ignoreSingleDirtyLogFlag := &cli.BoolFlag{
-		Name:  "ignore-single-dirty-log",
-		Usage: "Ignore a previously failed attempt if it will be immediately retried by this operation.",
-		Value: development,
+		Aliases:  []string{"db"},
 	}
 
-	makeOptions := func(cmd *cli.Context) runner.Options {
+	makeOptions := func(cmd *cli.Context, out *output.Output) runner.Options {
 		return runner.Options{
 			Operations: []runner.MigrationOperation{
 				{
-					SchemaName: schemaNameFlag.Get(cmd),
+					SchemaName: TranslateSchemaNames(schemaNameFlag.Get(cmd), out),
 					Type:       runner.MigrationOperationTypeRevert,
 				},
 			},
-			IgnoreSingleDirtyLog: ignoreSingleDirtyLogFlag.Get(cmd),
+			IgnoreSingleDirtyLog:   development,
+			IgnoreSinglePendingLog: development,
 		}
 	}
 
 	action := makeAction(outFactory, func(ctx context.Context, cmd *cli.Context, out *output.Output) error {
-		r, err := setupRunner(ctx, factory, schemaNameFlag.Get(cmd))
+		r, err := setupRunner(factory, TranslateSchemaNames(schemaNameFlag.Get(cmd), out))
 		if err != nil {
 			return err
 		}
 
-		return r.Run(ctx, makeOptions(cmd))
+		return r.Run(ctx, makeOptions(cmd, out))
 	})
 
 	return &cli.Command{
@@ -51,7 +48,6 @@ func Undo(commandName string, factory RunnerFactory, outFactory OutputFactory, d
 		Action:      action,
 		Flags: []cli.Flag{
 			schemaNameFlag,
-			ignoreSingleDirtyLogFlag,
 		},
 	}
 }

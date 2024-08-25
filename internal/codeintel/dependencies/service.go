@@ -3,501 +3,322 @@ package dependencies
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 
-	"github.com/inconshreveable/log15"
-	"github.com/opentracing/opentracing-go/log"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
+	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies/internal/lockfiles"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies/internal/store"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies/shared"
-	"github.com/sourcegraph/sourcegraph/internal/codeintel/types"
 	"github.com/sourcegraph/sourcegraph/internal/conf/reposource"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
+	"github.com/sourcegraph/sourcegraph/internal/packagefilters"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
 // Service encapsulates the resolution and persistence of dependencies at the repository and package levels.
 type Service struct {
-	dependenciesStore  store.Store
-	gitSvc             localGitService
-	lockfilesSvc       LockfilesService
-	lockfilesSemaphore *semaphore.Weighted
-	syncer             Syncer
-	syncerSemaphore    *semaphore.Weighted
-	operations         *operations
+	store      store.Store
+	operations *operations
 }
 
-func newService(
-	dependenciesStore store.Store,
-	gitSvc localGitService,
-	lockfilesSvc LockfilesService,
-	lockfilesSemaphore *semaphore.Weighted,
-	syncer Syncer,
-	syncerSemaphore *semaphore.Weighted,
-	observationContext *observation.Context,
-) *Service {
+func newService(observationCtx *observation.Context, store store.Store) *Service {
 	return &Service{
-		dependenciesStore:  dependenciesStore,
-		gitSvc:             gitSvc,
-		lockfilesSvc:       lockfilesSvc,
-		lockfilesSemaphore: lockfilesSemaphore,
-		syncer:             syncer,
-		syncerSemaphore:    syncerSemaphore,
-		operations:         newOperations(observationContext),
+		store:      store,
+		operations: newOperations(observationCtx),
 	}
 }
 
-// Dependencies resolves the (transitive) dependencies for a set of repository and revisions.
-// Both the input repoRevs and the output dependencyRevs are a map from repository names to revspecs.
-func (s *Service) Dependencies(ctx context.Context, repoRevs map[api.RepoName]types.RevSpecSet, includeTransitive bool) (dependencyRevs map[api.RepoName]types.RevSpecSet, notFound map[api.RepoName]types.RevSpecSet, err error) {
-	ctx, _, endObservation := s.operations.dependencies.With(ctx, &err, observation.Args{LogFields: constructLogFields(repoRevs)})
-	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("numDependencyRevs", len(dependencyRevs)),
-		}})
-	}()
-
-	// Resolve the revhashes for the source repo-commit pairs.
-	// TODO - Process unresolved commits.
-	repoCommits, _, err := s.resolveRepoCommits(ctx, repoRevs)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Load lockfile dependencies for the given repository and revision pairs
-	deps, notFoundRepoCommits, err := s.resolveLockfileDependenciesFromStore(ctx, repoCommits, includeTransitive)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Populate return value map from the given information.
-	dependencyRevs = make(map[api.RepoName]types.RevSpecSet, len(repoRevs))
-	for _, dep := range deps {
-		repo := dep.RepoName()
-		rev := api.RevSpec(dep.GitTagFromVersion())
-
-		if _, ok := dependencyRevs[repo]; !ok {
-			dependencyRevs[repo] = types.RevSpecSet{}
-		}
-		dependencyRevs[repo][rev] = struct{}{}
-	}
-
-	notFound = make(map[api.RepoName]types.RevSpecSet, len(notFoundRepoCommits))
-	for _, repoCommit := range notFoundRepoCommits {
-		repo := repoCommit.Repo
-		// TODO: This is wrong. what we want is to find out which revspec we
-		// couldn't find results for. So if the user is querying for
-		// dependencies of foo@v1 we want to tell user that we couldn't find
-		// anything for foo@v1 and not foo@d34db33f, if that is the commit that
-		// v1 resolved to.
-		rev := api.RevSpec(repoCommit.CommitID)
-
-		if _, ok := notFound[repo]; !ok {
-			notFound[repo] = types.RevSpecSet{}
-		}
-		notFound[repo][rev] = struct{}{}
-	}
-
-	if !enablePreciseQueries {
-		return dependencyRevs, notFound, nil
-	}
-
-	for _, repoCommit := range repoCommits {
-		// TODO - batch these requests in the store layer
-		preciseDeps, err := s.dependenciesStore.PreciseDependencies(ctx, string(repoCommit.Repo), repoCommit.ResolvedCommit)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "store.PreciseDependencies")
-		}
-
-		for repoName, commits := range preciseDeps {
-			if _, ok := dependencyRevs[repoName]; !ok {
-				dependencyRevs[repoName] = types.RevSpecSet{}
-			}
-			for commit := range commits {
-				dependencyRevs[repoName][commit] = struct{}{}
-			}
-
-			// If we found a precise result, we remove repoRev from notFound.
-			if notFoundRevs, ok := notFound[repoCommit.Repo]; ok {
-				for commit := range commits {
-					delete(notFoundRevs, commit)
-				}
-
-				if len(notFoundRevs) == 0 {
-					delete(notFound, repoCommit.Repo)
-				}
-			}
-		}
-	}
-
-	return dependencyRevs, notFound, nil
-}
-
-type repoCommitResolvedCommit struct {
-	api.RepoCommit
-	ResolvedCommit string
-}
-
-// resolveRepoCommits flattens the given map into a slice of api.RepoCommits with an extra
-// field indicating the canonical 40-character commit hash of the given revlike, which is
-// often symbolic. The commits that failed to resolve are returned in a separate slice.
-func (s *Service) resolveRepoCommits(ctx context.Context, repoRevs map[api.RepoName]types.RevSpecSet) ([]repoCommitResolvedCommit, []api.RepoCommit, error) {
-	n := 0
-	for _, revs := range repoRevs {
-		n += len(revs)
-	}
-
-	repoCommits := make([]api.RepoCommit, 0, n)
-	for repoName, revs := range repoRevs {
-		for rev := range revs {
-			repoCommits = append(repoCommits, api.RepoCommit{
-				Repo:     repoName,
-				CommitID: api.CommitID(rev),
-			})
-		}
-	}
-
-	commits, err := s.gitSvc.GetCommits(ctx, repoCommits, true)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "git.GetCommits")
-	}
-	if len(commits) != len(repoCommits) {
-		// Add assertion here so that the blast radius of new or newly discovered errors
-		// southbound from the internal/vcs/git package does not leak into code intelligence.
-		return nil, nil, errors.Newf("expected slice returned from git.GetCommits to have len %d, but has len %d", len(repoCommits), len(commits))
-	}
-
-	resolvedCommits := make([]repoCommitResolvedCommit, 0, len(repoCommits))
-	var unresolvedCommits []api.RepoCommit
-	for i, repoCommit := range repoCommits {
-		if commits[i] == nil {
-			unresolvedCommits = append(unresolvedCommits, repoCommit)
-			continue
-		}
-		resolvedCommits = append(resolvedCommits, repoCommitResolvedCommit{
-			RepoCommit:     repoCommit,
-			ResolvedCommit: string(commits[i].ID),
-		})
-	}
-
-	return resolvedCommits, unresolvedCommits, nil
-}
-
-// resolveLockfileDependenciesFromStore returns a flattened list of package dependencies for each
-// of the given repo-commit pairs from the database. The given `repoCommits` slice is altered in-place.
-// The returned `numUnqueried` value is the number of elements at the prefix of the slice that had no data.
-// It is expected that the remaining elements be passed to the fallback dependencies resolver, if one is
-// registered.
-func (s *Service) resolveLockfileDependenciesFromStore(ctx context.Context, repoCommits []repoCommitResolvedCommit, includeTransitive bool) (deps []shared.PackageDependency, notFound []repoCommitResolvedCommit, err error) {
-	ctx, _, endObservation := s.operations.resolveLockfileDependenciesFromStore.With(ctx, &err, observation.Args{})
-	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("notFound", len(notFound)),
-		}})
-	}()
-
-	for _, repoCommit := range repoCommits {
-		// TODO - batch these requests in the store layer
-		if repoDeps, ok, err := s.dependenciesStore.LockfileDependencies(ctx, store.LockfileDependenciesOpts{
-			RepoName:          string(repoCommit.Repo),
-			Commit:            repoCommit.ResolvedCommit,
-			IncludeTransitive: includeTransitive,
-		}); err != nil {
-			return nil, notFound, errors.Wrap(err, "store.LockfileDependencies")
-		} else if !ok {
-			notFound = append(notFound, repoCommit)
-		} else {
-			deps = append(deps, repoDeps...)
-		}
-	}
-
-	return deps, notFound, nil
-}
-
-// listAndPersistLockfileDependencies gathers dependencies from the lockfiles service for the
-// given repo-commit pair and persists the result to the database. This aids in both caching
-// and building an inverted index to power dependents search.
-func (s *Service) listAndPersistLockfileDependencies(ctx context.Context, repoCommit repoCommitResolvedCommit) ([]shared.PackageDependency, error) {
-	results, err := s.lockfilesSvc.ListDependencies(ctx, repoCommit.Repo, string(repoCommit.CommitID))
-	if err != nil {
-		return nil, errors.Wrap(err, "lockfiles.ListDependencies")
-	}
-
-	if len(results) == 0 {
-		// If we haven't found anything in that repository, we still persist
-		// the result to make sure we can tell the user that we have or haven't
-		// indexed the repository.
-		// TODO: There should be a better solution for that.
-		results = append(results, lockfiles.Result{Lockfile: "NOT-FOUND", Deps: []reposource.VersionedPackage{}})
-	}
-
-	var (
-		allDeps []shared.PackageDependency
-		set     = make(map[string]struct{})
-	)
-
-	for _, result := range results {
-		serializableRepoDeps := shared.SerializePackageDependencies(result.Deps)
-		serializableGraph := shared.SerializeDependencyGraph(result.Graph)
-
-		err = s.dependenciesStore.UpsertLockfileGraph(
-			ctx,
-			string(repoCommit.Repo),
-			repoCommit.ResolvedCommit,
-			result.Lockfile,
-			serializableRepoDeps,
-			serializableGraph,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "store.UpsertLockfileGraph")
-		}
-
-		for _, d := range serializableRepoDeps {
-			k := fmt.Sprintf("%s%s", d.PackageSyntax(), d.PackageVersion())
-			if _, ok := set[k]; !ok {
-				set[k] = struct{}{}
-				allDeps = append(allDeps, d)
-			}
-		}
-	}
-
-	return allDeps, nil
-}
-
-// sync invokes the Syncer for every repo in the supplied slice.
-func (s *Service) sync(ctx context.Context, repos []api.RepoName) error {
-	ctx, cancel := context.WithCancel(ctx)
-	g, ctx := errgroup.WithContext(ctx)
-	defer cancel()
-
-	for _, repo := range repos {
-		// Capture outside of goroutine below
-		repo := repo
-
-		// Acquire semaphore before spawning goroutine to ensure that we limit the total number
-		// of concurrent _routines_, whether they are actively syncing repo sources or not. Any
-		// non-nil returned from here is a context timeout error, so we are guaranteed to clean
-		// up the errgroup on exit.
-		if err := s.syncerSemaphore.Acquire(ctx, 1); err != nil {
-			return errors.Wrap(err, "syncer semaphore")
-		}
-
-		g.Go(func() error {
-			defer s.syncerSemaphore.Release(1)
-
-			if err := s.syncer.Sync(ctx, repo); err != nil {
-				log15.Warn("Failed to sync dependency repo", "repo", repo, "error", err)
-			}
-
-			return nil
-		})
-	}
-
-	return g.Wait()
-}
-
-// IndexLockfiles resolves the lockfile dependencies for a set of repository and revsisions
-// and writes them the database.
-//
-// This method is expected to be used only from background routines controlling lockfile indexing
-// scheduling. Additional users may impact the performance profile of the application as a whole.
-func (s *Service) IndexLockfiles(ctx context.Context, repoRevs map[api.RepoName]types.RevSpecSet) (err error) {
-	if !lockfileIndexingEnabled() {
-		return nil
-	}
-
-	// Resolve the revhashes for the source repo-commit pairs
-	repoCommits, _, err := s.resolveRepoCommits(ctx, repoRevs)
-	if err != nil {
-		return err
-	}
-
-	var allDependencies []shared.PackageDependency
-	for _, repoCommit := range repoCommits {
-		deps, err := s.listAndPersistLockfileDependencies(ctx, repoCommit)
-		if err != nil {
-			return err
-		}
-		allDependencies = append(allDependencies, deps...)
-	}
-
-	return s.upsertAndSyncDependencies(ctx, allDependencies)
-}
-
-func (s *Service) upsertAndSyncDependencies(ctx context.Context, deps []shared.PackageDependency) error {
-	hash := func(dep Repo) string {
-		return strings.Join([]string{dep.Scheme, string(dep.Name), dep.Version}, ":")
-	}
-
-	dependencies := make([]Repo, 0, len(deps))
-	repoNamesByDependency := make(map[string]api.RepoName, len(deps))
-
-	for _, dep := range deps {
-		repo := dep.RepoName()
-		scheme := dep.Scheme()
-		name := dep.PackageSyntax()
-		version := dep.PackageVersion()
-
-		dep := Repo{Scheme: scheme, Name: name, Version: version}
-		dependencies = append(dependencies, dep)
-		repoNamesByDependency[hash(dep)] = repo
-	}
-
-	// Write dependencies to database
-	newDependencies, err := s.dependenciesStore.UpsertDependencyRepos(ctx, dependencies)
-	if err != nil {
-		return errors.Wrap(err, "store.UpsertDependencyRepos")
-	}
-
-	// Determine the set of repo names that were recently inserted. Package and repository
-	// names are generally distinct, so we need to re-translate the dependency scheme, name,
-	// and version back to the repository name.
-	newRepos := make([]api.RepoName, 0, len(newDependencies))
-	newReposSet := make(map[api.RepoName]struct{}, len(newDependencies))
-	for _, dep := range newDependencies {
-		repoName := repoNamesByDependency[hash(dep)]
-		if _, ok := newReposSet[repoName]; ok {
-			continue
-		}
-
-		newRepos = append(newRepos, repoName)
-		newReposSet[repoName] = struct{}{}
-	}
-
-	// Lazily sync all the repos that were newly added
-	return s.sync(ctx, newRepos)
-}
-
-// Dependents resolves the (transitive) inverse dependencies for a set of repository and revisions.
-// Both the input repoRevs and the output dependencyRevs are a map from repository names to revspecs.
-func (s *Service) Dependents(ctx context.Context, repoRevs map[api.RepoName]types.RevSpecSet) (dependentsRevs map[api.RepoName]types.RevSpecSet, err error) {
-	// Resolve the revhashes for the source repo-commit pairs.
-	// TODO - Process unresolved commits.
-	repoCommits, _, err := s.resolveRepoCommits(ctx, repoRevs)
-	if err != nil {
-		return nil, err
-	}
-
-	var deps []api.RepoCommit
-	for _, commit := range repoCommits {
-		// TODO - batch these requests in the store layer
-		repoDeps, err := s.dependenciesStore.LockfileDependents(ctx, string(commit.Repo), commit.ResolvedCommit)
-		if err != nil {
-			return nil, errors.Wrap(err, "store.LockfileDependents")
-		}
-		deps = append(deps, repoDeps...)
-
-	}
-
-	dependentsRevs = map[api.RepoName]types.RevSpecSet{}
-	for _, dep := range deps {
-		if _, ok := dependentsRevs[dep.Repo]; !ok {
-			dependentsRevs[dep.Repo] = types.RevSpecSet{}
-		}
-		dependentsRevs[dep.Repo][api.RevSpec(dep.CommitID)] = struct{}{}
-	}
-
-	if !enablePreciseQueries {
-		return dependentsRevs, nil
-	}
-
-	for _, repoCommit := range repoCommits {
-		// TODO - batch these requests in the store layer
-		preciseDeps, err := s.dependenciesStore.PreciseDependents(ctx, string(repoCommit.Repo), repoCommit.ResolvedCommit)
-		if err != nil {
-			return nil, errors.Wrap(err, "store.PreciseDependents")
-		}
-
-		for repoName, commits := range preciseDeps {
-			if _, ok := dependentsRevs[repoName]; !ok {
-				dependentsRevs[repoName] = types.RevSpecSet{}
-			}
-			for commit := range commits {
-				dependentsRevs[repoName][commit] = struct{}{}
-			}
-		}
-	}
-
-	return dependentsRevs, nil
-}
-
-func constructLogFields(repoRevs map[api.RepoName]types.RevSpecSet) []log.Field {
-	if len(repoRevs) == 1 {
-		for repoName, revs := range repoRevs {
-			revStrs := make([]string, 0, len(revs))
-			for rev := range revs {
-				revStrs = append(revStrs, string(rev))
-			}
-
-			return []log.Field{
-				log.String("repo", string(repoName)),
-				log.String("revs", strings.Join(revStrs, ",")),
-			}
-		}
-	}
-
-	return []log.Field{
-		log.Int("repoRevs", len(repoRevs)),
-	}
-}
-
-func (s *Service) SelectRepoRevisionsToResolve(ctx context.Context, batchSize int, minimumCheckInterval time.Duration) (map[string][]string, error) {
-	return s.dependenciesStore.SelectRepoRevisionsToResolve(ctx, batchSize, minimumCheckInterval)
-}
-
-func (s *Service) UpdateResolvedRevisions(ctx context.Context, repoRevsToResolvedRevs map[string]map[string]string) error {
-	return s.dependenciesStore.UpdateResolvedRevisions(ctx, repoRevsToResolvedRevs)
-}
-
-type Repo = shared.Repo
+type (
+	PackageRepoReference         = shared.PackageRepoReference
+	PackageRepoRefVersion        = shared.PackageRepoRefVersion
+	MinimalPackageRepoRef        = shared.MinimalPackageRepoRef
+	MinimialVersionedPackageRepo = shared.MinimialVersionedPackageRepo
+	MinimalPackageRepoRefVersion = shared.MinimalPackageRepoRefVersion
+	PackageRepoFilter            = shared.PackageRepoFilter
+)
 
 type ListDependencyReposOpts struct {
 	// Scheme is the moniker scheme to filter for e.g. 'gomod', 'npm' etc.
 	Scheme string
 	// Name is the package name to filter for e.g. '@types/node' etc.
 	Name reposource.PackageName
+
+	// ExactNameOnly enables exact name matching instead of substring.
+	ExactNameOnly bool
 	// After is the value predominantly used for pagination. When sorting by
 	// newest first, this should be the ID of the last element in the previous
 	// page, when excluding versions it should be the last package name in the
 	// previous page.
-	After any
+	After int
 	// Limit limits the size of the results set to be returned.
 	Limit int
-	// NewestFirst sorts by when a (package, version) was added to the list.
-	// Incompatible with ExcludeVersions below.
-	NewestFirst bool
-	// ExcludeVersions returns one row for every package, instead of one for
-	// every (package, version) tuple. Results will be sorted by name to make
-	// pagination possible. Takes precedence over NewestFirst.
-	ExcludeVersions bool
+	// IncludeBlocked also includes those that would not be synced due to filter rules
+	IncludeBlocked bool
 }
 
-func (s *Service) ListDependencyRepos(ctx context.Context, opts ListDependencyReposOpts) ([]Repo, error) {
-	return s.dependenciesStore.ListDependencyRepos(ctx, store.ListDependencyReposOpts(opts))
+func (s *Service) ListPackageRepoRefs(ctx context.Context, opts ListDependencyReposOpts) (_ []PackageRepoReference, total int, hasMore bool, err error) {
+	ctx, _, endObservation := s.operations.listPackageRepos.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("scheme", opts.Scheme),
+		attribute.String("name", string(opts.Name)),
+		attribute.Bool("exactOnly", opts.ExactNameOnly),
+		attribute.Int("after", opts.After),
+		attribute.Int("limit", opts.Limit),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	storeopts := store.ListDependencyReposOpts{
+		Scheme:         opts.Scheme,
+		Name:           opts.Name,
+		After:          opts.After,
+		Limit:          opts.Limit,
+		IncludeBlocked: opts.IncludeBlocked,
+	}
+
+	if opts.ExactNameOnly {
+		storeopts.Fuzziness = store.FuzzinessExactMatch
+	} else {
+		storeopts.Fuzziness = store.FuzzinessWildcard
+	}
+
+	return s.store.ListPackageRepoRefs(ctx, storeopts)
 }
 
-func (s *Service) UpsertDependencyRepos(ctx context.Context, deps []Repo) ([]Repo, error) {
-	return s.dependenciesStore.UpsertDependencyRepos(ctx, deps)
+func (s *Service) InsertPackageRepoRefs(ctx context.Context, deps []MinimalPackageRepoRef) (_ []shared.PackageRepoReference, _ []shared.PackageRepoRefVersion, err error) {
+	ctx, _, endObservation := s.operations.insertPackageRepoRefs.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("packageRepoRefs", len(deps)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	return s.store.InsertPackageRepoRefs(ctx, deps)
 }
 
-func (s *Service) DeleteDependencyReposByID(ctx context.Context, ids ...int) error {
-	return s.dependenciesStore.DeleteDependencyReposByID(ctx, ids...)
+func (s *Service) DeletePackageRepoRefsByID(ctx context.Context, ids ...int) (err error) {
+	ctx, _, endObservation := s.operations.deletePackageRepoRefsByID.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("packageRepoRefs", len(ids)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	return s.store.DeletePackageRepoRefsByID(ctx, ids...)
 }
 
-type ListLockfileIndexesOpts struct {
-	RepoName string
-	Commit   string
-	Lockfile string
+func (s *Service) DeletePackageRepoRefVersionsByID(ctx context.Context, ids ...int) (err error) {
+	ctx, _, endObservation := s.operations.deletePackageRepoRefVersionsByID.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("packageRepoRefVersions", len(ids)),
+	}})
+	defer endObservation(1, observation.Args{})
 
-	After int
-	Limit int
+	return s.store.DeletePackageRepoRefVersionsByID(ctx, ids...)
 }
 
-func (s *Service) ListLockfileIndexes(ctx context.Context, opts ListLockfileIndexesOpts) ([]shared.LockfileIndex, int, error) {
-	return s.dependenciesStore.ListLockfileIndexes(ctx, store.ListLockfileIndexesOpts(opts))
+type ListPackageRepoRefFiltersOpts struct {
+	IDs            []int
+	PackageScheme  string
+	Behaviour      string
+	IncludeDeleted bool
+	After          int
+	Limit          int
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func (s *Service) ListPackageRepoFilters(ctx context.Context, opts ListPackageRepoRefFiltersOpts) (_ []shared.PackageRepoFilter, hasMore bool, err error) {
+	ctx, _, endObservation := s.operations.listPackageRepoFilters.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("numPackageRepoFilterIDs", len(opts.IDs)),
+		attribute.String("packageScheme", opts.PackageScheme),
+		attribute.Int("after", opts.After),
+		attribute.Int("limit", opts.Limit),
+		attribute.String("behaviour", opts.Behaviour),
+	}})
+	defer endObservation(1, observation.Args{})
+	return s.store.ListPackageRepoRefFilters(ctx, store.ListPackageRepoRefFiltersOpts(opts))
+}
+
+func (s *Service) CreatePackageRepoFilter(ctx context.Context, input shared.MinimalPackageFilter) (filter *shared.PackageRepoFilter, err error) {
+	ctx, _, endObservation := s.operations.createPackageRepoFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("packageScheme", input.PackageScheme),
+		attribute.String("behaviour", deref(input.Behaviour)),
+		attribute.String("versionFilter", fmt.Sprintf("%+v", input.VersionFilter)),
+		attribute.String("nameFilter", fmt.Sprintf("%+v", input.NameFilter)),
+	}})
+	defer func() {
+		endObservation(1, observation.Args{Attrs: []attribute.KeyValue{
+			attribute.Int("filterID", filter.ID),
+		}})
+	}()
+	return s.store.CreatePackageRepoFilter(ctx, input)
+}
+
+func (s *Service) UpdatePackageRepoFilter(ctx context.Context, filter shared.PackageRepoFilter) (err error) {
+	ctx, _, endObservation := s.operations.updatePackageRepoFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("id", filter.ID),
+		attribute.String("packageScheme", filter.PackageScheme),
+		attribute.String("behaviour", filter.Behaviour),
+		attribute.String("versionFilter", fmt.Sprintf("%+v", filter.VersionFilter)),
+		attribute.String("nameFilter", fmt.Sprintf("%+v", filter.NameFilter)),
+	}})
+	defer endObservation(1, observation.Args{})
+	return s.store.UpdatePackageRepoFilter(ctx, filter)
+}
+
+func (s *Service) DeletePackageRepoFilter(ctx context.Context, id int) (err error) {
+	ctx, _, endObservation := s.operations.deletePackageRepoFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("id", id),
+	}})
+	defer endObservation(1, observation.Args{})
+	return s.store.DeletePacakgeRepoFilter(ctx, id)
+}
+
+func (s *Service) IsPackageRepoVersionAllowed(ctx context.Context, scheme string, pkg reposource.PackageName, version string) (allowed bool, err error) {
+	ctx, _, endObservation := s.operations.isPackageRepoVersionAllowed.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("packageScheme", scheme),
+		attribute.String("name", string(pkg)),
+		attribute.String("version", version),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	filters, _, err := s.store.ListPackageRepoRefFilters(ctx, store.ListPackageRepoRefFiltersOpts{
+		PackageScheme:  scheme,
+		IncludeDeleted: false,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	packageFilters, err := packagefilters.NewFilterLists(filters)
+	if err != nil {
+		return false, err
+	}
+
+	return packagefilters.IsVersionedPackageAllowed(scheme, pkg, version, packageFilters), nil
+}
+
+func (s *Service) IsPackageRepoAllowed(ctx context.Context, scheme string, pkg reposource.PackageName) (allowed bool, err error) {
+	ctx, _, endObservation := s.operations.isPackageRepoAllowed.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("packageScheme", scheme),
+		attribute.String("name", string(pkg)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	filters, _, err := s.store.ListPackageRepoRefFilters(ctx, store.ListPackageRepoRefFiltersOpts{
+		PackageScheme:  scheme,
+		IncludeDeleted: false,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	packageFilters, err := packagefilters.NewFilterLists(filters)
+	if err != nil {
+		return false, err
+	}
+
+	return packagefilters.IsPackageAllowed(scheme, pkg, packageFilters), nil
+}
+
+func (s *Service) PackagesOrVersionsMatchingFilter(ctx context.Context, filter shared.MinimalPackageFilter, limit, after int) (_ []shared.PackageRepoReference, _ int, hasMore bool, err error) {
+	ctx, _, endObservation := s.operations.pkgsOrVersionsMatchingFilter.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.String("packageScheme", filter.PackageScheme),
+		attribute.String("versionFilter", fmt.Sprintf("%+v", filter.VersionFilter)),
+		attribute.String("nameFilter", fmt.Sprintf("%+v", filter.NameFilter)),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	var (
+		totalCount   int
+		matchingPkgs = make([]shared.PackageRepoReference, 0, limit)
+	)
+
+	if filter.NameFilter != nil {
+		// we dont use a compiled glob when checking name filters as we can do a hugely more efficient regex search
+		// in postgres instead of paging through every single package to do a glob check here
+		nameRegex, err := packagefilters.GlobToRegex(filter.NameFilter.PackageGlob)
+		if err != nil {
+			return nil, 0, false, errors.Wrap(err, "failed to compile glob")
+		}
+
+		var lastID int
+		for {
+			pkgs, _, _, err := s.store.ListPackageRepoRefs(ctx, store.ListDependencyReposOpts{
+				Scheme: filter.PackageScheme,
+				// we filter down here else we have to page through a potentially huge number of non-matching packages
+				Name:      reposource.PackageName(nameRegex),
+				Fuzziness: store.FuzzinessRegex,
+				// doing this so we don't have to load everything in at once
+				Limit:          500,
+				After:          lastID,
+				IncludeBlocked: true,
+			})
+			if err != nil {
+				return nil, 0, false, errors.Wrap(err, "failed to list package repo references")
+			}
+
+			if len(pkgs) == 0 {
+				break
+			}
+
+			lastID = pkgs[len(pkgs)-1].ID
+
+			totalCount += len(pkgs)
+
+			for _, pkg := range pkgs {
+				if pkg.ID <= after {
+					continue
+				}
+				if len(matchingPkgs) == limit {
+					// once we've reached the limit but are hitting more, we know theres more
+					hasMore = true
+					continue
+				}
+				pkg.Versions = nil
+				matchingPkgs = append(matchingPkgs, pkg)
+			}
+		}
+	} else {
+		matcher, err := packagefilters.NewVersionGlob(filter.VersionFilter.PackageName, filter.VersionFilter.VersionGlob)
+		if err != nil {
+			return nil, 0, false, errors.Wrap(err, "failed to compile glob")
+		}
+		nameToMatch := filter.VersionFilter.PackageName
+
+		pkgs, _, _, err := s.store.ListPackageRepoRefs(ctx, store.ListDependencyReposOpts{
+			Scheme:    filter.PackageScheme,
+			Name:      reposource.PackageName(nameToMatch),
+			Fuzziness: store.FuzzinessExactMatch,
+			// should only have 1 matching package ref
+			Limit:          1,
+			IncludeBlocked: true,
+		})
+		if err != nil {
+			return nil, 0, false, errors.Wrap(err, "failed to list package repo references")
+		}
+
+		if len(pkgs) == 0 {
+			return nil, 0, false, errors.Newf("package repo reference not found for name %q", nameToMatch)
+		}
+
+		pkg := pkgs[0]
+		versions := pkg.Versions[:0]
+		for _, version := range pkg.Versions {
+			if matcher.Matches(pkg.Name, version.Version) {
+				totalCount++
+				if version.ID <= after {
+					continue
+				}
+				if len(versions) == limit {
+					// once we've reached the limit but are hitting more, we know theres more
+					hasMore = true
+					continue
+				}
+				versions = append(versions, version)
+			}
+		}
+		pkg.Versions = versions
+		matchingPkgs = append(matchingPkgs, pkg)
+	}
+
+	return matchingPkgs, totalCount, hasMore, nil
 }

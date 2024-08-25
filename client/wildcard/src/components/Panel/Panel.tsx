@@ -3,7 +3,7 @@ import React, { useRef } from 'react'
 import classNames from 'classnames'
 import { upperFirst } from 'lodash'
 
-import { useResizablePanel, UseResizablePanelParameters } from './useResizablePanel'
+import { useResizablePanel, type UseResizablePanelParameters } from './useResizablePanel'
 import { getDisplayStyle, getPositionStyle } from './utils'
 
 import styles from './Panel.module.scss'
@@ -20,6 +20,8 @@ export interface PanelProps extends Omit<UseResizablePanelParameters, 'panelRef'
      */
     handleClassName?: string
     className?: string
+    id?: string
+    ariaLabel: string
 }
 
 export const Panel: React.FunctionComponent<React.PropsWithChildren<PanelProps>> = ({
@@ -32,6 +34,8 @@ export const Panel: React.FunctionComponent<React.PropsWithChildren<PanelProps>>
     handleClassName,
     minSize,
     maxSize,
+    ariaLabel,
+    onResize,
 }) => {
     const handleReference = useRef<HTMLDivElement | null>(null)
     const panelReference = useRef<HTMLDivElement | null>(null)
@@ -44,6 +48,7 @@ export const Panel: React.FunctionComponent<React.PropsWithChildren<PanelProps>>
         defaultSize,
         minSize,
         maxSize,
+        onResize,
     })
 
     return (
@@ -57,6 +62,8 @@ export const Panel: React.FunctionComponent<React.PropsWithChildren<PanelProps>>
                 getDisplayStyle({ isFloating })
             )}
             ref={panelReference}
+            role="region"
+            aria-label={ariaLabel}
         >
             <div
                 ref={handleReference}

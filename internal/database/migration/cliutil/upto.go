@@ -12,9 +12,10 @@ import (
 
 func UpTo(commandName string, factory RunnerFactory, outFactory OutputFactory, development bool) *cli.Command {
 	schemaNameFlag := &cli.StringFlag{
-		Name:     "db",
-		Usage:    "The target `schema` to modify.",
+		Name:     "schema",
+		Usage:    "The target `schema` to modify. Possible values are 'frontend', 'codeintel' and 'codeinsights'",
 		Required: true,
+		Aliases:  []string{"db"},
 	}
 	targetFlag := &cli.StringSliceFlag{
 		Name:     "target",
@@ -33,12 +34,17 @@ func UpTo(commandName string, factory RunnerFactory, outFactory OutputFactory, d
 	}
 	privilegedHashFlag := &cli.StringFlag{
 		Name:  "privileged-hash",
-		Usage: "Running -noop-privileged without this value will supply a value that will unlock migration application for the current upgrade operation. Future (distinct) upgrade operations will require a unique hash.",
+		Usage: "Running --noop-privileged without this flag will print instructions and supply a value for use in a second invocation. Future (distinct) upto operations will require a unique hash.",
 		Value: "",
 	}
 	ignoreSingleDirtyLogFlag := &cli.BoolFlag{
 		Name:  "ignore-single-dirty-log",
-		Usage: "Ignore a previously failed attempt if it will be immediately retried by this operation.",
+		Usage: "Ignore a single previously failed attempt if it will be immediately retried by this operation.",
+		Value: development,
+	}
+	ignoreSinglePendingLogFlag := &cli.BoolFlag{
+		Name:  "ignore-single-pending-log",
+		Usage: "Ignore a single pending migration attempt if it will be immediately retried by this operation.",
 		Value: development,
 	}
 
@@ -51,14 +57,15 @@ func UpTo(commandName string, factory RunnerFactory, outFactory OutputFactory, d
 		return runner.Options{
 			Operations: []runner.MigrationOperation{
 				{
-					SchemaName:     schemaNameFlag.Get(cmd),
+					SchemaName:     TranslateSchemaNames(schemaNameFlag.Get(cmd), out),
 					Type:           runner.MigrationOperationTypeTargetedUp,
 					TargetVersions: versions,
 				},
 			},
-			PrivilegedMode:       privilegedMode,
-			PrivilegedHash:       privilegedHashFlag.Get(cmd),
-			IgnoreSingleDirtyLog: ignoreSingleDirtyLogFlag.Get(cmd),
+			PrivilegedMode:         privilegedMode,
+			MatchPrivilegedHash:    func(hash string) bool { return hash == privilegedHashFlag.Get(cmd) },
+			IgnoreSingleDirtyLog:   ignoreSingleDirtyLogFlag.Get(cmd),
+			IgnoreSinglePendingLog: ignoreSinglePendingLogFlag.Get(cmd),
 		}, nil
 	}
 
@@ -71,7 +78,7 @@ func UpTo(commandName string, factory RunnerFactory, outFactory OutputFactory, d
 			return flagHelp(out, "supply a target via -target")
 		}
 
-		r, err := setupRunner(ctx, factory, schemaNameFlag.Get(cmd))
+		r, err := setupRunner(factory, TranslateSchemaNames(schemaNameFlag.Get(cmd), out))
 		if err != nil {
 			return err
 		}
@@ -97,6 +104,7 @@ func UpTo(commandName string, factory RunnerFactory, outFactory OutputFactory, d
 			noopPrivilegedFlag,
 			privilegedHashFlag,
 			ignoreSingleDirtyLogFlag,
+			ignoreSinglePendingLogFlag,
 		},
 	}
 }

@@ -4,151 +4,151 @@ import (
 	"context"
 	"time"
 
+	"github.com/sourcegraph/log"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/sourcegraph/sourcegraph/internal/api"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/enqueuer"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/inference"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/jobselector"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/store"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/shared"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies"
+	uploadsshared "github.com/sourcegraph/sourcegraph/internal/codeintel/uploads/shared"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
-var _ service = (*Service)(nil)
-
-type service interface {
-	// Not in use yet.
-	List(ctx context.Context, opts ListOpts) (jobs []IndexJob, err error)
-	Get(ctx context.Context, id int) (job IndexJob, ok bool, err error)
-	GetBatch(ctx context.Context, ids ...int) (jobs []IndexJob, err error)
-	Delete(ctx context.Context, id int) (err error)
-	Enqueue(ctx context.Context, jobs []IndexJob) (err error)
-	Infer(ctx context.Context, repoID int) (jobs []IndexJob, err error)
-	UpdateIndexingConfiguration(ctx context.Context, repoID int) (jobs []IndexJob, err error)
-
-	// Commits
-	GetStaleSourcedCommits(ctx context.Context, minimumTimeSinceLastCheck time.Duration, limit int, now time.Time) (_ []shared.SourcedCommits, err error)
-	UpdateSourcedCommits(ctx context.Context, repositoryID int, commit string, now time.Time) (indexesUpdated int, err error)
-	DeleteSourcedCommits(ctx context.Context, repositoryID int, commit string, maximumCommitLag time.Duration, now time.Time) (indexesDeleted int, err error)
-
-	// Indexes
-	DeleteIndexesWithoutRepository(ctx context.Context, now time.Time) (map[int]int, error)
-}
-
 type Service struct {
-	autoindexingStore store.Store
-	dbStore           DBStore // TODO - roll into store
-	gitserverClient   GitserverClient
-	repoUpdater       RepoUpdaterClient
-	inferenceService  inferenceService
-	operations        *operations
+	store           store.Store
+	repoStore       database.RepoStore
+	gitserverClient gitserver.Client
+	indexEnqueuer   *enqueuer.IndexEnqueuer
+	jobSelector     *jobselector.JobSelector
+	operations      *operations
 }
 
 func newService(
-	autoindexingStore store.Store,
-	dbStore DBStore,
-	gitserverClient GitserverClient,
-	repoUpdaterClient RepoUpdaterClient,
-	inferenceService inferenceService,
-	observationContext *observation.Context,
+	observationCtx *observation.Context,
+	store store.Store,
+	inferenceSvc InferenceService,
+	repoStore database.RepoStore,
+	gitserverClient gitserver.Client,
 ) *Service {
+	// NOTE - this should go up a level in init.go.
+	// Not going to do this now so that we don't blow up all of the
+	// tests (which have pretty good coverage of the whole service).
+	// We should rewrite/transplant tests to the closest package that
+	// provides that behavior and then mock the dependencies in the
+	// glue packages.
+
+	jobSelector := jobselector.NewJobSelector(
+		store,
+		repoStore,
+		inferenceSvc,
+		gitserverClient,
+		log.Scoped("autoindexing job selector"),
+	)
+
+	indexEnqueuer := enqueuer.NewIndexEnqueuer(
+		observationCtx,
+		store,
+		repoStore,
+		gitserverClient,
+		jobSelector,
+	)
+
 	return &Service{
-		autoindexingStore: autoindexingStore,
-		dbStore:           dbStore,
-		gitserverClient:   gitserverClient,
-		repoUpdater:       repoUpdaterClient,
-		inferenceService:  inferenceService,
-		operations:        newOperations(observationContext),
+		store:           store,
+		repoStore:       repoStore,
+		gitserverClient: gitserverClient,
+		indexEnqueuer:   indexEnqueuer,
+		jobSelector:     jobSelector,
+		operations:      newOperations(observationCtx),
 	}
 }
 
-type IndexJob = shared.IndexJob
-
-type ListOpts struct {
-	Limit int
+func (s *Service) GetIndexConfigurationByRepositoryID(ctx context.Context, repositoryID int) (shared.IndexConfiguration, bool, error) {
+	return s.store.GetIndexConfigurationByRepositoryID(ctx, repositoryID)
 }
 
-func (s *Service) List(ctx context.Context, opts ListOpts) (jobs []IndexJob, err error) {
-	ctx, _, endObservation := s.operations.list.With(ctx, &err, observation.Args{})
+// InferIndexConfiguration looks at the repository contents at the latest commit on the default branch of the given
+// repository and determines an index configuration that is likely to succeed.
+func (s *Service) InferIndexConfiguration(ctx context.Context, repositoryID int, commit string, localOverrideScript string, bypassLimit bool) (_ *shared.InferenceResult, err error) {
+	ctx, trace, endObservation := s.operations.inferIndexConfiguration.With(ctx, &err, observation.Args{Attrs: []attribute.KeyValue{
+		attribute.Int("repositoryID", repositoryID),
+	}})
 	defer endObservation(1, observation.Args{})
 
-	return s.autoindexingStore.List(ctx, store.ListOpts(opts))
+	repo, err := s.repoStore.Get(ctx, api.RepoID(repositoryID))
+	if err != nil {
+		return nil, err
+	}
+
+	if commit == "" {
+		_, commitSHA, err := s.gitserverClient.GetDefaultBranch(ctx, repo.Name, false)
+		if err != nil {
+			return nil, errors.Wrapf(err, "gitserver.GetDefaultBranch: error resolving HEAD for %d", repositoryID)
+		}
+		// If we're dealing with an empty repo, we can't infer anything.
+		if commitSHA == "" {
+			return nil, nil
+		}
+		commit = string(commitSHA)
+	} else {
+		// Verify that the commit exists.
+		_, err := s.gitserverClient.GetCommit(ctx, repo.Name, api.CommitID(commit))
+		if errors.HasType[*gitdomain.RevisionNotFoundError](err) {
+			return nil, errors.Newf("revision %s not found for %d", commit, repositoryID)
+		}
+		if err != nil {
+			return nil, errors.Wrapf(err, "gitserver.CommitExists: error checking %s for %d", commit, repositoryID)
+		}
+	}
+	trace.AddEvent("found", attribute.String("commit", commit))
+
+	return s.InferIndexJobsFromRepositoryStructure(ctx, repositoryID, commit, localOverrideScript, bypassLimit)
 }
 
-func (s *Service) Get(ctx context.Context, id int) (job IndexJob, ok bool, err error) {
-	ctx, _, endObservation := s.operations.get.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	// To be implemented in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_ = ctx
-	return IndexJob{}, false, errors.Newf("unimplemented: autoindexing.Get")
+func (s *Service) UpdateIndexConfigurationByRepositoryID(ctx context.Context, repositoryID int, data []byte) error {
+	return s.store.UpdateIndexConfigurationByRepositoryID(ctx, repositoryID, data)
 }
 
-func (s *Service) GetBatch(ctx context.Context, ids ...int) (jobs []IndexJob, err error) {
-	ctx, _, endObservation := s.operations.getBatch.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	// To be implemented in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_ = ctx
-	return nil, errors.Newf("unimplemented: autoindexing.GetBatch")
+func (s *Service) QueueRepoRev(ctx context.Context, repositoryID int, rev string) error {
+	return s.store.QueueRepoRev(ctx, repositoryID, rev)
 }
 
-func (s *Service) Delete(ctx context.Context, id int) (err error) {
-	ctx, _, endObservation := s.operations.delete.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	// To be implemented in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_ = ctx
-	return errors.Newf("unimplemented: autoindexing.Delete")
+func (s *Service) SetInferenceScript(ctx context.Context, script string) error {
+	return s.store.SetInferenceScript(ctx, script)
 }
 
-func (s *Service) Enqueue(ctx context.Context, jobs []IndexJob) (err error) {
-	ctx, _, endObservation := s.operations.enqueue.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	// To be implemented in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_ = ctx
-	return errors.Newf("unimplemented: autoindexing.Enqueue")
+func (s *Service) GetInferenceScript(ctx context.Context) (string, error) {
+	return s.store.GetInferenceScript(ctx)
 }
 
-func (s *Service) Infer(ctx context.Context, repoID int) (jobs []IndexJob, err error) {
-	ctx, _, endObservation := s.operations.infer.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	// To be implemented in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_ = ctx
-	return nil, errors.Newf("unimplemented: autoindexing.Infer")
+func (s *Service) QueueAutoIndexJobs(ctx context.Context, repositoryID int, rev, configuration string, force, bypassLimit bool) ([]uploadsshared.AutoIndexJob, error) {
+	return s.indexEnqueuer.QueueAutoIndexJobs(ctx, repositoryID, rev, configuration, force, bypassLimit)
 }
 
-func (s *Service) UpdateIndexingConfiguration(ctx context.Context, repoID int) (jobs []IndexJob, err error) {
-	ctx, _, endObservation := s.operations.updateIndexingConfiguration.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	// To be implemented in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_ = ctx
-	return nil, errors.Newf("unimplemented: autoindexing.UpdateIndexingConfiguration")
+func (s *Service) QueueAutoIndexJobsForPackage(ctx context.Context, pkg dependencies.MinimialVersionedPackageRepo) error {
+	return s.indexEnqueuer.QueueAutoIndexJobsForPackage(ctx, pkg)
 }
 
-func (s *Service) DeleteIndexesWithoutRepository(ctx context.Context, now time.Time) (_ map[int]int, err error) {
-	ctx, _, endObservation := s.operations.deleteIndexesWithoutRepository.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	return s.autoindexingStore.DeleteIndexesWithoutRepository(ctx, now)
+func (s *Service) InferIndexJobsFromRepositoryStructure(ctx context.Context, repositoryID int, commit string, localOverrideScript string, bypassLimit bool) (*shared.InferenceResult, error) {
+	return s.jobSelector.InferIndexJobsFromRepositoryStructure(ctx, repositoryID, commit, localOverrideScript, bypassLimit)
 }
 
-func (s *Service) GetStaleSourcedCommits(ctx context.Context, minimumTimeSinceLastCheck time.Duration, limit int, now time.Time) (_ []shared.SourcedCommits, err error) {
-	ctx, _, endObservation := s.operations.getStaleSourcedCommits.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	return s.autoindexingStore.GetStaleSourcedCommits(ctx, minimumTimeSinceLastCheck, limit, now)
+func IsLimitError(err error) bool {
+	return errors.As(err, &inference.LimitError{})
 }
 
-func (s *Service) UpdateSourcedCommits(ctx context.Context, repositoryID int, commit string, now time.Time) (indexesUpdated int, err error) {
-	ctx, _, endObservation := s.operations.updateSourcedCommits.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	return s.autoindexingStore.UpdateSourcedCommits(ctx, repositoryID, commit, now)
+func (s *Service) RepositoryIDsWithConfiguration(ctx context.Context, offset, limit int) ([]uploadsshared.RepositoryWithAvailableIndexers, int, error) {
+	return s.store.RepositoryIDsWithConfiguration(ctx, offset, limit)
 }
 
-func (s *Service) DeleteSourcedCommits(ctx context.Context, repositoryID int, commit string, maximumCommitLag time.Duration, now time.Time) (indexesDeleted int, err error) {
-	ctx, _, endObservation := s.operations.deleteSourcedCommits.With(ctx, &err, observation.Args{})
-	defer endObservation(1, observation.Args{})
-
-	return s.autoindexingStore.DeleteSourcedCommits(ctx, repositoryID, commit, maximumCommitLag)
+func (s *Service) GetLastIndexScanForRepository(ctx context.Context, repositoryID int) (*time.Time, error) {
+	return s.store.GetLastIndexScanForRepository(ctx, repositoryID)
 }

@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -35,7 +36,7 @@ const (
 	squasherContainerPostgresName = "postgres"
 )
 
-func SquashAll(database db.Database, inContainer, skipTeardown bool, filepath string) error {
+func SquashAll(database db.Database, inContainer, runInTimescaleDBContainer, skipTeardown, skipData bool, filepath string) error {
 	definitions, err := readDefinitions(database)
 	if err != nil {
 		return err
@@ -45,7 +46,7 @@ func SquashAll(database db.Database, inContainer, skipTeardown bool, filepath st
 		leafIDs = append(leafIDs, leaf.ID)
 	}
 
-	squashedUpMigration, _, err := generateSquashedMigrations(database, leafIDs, inContainer, skipTeardown)
+	squashedUpMigration, _, err := generateSquashedMigrations(database, leafIDs, inContainer, runInTimescaleDBContainer, skipTeardown, skipData)
 	if err != nil {
 		return err
 	}
@@ -53,7 +54,7 @@ func SquashAll(database db.Database, inContainer, skipTeardown bool, filepath st
 	return os.WriteFile(filepath, []byte(squashedUpMigration), os.ModePerm)
 }
 
-func Squash(database db.Database, commit string, inContainer, skipTeardown bool) error {
+func Squash(database db.Database, commit string, inContainer, runInTimescaleDBContainer, skipTeardown, skipData bool) error {
 	definitions, err := readDefinitions(database)
 	if err != nil {
 		return err
@@ -68,7 +69,7 @@ func Squash(database db.Database, commit string, inContainer, skipTeardown bool)
 	}
 
 	// Run migrations up to the new selected root and dump the database into a single migration file pair
-	squashedUpMigration, squashedDownMigration, err := generateSquashedMigrations(database, []int{newRoot.ID}, inContainer, skipTeardown)
+	squashedUpMigration, squashedDownMigration, err := generateSquashedMigrations(database, []int{newRoot.ID}, inContainer, runInTimescaleDBContainer, skipTeardown, skipData)
 	if err != nil {
 		return err
 	}
@@ -163,17 +164,40 @@ func Squash(database db.Database, commit string, inContainer, skipTeardown bool)
 func selectNewRootMigration(database db.Database, ds *definition.Definitions, commit string) (definition.Definition, bool, error) {
 	migrationsDir := filepath.Join("migrations", database.Name)
 
-	output, err := run.GitCmd("ls-tree", "-r", "--name-only", commit, migrationsDir)
+	gitCmdOutput, err := run.GitCmd("ls-tree", "-r", "--name-only", commit, migrationsDir)
 	if err != nil {
 		return definition.Definition{}, false, err
 	}
 
-	ds, err = ds.Filter(parseVersions(strings.Split(output, "\n"), migrationsDir))
+	versionsAtCommit := parseVersions(strings.Split(gitCmdOutput, "\n"), migrationsDir)
+
+	filteredDefinitions, err := ds.Filter(versionsAtCommit)
 	if err != nil {
 		return definition.Definition{}, false, err
 	}
 
-	leafDominator, ok := ds.LeafDominator()
+	// Determine the set of parents inside the intersection with children outside of
+	// the intersection. Unfortunately it's not enough to calculate only the leaf
+	// dominator (below) if there were long-standing PRs that caused a migration parent
+	// edge to cross over the release boundary. What we actually need is the dominators
+	// of the leaves as well as the set of migrations defined more recently than the
+	// squash target version.
+	parentsMap := make(map[int]struct{}, len(versionsAtCommit))
+	for _, migration := range ds.All() {
+		if _, ok := filteredDefinitions.GetByID(migration.ID); !ok {
+			for _, parent := range migration.Parents {
+				if _, ok := filteredDefinitions.GetByID(parent); ok {
+					parentsMap[parent] = struct{}{}
+				}
+			}
+		}
+	}
+	flattenedParents := make([]int, 0, len(parentsMap))
+	for id := range parentsMap {
+		flattenedParents = append(flattenedParents, id)
+	}
+
+	leafDominator, ok := filteredDefinitions.LeafDominator(flattenedParents...)
 	if !ok {
 		return definition.Definition{}, false, nil
 	}
@@ -183,8 +207,8 @@ func selectNewRootMigration(database db.Database, ds *definition.Definitions, co
 
 // generateSquashedMigrations generates the content of a migration file pair that contains the contents
 // of a database up to a given migration index.
-func generateSquashedMigrations(database db.Database, targetVersions []int, inContainer, skipTeardown bool) (up, down string, err error) {
-	postgresDSN, teardown, err := setupDatabaseForSquash(database, inContainer)
+func generateSquashedMigrations(database db.Database, targetVersions []int, inContainer, runInTimescaleDBContainer, skipTeardown, skipData bool) (up, down string, err error) {
+	postgresDSN, teardown, err := setupDatabaseForSquash(database, inContainer, runInTimescaleDBContainer)
 	if err != nil {
 		return "", "", err
 	}
@@ -198,7 +222,7 @@ func generateSquashedMigrations(database db.Database, targetVersions []int, inCo
 		return "", "", err
 	}
 
-	upMigration, err := generateSquashedUpMigration(database, postgresDSN)
+	upMigration, err := generateSquashedUpMigration(database, postgresDSN, skipData)
 	if err != nil {
 		return "", "", err
 	}
@@ -209,14 +233,22 @@ func generateSquashedMigrations(database db.Database, targetVersions []int, inCo
 // setupDatabaseForSquash prepares a database for use in running a schema up to a certain point so it
 // can be reliably dumped. If the provided inContainer flag is true, then this function will launch a
 // daemon Postgres container. Otherwise, a new database on the host Postgres instance will be created.
-func setupDatabaseForSquash(database db.Database, runInContainer bool) (string, func(error) error, error) {
+//
+// If `runIntimescaleDBContainer` is true, then a TimescaleDB-compatible image will be used. This is
+// necessary to squash migrations prior to the deprecation of TimescaleDB.
+func setupDatabaseForSquash(database db.Database, runInContainer, runInTimescaleDBContainer bool) (string, func(error) error, error) {
 	if runInContainer {
+		image := "postgres:12.7"
+		if runInTimescaleDBContainer {
+			image = "timescale/timescaledb-ha:pg14-latest"
+		}
+
 		postgresDSN := fmt.Sprintf(
 			"postgres://postgres@127.0.0.1:%d/%s?sslmode=disable",
 			squasherContainerExposedPort,
 			database.Name,
 		)
-		teardown, err := runPostgresContainer(database.Name)
+		teardown, err := runPostgresContainer(image, database.Name)
 		return postgresDSN, teardown, err
 	}
 
@@ -233,8 +265,8 @@ func setupDatabaseForSquash(database db.Database, runInContainer bool) (string, 
 
 // runTargetedUpMigrations runs up migration targeting the given versions on the given database instance.
 func runTargetedUpMigrations(database db.Database, targetVersions []int, postgresDSN string) (err error) {
+	logger := log.Scoped("runTargetedUpMigrations")
 
-	logger := log.Scoped("runTargetedUpMigrations", "")
 	pending := std.Out.Pending(output.Line("", output.StylePending, "Migrating PostgreSQL schema..."))
 	defer func() {
 		if err == nil {
@@ -246,8 +278,8 @@ func runTargetedUpMigrations(database db.Database, targetVersions []int, postgre
 
 	var dbs []*sql.DB
 	defer func() {
-		for _, db := range dbs {
-			_ = db.Close()
+		for _, dbHandle := range dbs {
+			_ = dbHandle.Close()
 		}
 	}()
 
@@ -262,9 +294,10 @@ func runTargetedUpMigrations(database db.Database, targetVersions []int, postgre
 		// in-use.
 		dbs = append(dbs, db)
 
-		return connections.NewStoreShim(store.NewWithDB(db, migrationsTable, store.NewOperations(&observation.TestContext)))
+		return connections.NewStoreShim(store.NewWithDB(&observation.TestContext, db, migrationsTable))
 	}
-	r, err := connections.RunnerFromDSNs(logger, dsns, "sg", storeFactory)
+
+	r, err := connections.RunnerFromDSNs(std.Out.Output, logger.IncreaseLevel("runner", "", log.LevelNone), dsns, "sg", storeFactory)
 	if err != nil {
 		return err
 	}
@@ -294,13 +327,13 @@ func setupLocalDatabase(databaseName string) (_ func(error) error, err error) {
 
 	createLocalDatabase := func() error {
 		cmd := exec.Command("createdb", databaseName)
-		_, err := run.InRoot(cmd)
+		_, err := run.InRoot(cmd, run.InRootArgs{})
 		return err
 	}
 
 	dropLocalDatabase := func() error {
 		cmd := exec.Command("dropdb", databaseName)
-		_, err := run.InRoot(cmd)
+		_, err := run.InRoot(cmd, run.InRootArgs{})
 		return err
 	}
 
@@ -322,10 +355,10 @@ func setupLocalDatabase(databaseName string) (_ func(error) error, err error) {
 	return teardown, nil
 }
 
-// runPostgresContainer runs a postgres:12.6 daemon with an empty db with the given name.
-// This method returns a teardown function that filters the error value of the calling
-// function, as well as any immediate synchronous error.
-func runPostgresContainer(databaseName string) (_ func(err error) error, err error) {
+// runPostgresContainer runs the given Postgres-compatible image with an empty db with the
+// given name. This method returns a teardown function that filters the error value of the
+// calling function, as well as any immediate synchronous error.
+func runPostgresContainer(image, databaseName string) (_ func(err error) error, err error) {
 	pending := std.Out.Pending(output.Line("", output.StylePending, "Starting PostgreSQL 12 in a container..."))
 	defer func() {
 		if err == nil {
@@ -353,7 +386,7 @@ func runPostgresContainer(databaseName string) (_ func(err error) error, err err
 		"--name", squasherContainerName,
 		"-p", fmt.Sprintf("%d:5432", squasherContainerExposedPort),
 		"-e", "POSTGRES_HOST_AUTH_METHOD=trust",
-		"postgres:12.7",
+		image,
 	}
 	if _, err := run.DockerCmd(runArgs...); err != nil {
 		return nil, err
@@ -379,7 +412,7 @@ func runPostgresContainer(databaseName string) (_ func(err error) error, err err
 
 // generateSquashedUpMigration returns the contents of an up migration file containing the
 // current contents of the given database.
-func generateSquashedUpMigration(database db.Database, postgresDSN string) (_ string, err error) {
+func generateSquashedUpMigration(database db.Database, postgresDSN string, skipData bool) (_ string, err error) {
 	pending := std.Out.Pending(output.Line("", output.StylePending, "Dumping current database..."))
 	defer func() {
 		if err == nil {
@@ -391,7 +424,9 @@ func generateSquashedUpMigration(database db.Database, postgresDSN string) (_ st
 
 	pgDump := func(args ...string) (string, error) {
 		cmd := exec.Command("pg_dump", append([]string{postgresDSN}, args...)...)
-		return run.InRoot(cmd)
+		var b bytes.Buffer
+		err := run.SplitOutputInRoot(cmd, &b, os.Stderr)
+		return b.String(), err
 	}
 
 	excludeTables := []string{
@@ -403,6 +438,7 @@ func generateSquashedUpMigration(database db.Database, postgresDSN string) (_ st
 	args := []string{
 		"--schema-only",
 		"--no-owner",
+		"--verbose",
 	}
 	for _, tableName := range excludeTables {
 		args = append(args, "--exclude-table", tableName)
@@ -413,17 +449,19 @@ func generateSquashedUpMigration(database db.Database, postgresDSN string) (_ st
 		return "", err
 	}
 
-	for _, table := range database.DataTables {
-		dataOutput, err := pgDump("--data-only", "--inserts", "--table", table)
-		if err != nil {
-			return "", err
+	if !skipData {
+		for _, table := range database.DataTables {
+			dataOutput, err := pgDump("--data-only", "--inserts", "--table", table)
+			if err != nil {
+				return "", err
+			}
+
+			pgDumpOutput += dataOutput
 		}
 
-		pgDumpOutput += dataOutput
-	}
-
-	for _, table := range database.CountTables {
-		pgDumpOutput += fmt.Sprintf("INSERT INTO %s VALUES (0);\n", table)
+		for _, table := range database.CountTables {
+			pgDumpOutput += fmt.Sprintf("INSERT INTO %s VALUES (0);\n", table)
+		}
 	}
 
 	return sanitizePgDumpOutput(pgDumpOutput), nil
@@ -478,8 +516,8 @@ var privilegedQueryPattern = lazyregexp.New(`(CREATE|COMMENT ON) EXTENSION .+;\n
 //
 // Currently, we consider the following query patterns as privileged from pg_dump output:
 //
-//  - CREATE EXTENSION ...
-//  - COMMENT ON EXTENSION ...
+//   - CREATE EXTENSION ...
+//   - COMMENT ON EXTENSION ...
 func splitPrivilegedMigrations(content string) (privilegedMigration string, unprivilegedMigration string) {
 	var privilegedQueries []string
 	unprivileged := privilegedQueryPattern.ReplaceAllStringFunc(content, func(s string) string {
@@ -496,8 +534,8 @@ func removeAncestorsOf(database db.Database, ds *definition.Definitions, targetV
 	allDefinitions := ds.All()
 
 	allIDs := make([]int, 0, len(allDefinitions))
-	for _, definition := range allDefinitions {
-		allIDs = append(allIDs, definition.ID)
+	for _, def := range allDefinitions {
+		allIDs = append(allIDs, def.ID)
 	}
 
 	properDescendants, err := ds.Down(allIDs, []int{targetVersion})
@@ -506,16 +544,16 @@ func removeAncestorsOf(database db.Database, ds *definition.Definitions, targetV
 	}
 
 	keep := make(map[int]struct{}, len(properDescendants))
-	for _, definition := range properDescendants {
-		keep[definition.ID] = struct{}{}
+	for _, def := range properDescendants {
+		keep[def.ID] = struct{}{}
 	}
 
 	// Gather the set of filtered that are NOT a proper descendant of the given target version.
 	// This will leave us with the ancestors of the target version (including itself).
 	filteredIDs := make([]int, 0, len(allDefinitions))
-	for _, definition := range allDefinitions {
-		if _, ok := keep[definition.ID]; !ok {
-			filteredIDs = append(filteredIDs, definition.ID)
+	for _, def := range allDefinitions {
+		if _, ok := keep[def.ID]; !ok {
+			filteredIDs = append(filteredIDs, def.ID)
 		}
 	}
 

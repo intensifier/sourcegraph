@@ -8,26 +8,26 @@ import (
 )
 
 type operations struct {
-	todo *observation.Operation
+	authMiddleware *observation.Operation
 }
 
-func newOperations(observationContext *observation.Context) *operations {
-	metrics := metrics.NewREDMetrics(
-		observationContext.Registerer,
+func newOperations(observationCtx *observation.Context) *operations {
+	redMetrics := metrics.NewREDMetrics(
+		observationCtx.Registerer,
 		"codeintel_uploads_transport_http",
 		metrics.WithLabels("op"),
 		metrics.WithCountHelp("Total number of method invocations."),
 	)
 
 	op := func(name string) *observation.Operation {
-		return observationContext.Operation(observation.Op{
+		return observationCtx.Operation(observation.Op{
 			Name:              fmt.Sprintf("codeintel.uploads.transport.http.%s", name),
 			MetricLabelValues: []string{name},
-			Metrics:           metrics,
+			Metrics:           redMetrics,
 		})
 	}
 
 	return &operations{
-		todo: op("Todo"),
+		authMiddleware: op("authMiddleware"),
 	}
 }

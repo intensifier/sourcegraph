@@ -1,7 +1,5 @@
 import React from 'react'
 
-import * as GQL from '@sourcegraph/shared/src/schema'
-
 import { formatUserCount } from '../../../productSubscription/helpers'
 
 /**
@@ -10,32 +8,20 @@ import { formatUserCount } from '../../../productSubscription/helpers'
  */
 export const ProductSubscriptionLabel: React.FunctionComponent<
     React.PropsWithChildren<{
-        productSubscription: {
-            invoiceItem?:
-                | ({
-                      plan: Pick<GQL.IProductPlan, 'name' | 'nameWithBrand'>
-                  } & Pick<GQL.IProductSubscriptionInvoiceItem, 'userCount'>)
-                | null
-        } & Pick<GQL.IProductSubscription, 'activeLicense'>
-
-        planField?: 'name' | 'nameWithBrand'
-
+        productName?: string
+        userCount?: bigint
         className?: string
     }>
-> = ({ productSubscription, planField, className = '' }) => (
+> = ({ productName, userCount, className = '' }) => (
     <span className={className}>
-        {productSubscription.invoiceItem ? (
-            <>
-                {productSubscription.invoiceItem.plan[planField || 'nameWithBrand']} (
-                {formatUserCount(productSubscription.invoiceItem.userCount)})
-            </>
-        ) : productSubscription.activeLicense?.info ? (
-            <>
-                {productSubscription.activeLicense.info.productNameWithBrand} (
-                {formatUserCount(productSubscription.activeLicense.info.userCount)})
-            </>
+        {productName && userCount ? (
+            <>{productSubscriptionLabel(productName, userCount)}</>
         ) : (
             <span className="text-muted font-italic">No plan selected</span>
         )}
     </span>
 )
+
+export function productSubscriptionLabel(productName?: string, userCount?: bigint): string {
+    return `${productName} (${formatUserCount(Number(userCount))})`
+}

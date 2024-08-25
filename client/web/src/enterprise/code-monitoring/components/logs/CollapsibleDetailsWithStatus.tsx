@@ -1,7 +1,6 @@
 import React, { useCallback, useMemo, useState } from 'react'
 
-import { mdiChevronDown, mdiChevronRight } from '@mdi/js'
-import classNames from 'classnames'
+import { mdiChevronDown, mdiChevronUp } from '@mdi/js'
 
 import { Badge, Button, Icon } from '@sourcegraph/wildcard'
 
@@ -23,37 +22,45 @@ export const CollapsibleDetailsWithStatus: React.FunctionComponent<
 
     const statusBadge = useMemo(() => {
         switch (status) {
-            case EventStatus.ERROR:
+            case EventStatus.ERROR: {
                 return 'danger'
-            case EventStatus.PENDING:
+            }
+            case EventStatus.PENDING: {
                 return 'warning'
-            case EventStatus.SUCCESS:
+            }
+            case EventStatus.SUCCESS: {
                 return 'primary'
-            case 'skipped':
+            }
+            case 'skipped': {
                 return 'warning'
+            }
         }
     }, [status])
 
     const statusText = useMemo(() => {
         switch (status) {
-            case EventStatus.ERROR:
+            case EventStatus.ERROR: {
                 return 'Error'
-            case EventStatus.PENDING:
+            }
+            case EventStatus.PENDING: {
                 return 'Pending'
-            case EventStatus.SUCCESS:
+            }
+            case EventStatus.SUCCESS: {
                 return 'Success'
-            case 'skipped':
+            }
+            case 'skipped': {
                 return 'Skipped'
+            }
         }
     }, [status])
 
     return (
         <li className={styles.wrapper}>
-            <Button onClick={toggleExpanded} className={classNames('btn-icon d-block', styles.expandButton)}>
+            <Button onClick={toggleExpanded} className={styles.expandButton}>
                 {expanded ? (
-                    <Icon svgPath={mdiChevronDown} className="mr-2" aria-label="Collapse details." />
+                    <Icon svgPath={mdiChevronUp} className="mr-2" aria-label="Collapse details." />
                 ) : (
-                    <Icon svgPath={mdiChevronRight} className="mr-2" aria-label="Expand details." />
+                    <Icon svgPath={mdiChevronDown} className="mr-2" aria-label="Expand details." />
                 )}
                 <span>{title}</span>
                 <Badge

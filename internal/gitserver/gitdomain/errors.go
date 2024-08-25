@@ -7,10 +7,6 @@ import (
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
-// TODO: We should consistently make all the errors pointer receivers. By being
-// pointer receivers it's a compile time error to return them as values and then
-// use them as an error type.
-
 // RevisionNotFoundError is an error that reports a revision doesn't exist.
 type RevisionNotFoundError struct {
 	Repo api.RepoName
@@ -25,8 +21,14 @@ func (e *RevisionNotFoundError) HTTPStatusCode() int {
 	return 404
 }
 
-func (RevisionNotFoundError) NotFound() bool {
+func (e *RevisionNotFoundError) NotFound() bool {
 	return true
+}
+
+// IsRevisionNotFoundError reports if err is a RevisionNotFoundError.
+func IsRevisionNotFoundError(err error) bool {
+	var e *RevisionNotFoundError
+	return errors.As(err, &e)
 }
 
 type BadCommitError struct {
@@ -35,7 +37,7 @@ type BadCommitError struct {
 	Repo   api.RepoName
 }
 
-func (e BadCommitError) Error() string {
+func (e *BadCommitError) Error() string {
 	return fmt.Sprintf("ResolveRevision: got bad commit %q for repo %q at revision %q", e.Commit, e.Repo, e.Spec)
 }
 
@@ -61,7 +63,7 @@ func (e *RepoNotExistError) Error() string {
 
 // IsRepoNotExist reports if err is a RepoNotExistError.
 func IsRepoNotExist(err error) bool {
-	return errors.HasType(err, &RepoNotExistError{})
+	return errors.HasType[*RepoNotExistError](err)
 }
 
 // IsCloneInProgress reports if err is a RepoNotExistError which has a clone

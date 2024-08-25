@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/urfave/cli/v2"
 
+	"github.com/sourcegraph/sourcegraph/dev/sg/internal/category"
 	"github.com/sourcegraph/sourcegraph/dev/sg/internal/run"
-	"github.com/sourcegraph/sourcegraph/dev/sg/internal/sgconf"
 	"github.com/sourcegraph/sourcegraph/dev/sg/internal/std"
+	"github.com/sourcegraph/sourcegraph/lib/cliutil/completions"
 	"github.com/sourcegraph/sourcegraph/lib/output"
 )
 
@@ -29,8 +32,8 @@ var testCommand = &cli.Command{
 # Run different test suites:
 sg test backend
 sg test backend-integration
-sg test frontend
-sg test frontend-e2e
+sg test client
+sg test web-e2e
 
 # List available test suites:
 sg test -help
@@ -38,9 +41,9 @@ sg test -help
 # Arguments are passed along to the command
 sg test backend-integration -run TestSearch
 `,
-	Category: CategoryDev,
-	BashComplete: completeOptions(func() (options []string) {
-		config, _ := sgconf.Get(configFile, configOverwriteFile)
+	Category: category.Dev,
+	BashComplete: completions.CompleteArgs(func() (options []string) {
+		config, _ := getConfig()
 		if config == nil {
 			return
 		}
@@ -53,7 +56,7 @@ sg test backend-integration -run TestSearch
 }
 
 func testExec(ctx *cli.Context) error {
-	config, err := sgconf.Get(configFile, configOverwriteFile)
+	config, err := getConfig()
 	if err != nil {
 		return err
 	}
@@ -70,7 +73,7 @@ func testExec(ctx *cli.Context) error {
 		return flag.ErrHelp
 	}
 
-	return run.Test(ctx.Context, cmd, args[1:], config.Env)
+	return run.Test(ctx.Context, newSGTestCommand(*cmd, args[1:]), config.Env)
 }
 
 func constructTestCmdLongHelp() string {
@@ -80,7 +83,7 @@ func constructTestCmdLongHelp() string {
 
 	// Attempt to parse config to list available testsuites, but don't fail on
 	// error, because we should never error when the user wants --help output.
-	config, err := sgconf.Get(configFile, configOverwriteFile)
+	config, err := getConfig()
 	if err != nil {
 		out.Write([]byte("\n"))
 		// Do not treat error message as a format string
@@ -100,4 +103,29 @@ func constructTestCmdLongHelp() string {
 	fmt.Fprint(&out, "* "+strings.Join(names, "\n* "))
 
 	return out.String()
+}
+
+type sgTestCommand struct {
+	run.Command
+	args []string
+}
+
+// Ovrrides the GetExecCmd method with a custom implementation to construct the command
+// using CLI-passed arguments
+func (test sgTestCommand) GetExecCmd(ctx context.Context) (*exec.Cmd, error) {
+	cmdArgs := []string{test.Command.Cmd}
+	if len(test.args) != 0 {
+		cmdArgs = append(cmdArgs, test.args...)
+	} else {
+		cmdArgs = append(cmdArgs, test.Command.DefaultArgs)
+	}
+
+	return exec.CommandContext(ctx, "bash", "-c", strings.Join(cmdArgs, " ")), nil
+}
+
+func newSGTestCommand(cmd run.Command, args []string) sgTestCommand {
+	return sgTestCommand{
+		Command: cmd,
+		args:    args,
+	}
 }

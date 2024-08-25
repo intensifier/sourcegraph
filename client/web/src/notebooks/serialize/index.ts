@@ -1,37 +1,44 @@
-import { Observable, of } from 'rxjs'
+import { type Observable, of } from 'rxjs'
 import { map } from 'rxjs/operators'
 
 import { isErrorLike } from '@sourcegraph/common'
-import { IHighlightLineRange, NotebookBlock, SymbolKind } from '@sourcegraph/shared/src/schema'
 import { toAbsoluteBlobURL } from '@sourcegraph/shared/src/util/url'
 
-import { Block, BlockInit, BlockInput, FileBlockInput, SerializableBlock, SymbolBlockInput } from '..'
-import { CreateNotebookBlockInput, NotebookBlockType } from '../../graphql-operations'
+import type { Block, BlockInit, BlockInput, FileBlockInput, SerializableBlock, SymbolBlockInput } from '..'
+import {
+    type CreateNotebookBlockInput,
+    NotebookBlockType,
+    SymbolKind,
+    type HighlightLineRange,
+    type NotebookFields,
+} from '../../graphql-operations'
 import { parseBrowserRepoURL } from '../../util/url'
 
 export function serializeBlockToMarkdown(block: SerializableBlock, sourcegraphURL: string): Observable<string> {
     const serializedInput = serializeBlockInput(block, sourcegraphURL)
     switch (block.type) {
-        case 'md':
+        case 'md': {
             return serializedInput.pipe(map(input => input.trimEnd()))
-        case 'query':
+        }
+        case 'query': {
             return serializedInput.pipe(map(input => `\`\`\`sourcegraph\n${input}\n\`\`\``))
+        }
         case 'file':
-        case 'compute':
-        case 'symbol':
+        case 'symbol': {
             return serializedInput
+        }
     }
 }
 
 export function serializeBlockInput(block: SerializableBlock, sourcegraphURL: string): Observable<string> {
     switch (block.type) {
-        case 'md':
+        case 'md': {
             return of(block.input.text)
-        case 'query':
+        }
+        case 'query': {
             return of(block.input.query)
-        case 'compute':
-            return of(block.input)
-        case 'file':
+        }
+        case 'file': {
             return of(
                 toAbsoluteBlobURL(sourcegraphURL, {
                     repoName: block.input.repositoryName,
@@ -45,6 +52,7 @@ export function serializeBlockInput(block: SerializableBlock, sourcegraphURL: st
                         : undefined,
                 })
             )
+        }
         case 'symbol': {
             if (!block.output) {
                 return of('')
@@ -121,25 +129,26 @@ function parseSymbolBlockInput(input: string): SymbolBlockInput {
 
 export function deserializeBlockInput(type: Block['type'], input: string): BlockInput {
     switch (type) {
-        case 'md':
+        case 'md': {
             return { type, input: { text: input } }
-        case 'query':
+        }
+        case 'query': {
             return { type, input: { query: input } }
-        case 'compute':
-            return { type, input }
-        case 'file':
+        }
+        case 'file': {
             return { type, input: parseFileBlockInput(input) }
+        }
         case 'symbol': {
             return { type, input: parseSymbolBlockInput(input) }
         }
     }
 }
 
-export function isSingleLineRange(lineRange: IHighlightLineRange | null): boolean {
+export function isSingleLineRange(lineRange: HighlightLineRange | null): boolean {
     return lineRange ? lineRange.startLine + 1 === lineRange.endLine : false
 }
 
-export function serializeLineRange(lineRange: IHighlightLineRange | null): string {
+export function serializeLineRange(lineRange: HighlightLineRange | null): string {
     if (!lineRange) {
         return ''
     }
@@ -151,7 +160,7 @@ export function serializeLineRange(lineRange: IHighlightLineRange | null): strin
 
 const LINE_RANGE_REGEX = /^(\d+)(-\d+)?$/
 
-export function parseLineRange(value: string): IHighlightLineRange | null {
+export function parseLineRange(value: string): HighlightLineRange | null {
     const matches = value.match(LINE_RANGE_REGEX)
     if (matches === null) {
         return null
@@ -163,46 +172,46 @@ export function parseLineRange(value: string): IHighlightLineRange | null {
 
 export function blockToGQLInput(block: BlockInit): CreateNotebookBlockInput {
     switch (block.type) {
-        case 'md':
+        case 'md': {
             return { id: block.id, type: NotebookBlockType.MARKDOWN, markdownInput: block.input.text }
-        case 'query':
+        }
+        case 'query': {
             return { id: block.id, type: NotebookBlockType.QUERY, queryInput: block.input.query }
-        case 'file':
+        }
+        case 'file': {
             return { id: block.id, type: NotebookBlockType.FILE, fileInput: block.input }
-        case 'symbol':
+        }
+        case 'symbol': {
             return { id: block.id, type: NotebookBlockType.SYMBOL, symbolInput: block.input }
-        case 'compute':
-            return { id: block.id, type: NotebookBlockType.COMPUTE, computeInput: block.input }
+        }
     }
 }
 
-export function GQLBlockToGQLInput(block: NotebookBlock): CreateNotebookBlockInput {
+export function GQLBlockToGQLInput(block: NotebookFields['blocks'][number]): CreateNotebookBlockInput {
     switch (block.__typename) {
-        case 'MarkdownBlock':
+        case 'MarkdownBlock': {
             return { id: block.id, type: NotebookBlockType.MARKDOWN, markdownInput: block.markdownInput }
-        case 'QueryBlock':
+        }
+        case 'QueryBlock': {
             return { id: block.id, type: NotebookBlockType.QUERY, queryInput: block.queryInput }
-        case 'FileBlock':
+        }
+        case 'FileBlock': {
             return {
                 id: block.id,
                 type: NotebookBlockType.FILE,
                 fileInput: block.fileInput,
             }
-        case 'SymbolBlock':
+        }
+        case 'SymbolBlock': {
             return {
                 id: block.id,
                 type: NotebookBlockType.SYMBOL,
                 symbolInput: block.symbolInput,
             }
-        case 'ComputeBlock':
-            return {
-                id: block.id,
-                type: NotebookBlockType.COMPUTE,
-                computeInput: block.computeInput,
-            }
+        }
     }
 }
 
 export function convertNotebookTitleToFileName(title: string): string {
-    return title.replace(/[^\da-z]/gi, '_').replace(/_+/g, '_')
+    return title.replaceAll(/[^\da-z]/gi, '_').replaceAll(/_+/g, '_')
 }

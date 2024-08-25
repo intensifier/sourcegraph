@@ -11,10 +11,10 @@ import (
 // scripts via UserData values. This struct can take one of two mutually
 // exclusive forms:
 //
-//   (1) An applicable recognizer with patterns and a generate function.
-//   (2) A fallback recognizer, which consists of a list of children.
-//       Execution of a fallback recognizer will invoke its children,
-//       in order and recursively, until the non-empty value is yielded.
+//	(1) An applicable recognizer with patterns and a generate function.
+//	(2) A fallback recognizer, which consists of a list of children.
+//	    Execution of a fallback recognizer will invoke its children,
+//	    in order and recursively, until the non-empty value is yielded.
 type Recognizer struct {
 	patterns           []*PathPattern
 	patternsForContent []*PathPattern
@@ -129,42 +129,27 @@ func LinearizeHinter(recognizer *Recognizer) (recognizers []*Recognizer) {
 func NamedRecognizersFromUserDataMap(value lua.LValue, allowFalseAsNil bool) (recognizers map[string]*Recognizer, err error) {
 	recognizers = map[string]*Recognizer{}
 
+	if err := util.CheckTypeProperty(value, "sg.recognizer"); err != nil {
+		return nil, err
+	}
+
 	err = util.ForEach(value, func(key, value lua.LValue) error {
 		name := key.String()
-
-		if value.Type() == lua.LTBool && !lua.LVAsBool(value) {
-			if allowFalseAsNil {
-				recognizers[name] = nil
-				return nil
-			}
+		if name == "__type" {
+			return nil
 		}
 
-		return util.UnwrapLuaUserData(value, func(value any) error {
-			recognizer, ok := value.(*Recognizer)
-			if !ok {
-				return util.NewTypeError("*Recognizer", value)
-			}
-
-			recognizers[name] = recognizer
+		if allowFalseAsNil && value.Type() == lua.LTBool && !lua.LVAsBool(value) {
+			recognizers[name] = nil
 			return nil
-		})
-	})
+		}
 
-	return
-}
-
-// RecognizersFromUserData decodes a single recognize or slice of recognizers from the
-// given Lua value.
-func RecognizersFromUserData(value lua.LValue) (recognizers []*Recognizer, err error) {
-	err = util.UnwrapSliceOrSingleton(value, func(value lua.LValue) error {
-		return util.UnwrapLuaUserData(value, func(value any) error {
-			if recognizer, ok := value.(*Recognizer); ok {
-				recognizers = append(recognizers, recognizer)
-				return nil
-			}
-
-			return util.NewTypeError("*Recognizer", value)
-		})
+		recognizer, err := util.TypecheckUserData[*Recognizer](value, "*Recognizer")
+		if err != nil {
+			return err
+		}
+		recognizers[name] = recognizer
+		return nil
 	})
 
 	return

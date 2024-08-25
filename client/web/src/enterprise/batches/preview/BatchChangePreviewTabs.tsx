@@ -1,24 +1,19 @@
-import React from 'react'
+import React, { useCallback } from 'react'
 
 import { mdiSourceBranch, mdiFileDocument } from '@mdi/js'
-import { useHistory, useLocation } from 'react-router'
+import { useNavigate, useLocation } from 'react-router-dom'
 
-import { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
-import { ThemeProps } from '@sourcegraph/shared/src/theme'
-import { Badge, Container, Icon } from '@sourcegraph/wildcard'
+import type { TelemetryV2Props } from '@sourcegraph/shared/src/telemetry'
+import type { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import { Badge, Container, Icon, Tab, TabPanel, TabPanels } from '@sourcegraph/wildcard'
 
-import { BatchSpecFields } from '../../../graphql-operations'
-import {
-    BatchChangeTab,
-    BatchChangeTabList,
-    BatchChangeTabPanel,
-    BatchChangeTabPanels,
-    BatchChangeTabs,
-} from '../BatchChangeTabs'
+import { resetFilteredConnectionURLQuery } from '../../../components/FilteredConnection'
+import type { BatchSpecFields } from '../../../graphql-operations'
+import { BatchChangeTabList, BatchChangeTabs } from '../BatchChangeTabs'
 import { BatchSpec, BatchSpecDownloadButton } from '../BatchSpec'
 
-import { PreviewPageAuthenticatedUser } from './BatchChangePreviewPage'
-import {
+import type { PreviewPageAuthenticatedUser } from './BatchChangePreviewPage'
+import type {
     queryChangesetSpecFileDiffs as _queryChangesetSpecFileDiffs,
     queryChangesetApplyPreview as _queryChangesetApplyPreview,
 } from './list/backend'
@@ -26,7 +21,7 @@ import { PreviewList } from './list/PreviewList'
 
 import styles from './BatchChangePreviewTabs.module.scss'
 
-export interface BatchChangePreviewProps extends ThemeProps, TelemetryProps {
+export interface BatchChangePreviewProps extends TelemetryProps, TelemetryV2Props {
     batchSpecID: string
     authenticatedUser: PreviewPageAuthenticatedUser
 
@@ -42,21 +37,44 @@ interface BatchChangePreviewTabsProps extends BatchChangePreviewProps {
     spec: BatchSpecFields
 }
 
+const SPEC_TAB_NAME = 'spec'
+
 export const BatchChangePreviewTabs: React.FunctionComponent<React.PropsWithChildren<BatchChangePreviewTabsProps>> = ({
     authenticatedUser,
     batchSpecID,
     expandChangesetDescriptions,
-    isLightTheme,
     queryChangesetApplyPreview,
     queryChangesetSpecFileDiffs,
     spec,
+    telemetryRecorder,
 }) => {
-    const history = useHistory()
+    // We track the current tab in a URL parameter so that tabs are easy to navigate to
+    // and share.
+    const navigate = useNavigate()
     const location = useLocation()
+    const initialTab = new URLSearchParams(location.search).get('tab')
+
+    const onTabChange = useCallback(
+        (index: number) => {
+            const urlParameters = new URLSearchParams(location.search)
+            resetFilteredConnectionURLQuery(urlParameters)
+
+            // The first tab is the default, so it's not necessary to set it in the URL.
+            if (index === 0) {
+                urlParameters.delete('tab')
+            } else {
+                urlParameters.set('tab', SPEC_TAB_NAME)
+            }
+
+            navigate({ search: urlParameters.toString() })
+        },
+        [navigate, location.search]
+    )
+
     return (
-        <BatchChangeTabs history={history} location={location}>
+        <BatchChangeTabs defaultIndex={initialTab === SPEC_TAB_NAME ? 1 : 0} onChange={onTabChange}>
             <BatchChangeTabList>
-                <BatchChangeTab index={0} name="previewchangesets">
+                <Tab>
                     <span>
                         <Icon aria-hidden={true} className="text-muted mr-1" svgPath={mdiSourceBranch} />
                         <span className="text-content" data-tab-content="Preview changesets">
@@ -66,47 +84,44 @@ export const BatchChangePreviewTabs: React.FunctionComponent<React.PropsWithChil
                             {spec.applyPreview.totalCount}
                         </Badge>
                     </span>
-                </BatchChangeTab>
-                <BatchChangeTab index={1} name="spec">
+                </Tab>
+                <Tab>
                     <span>
                         <Icon aria-hidden={true} className="text-muted mr-1" svgPath={mdiFileDocument} />{' '}
                         <span className="text-content" data-tab-content="Spec">
                             Spec
                         </span>
                     </span>
-                </BatchChangeTab>
+                </Tab>
             </BatchChangeTabList>
-            <BatchChangeTabPanels>
-                <BatchChangeTabPanel index={0}>
+            <TabPanels>
+                <TabPanel>
                     <PreviewList
                         batchSpecID={batchSpecID}
-                        history={history}
-                        location={location}
                         authenticatedUser={authenticatedUser}
-                        isLightTheme={isLightTheme}
                         queryChangesetApplyPreview={queryChangesetApplyPreview}
                         queryChangesetSpecFileDiffs={queryChangesetSpecFileDiffs}
                         expandChangesetDescriptions={expandChangesetDescriptions}
                     />
-                </BatchChangeTabPanel>
-                <BatchChangeTabPanel index={1}>
+                </TabPanel>
+                <TabPanel>
                     <div className="d-flex mb-2 justify-content-end">
                         <BatchSpecDownloadButton
                             name={spec.description.name}
                             originalInput={spec.originalInput}
-                            isLightTheme={isLightTheme}
+                            telemetryRecorder={telemetryRecorder}
                         />
                     </div>
                     <Container>
                         <BatchSpec
                             name={spec.description.name}
                             originalInput={spec.originalInput}
-                            isLightTheme={isLightTheme}
                             className={styles.batchSpec}
+                            telemetryRecorder={telemetryRecorder}
                         />
                     </Container>
-                </BatchChangeTabPanel>
-            </BatchChangeTabPanels>
+                </TabPanel>
+            </TabPanels>
         </BatchChangeTabs>
     )
 }

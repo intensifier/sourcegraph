@@ -1,16 +1,14 @@
-import React from 'react'
+import { type MouseEvent, type ButtonHTMLAttributes, forwardRef } from 'react'
 
 import classNames from 'classnames'
 
-import { useWildcardTheme } from '../../hooks/useWildcardTheme'
-import { ForwardReferenceComponent } from '../../types'
+import { useWildcardTheme } from '../../hooks'
+import type { ForwardReferenceComponent } from '../../types'
 
-import { BUTTON_VARIANTS, BUTTON_SIZES, BUTTON_DISPLAY } from './constants'
-import { getButtonSize, getButtonStyle, getButtonDisplay } from './utils'
+import type { BUTTON_VARIANTS, BUTTON_SIZES, BUTTON_DISPLAY } from './constants'
+import { getButtonClassName } from './utils'
 
-import styles from './Button.module.scss'
-
-export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
     /**
      * The variant style of the button. Defaults to `primary`
      */
@@ -27,10 +25,6 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
      * Modifies the button style to have a transparent/light background and a more pronounced outline.
      */
     outline?: boolean
-    /**
-     * A tooltip to display when the user hovers the button.
-     */
-    ['data-tooltip']?: string
 }
 
 /**
@@ -49,8 +43,8 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
  * Tips:
  * - Avoid using button styling for links where possible. Buttons should typically trigger an action, links should navigate to places.
  */
-// eslint-disable-next-line react/display-name
-export const Button = React.forwardRef(
+
+export const Button = forwardRef(
     (
         {
             children,
@@ -63,25 +57,34 @@ export const Button = React.forwardRef(
             className,
             disabled,
             display,
+            onClick,
             ...attributes
         },
         reference
     ) => {
         const { isBranded } = useWildcardTheme()
 
-        const brandedButtonClassname = classNames(
-            styles.btn,
-            variant && getButtonStyle({ variant, outline }),
-            display && getButtonDisplay({ display }),
-            size && getButtonSize({ size })
-        )
+        const brandedButtonClassname = getButtonClassName({ variant, outline, display, size })
+
+        const handleClick = (event: MouseEvent<HTMLButtonElement>): void => {
+            if (disabled) {
+                // Prevent any native button element behaviour, such as submit
+                // functionality if the button is used within form elements without
+                // type attribute (or with explicitly set "submit" type.
+                event.preventDefault()
+                return
+            }
+
+            onClick?.(event)
+        }
 
         return (
             <Component
                 ref={reference}
-                className={classNames(isBranded && brandedButtonClassname, className)}
                 type={type}
-                disabled={disabled}
+                aria-disabled={disabled}
+                className={classNames(isBranded && brandedButtonClassname, className)}
+                onClick={handleClick}
                 {...attributes}
             >
                 {children}

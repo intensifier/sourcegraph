@@ -1,78 +1,102 @@
 package autoindexing
 
 import (
-	"sync"
-
-	"github.com/opentracing/opentracing-go"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/time/rate"
-
-	"github.com/sourcegraph/log"
-
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/background"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/background/dependencies"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/background/scheduler"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/background/summary"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/inference"
-	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/store"
+	autoindexingstore "github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/internal/store"
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/reposcheduler"
 	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/env"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/goroutine"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
-	"github.com/sourcegraph/sourcegraph/internal/trace"
 )
 
 var (
-	svc     *Service
-	svcOnce sync.Once
+	IndexWorkerStoreOptions                 = background.IndexWorkerStoreOptions
+	DependencySyncingJobWorkerStoreOptions  = background.DependencySyncingJobWorkerStoreOptions
+	DependencyIndexingJobWorkerStoreOptions = background.DependencyIndexingJobWorkerStoreOptions
 )
 
-var (
-	maximumRepositoriesInspectedPerSecond    = toRate(env.MustGetInt("PRECISE_CODE_INTEL_AUTO_INDEX_MAXIMUM_REPOSITORIES_INSPECTED_PER_SECOND", 0, "The maximum number of repositories inspected for auto-indexing per second. Set to zero to disable limit."))
-	maximumRepositoriesUpdatedPerSecond      = toRate(env.MustGetInt("PRECISE_CODE_INTEL_AUTO_INDEX_MAXIMUM_REPOSITORIES_UPDATED_PER_SECOND", 0, "The maximum number of repositories cloned or fetched for auto-indexing per second. Set to zero to disable limit."))
-	maximumIndexJobsPerInferredConfiguration = env.MustGetInt("PRECISE_CODE_INTEL_AUTO_INDEX_MAXIMUM_INDEX_JOBS_PER_INFERRED_CONFIGURATION", 25, "Repositories with a number of inferred auto-index jobs exceeding this threshold will not be auto-indexed.")
-)
-
-// GetService creates or returns an already-initialized autoindexing service. If the service is
-// new, it will use the given database handle.
-func GetService(
+func NewService(
+	observationCtx *observation.Context,
 	db database.DB,
-	dbStore DBStore,
-	gitserverClient GitserverClient,
-	repoUpdater RepoUpdaterClient,
+	depsSvc DependenciesService,
+	policiesSvc PoliciesService,
+	gitserverClient gitserver.Client,
 ) *Service {
-	svcOnce.Do(func() {
-		storeObservationCtx := &observation.Context{
-			Logger:     log.Scoped("autoindexing.store", "autoindexing store"),
-			Tracer:     &trace.Tracer{Tracer: opentracing.GlobalTracer()},
-			Registerer: prometheus.DefaultRegisterer,
-		}
-		store := store.New(db, storeObservationCtx)
+	store := autoindexingstore.New(scopedContext("store", observationCtx), db)
+	inferenceSvc := inference.NewService(db)
 
-		observationCxt := &observation.Context{
-			Logger:     log.Scoped("autoindexing.service", "autoindexing service"),
-			Tracer:     &trace.Tracer{Tracer: opentracing.GlobalTracer()},
-			Registerer: prometheus.DefaultRegisterer,
-		}
-
-		svc = newService(
-			store,
-			dbStore,
-			gitserverClient,
-			repoUpdater,
-			inference.GetService(db),
-			observationCxt,
-		)
-	})
-
-	return svc
+	return newService(
+		scopedContext("service", observationCtx),
+		store,
+		inferenceSvc,
+		db.Repos(),
+		gitserverClient,
+	)
 }
 
-func toRate(value int) rate.Limit {
-	if value == 0 {
-		return rate.Inf
-	}
+var (
+	DependenciesConfigInst = &dependencies.Config{}
+	SchedulerConfigInst    = &scheduler.Config{}
+	SummaryConfigInst      = &summary.Config{}
+)
 
-	return rate.Limit(value)
+func NewIndexSchedulers(
+	observationCtx *observation.Context,
+	policiesSvc PoliciesService,
+	policyMatcher PolicyMatcher,
+	repoSchedulingSvc reposcheduler.RepositorySchedulingService,
+	autoindexingSvc Service,
+	repoStore database.RepoStore,
+) []goroutine.BackgroundRoutine {
+	return background.NewIndexSchedulers(
+		scopedContext("scheduler", observationCtx),
+		policiesSvc,
+		policyMatcher,
+		repoSchedulingSvc,
+		autoindexingSvc.indexEnqueuer,
+		repoStore,
+		autoindexingSvc.store,
+		SchedulerConfigInst,
+	)
 }
 
-// To be removed after https://github.com/sourcegraph/sourcegraph/issues/33377
+func NewDependencyIndexSchedulers(
+	observationCtx *observation.Context,
+	db database.DB,
+	uploadSvc UploadService,
+	depsSvc DependenciesService,
+	autoindexingSvc *Service,
+) []goroutine.BackgroundRoutine {
+	return background.NewDependencyIndexSchedulers(
+		scopedContext("dependencies", observationCtx),
+		db,
+		uploadSvc,
+		depsSvc,
+		autoindexingSvc.store,
+		autoindexingSvc.indexEnqueuer,
+		DependenciesConfigInst,
+	)
+}
 
-type InferenceService = inference.Service
+func NewSummaryBuilder(
+	observationCtx *observation.Context,
+	autoindexingSvc *Service,
+	uploadSvc UploadService,
+) []goroutine.BackgroundRoutine {
+	return background.NewSummaryBuilder(
+		scopedContext("summary", observationCtx),
+		autoindexingSvc.store,
+		autoindexingSvc.jobSelector,
+		uploadSvc,
+		SummaryConfigInst,
+	)
+}
 
-var GetInferenceService = inference.GetService
+func scopedContext(component string, observationCtx *observation.Context) *observation.Context {
+	return observation.ScopedContext("codeintel", "autoindexing", component, observationCtx)
+}

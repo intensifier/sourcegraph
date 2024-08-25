@@ -59,7 +59,7 @@ func TestSearchPatternForSuggestion(t *testing.T) {
 			Alert: &Alert{
 				Title:       "An alert for regex",
 				Description: "An alert for regex",
-				ProposedQueries: []*ProposedQuery{
+				ProposedQueries: []*QueryDescription{
 					{
 						Description: "Some query description",
 						Query:       "repo:github.com/sourcegraph/sourcegraph",
@@ -74,7 +74,7 @@ func TestSearchPatternForSuggestion(t *testing.T) {
 			Alert: &Alert{
 				Title:       "An alert for structural",
 				Description: "An alert for structural",
-				ProposedQueries: []*ProposedQuery{
+				ProposedQueries: []*QueryDescription{
 					{
 						Description: "Some query description",
 						Query:       "repo:github.com/sourcegraph/sourcegraph",
@@ -211,7 +211,7 @@ func TestQuoteSuggestions(t *testing.T) {
 		if err == nil {
 			t.Fatalf("error returned from query.ParseRegexp(%q) is nil", raw)
 		}
-		alert := AlertForQuery(raw, err)
+		alert := AlertForQuery(err)
 		if !strings.Contains(alert.Description, "regexp") {
 			t.Errorf("description is '%s', want it to contain 'regexp'", alert.Description)
 		}

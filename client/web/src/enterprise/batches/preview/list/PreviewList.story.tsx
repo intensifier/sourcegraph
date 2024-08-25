@@ -1,28 +1,36 @@
-import { boolean } from '@storybook/addon-knobs'
-import { DecoratorFn, Story, Meta } from '@storybook/react'
-import { of, Observable } from 'rxjs'
+import type { Decorator, Meta, StoryFn } from '@storybook/react'
+import { type Observable, of } from 'rxjs'
 
 import { WebStory } from '../../../../components/WebStory'
-import { BatchSpecApplyPreviewConnectionFields, ChangesetApplyPreviewFields } from '../../../../graphql-operations'
+import type { BatchSpecApplyPreviewConnectionFields, ChangesetApplyPreviewFields } from '../../../../graphql-operations'
 import { MultiSelectContextProvider } from '../../MultiSelectContext'
 import { filterPublishableIDs } from '../utils'
 
 import { PreviewList } from './PreviewList'
 import { hiddenChangesetApplyPreviewStories, visibleChangesetApplyPreviewNodeStories } from './storyData'
 
-const decorator: DecoratorFn = story => <div className="p-3 container">{story()}</div>
+const decorator: Decorator = story => <div className="p-3 container">{story()}</div>
 
 const config: Meta = {
-    title: 'web/batches/preview',
+    title: 'web/batches/preview/PreviewList',
     decorators: [decorator],
+    argTypes: {
+        publicationStateSet: {
+            name: 'publication state set by spec file',
+            control: { type: 'boolean' },
+        },
+    },
+    args: {
+        publicationStateSet: false,
+    },
 }
 
 export default config
 
 const queryEmptyFileDiffs = () => of({ totalCount: 0, pageInfo: { endCursor: null, hasNextPage: false }, nodes: [] })
 
-export const PreviewListStory: Story = () => {
-    const publicationStateSet = boolean('publication state set by spec file', false)
+export const DefaultStory: StoryFn = args => {
+    const publicationStateSet = args.publicationStateSet
 
     const nodes: ChangesetApplyPreviewFields[] = [
         ...Object.values(visibleChangesetApplyPreviewNodeStories(publicationStateSet)),
@@ -53,7 +61,7 @@ export const PreviewListStory: Story = () => {
                             url: '/users/alice',
                             displayName: 'Alice',
                             username: 'alice',
-                            email: 'alice@email.test',
+                            emails: [{ email: 'alice@email.test', isPrimary: true, verified: true }],
                         }}
                         queryChangesetApplyPreview={queryChangesetApplyPreview}
                         queryChangesetSpecFileDiffs={queryEmptyFileDiffs}
@@ -65,10 +73,4 @@ export const PreviewListStory: Story = () => {
     )
 }
 
-PreviewListStory.parameters = {
-    chromatic: {
-        viewports: [320, 576, 978, 1440],
-    },
-}
-
-PreviewListStory.storyName = 'PreviewList'
+DefaultStory.storyName = 'default'

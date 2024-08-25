@@ -1,8 +1,8 @@
-import React, { HTMLAttributes } from 'react'
+import React, { type HTMLAttributes } from 'react'
 
 import classNames from 'classnames'
 
-import { Tabs, TabsProps } from '@sourcegraph/wildcard'
+import { Tabs, type TabsProps } from '@sourcegraph/wildcard'
 
 import styles from './ConnectionPopover.module.scss'
 
@@ -28,6 +28,8 @@ export const ConnectionPopoverTabs: React.FunctionComponent<React.PropsWithChild
     ...rest
 }) => (
     <div className={classNames(styles.connectionPopover, className)}>
-        <Tabs {...rest}>{children}</Tabs>
+        <Tabs {...rest} className={styles.tabs}>
+            {children}
+        </Tabs>
     </div>
 )

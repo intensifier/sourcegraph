@@ -12,11 +12,12 @@ import (
 	"github.com/sourcegraph/sourcegraph/lib/output"
 )
 
-func AddLog(logger log.Logger, commandName string, factory RunnerFactory, outFactory OutputFactory) *cli.Command {
+func AddLog(commandName string, factory RunnerFactory, outFactory OutputFactory) *cli.Command {
 	schemaNameFlag := &cli.StringFlag{
-		Name:     "db",
-		Usage:    "The target `schema` to modify.",
+		Name:     "schema",
+		Usage:    "The target `schema` to modify. Possible values are 'frontend', 'codeintel' and 'codeinsights'",
 		Required: true,
+		Aliases:  []string{"db"},
 	}
 	versionFlag := &cli.IntFlag{
 		Name:     "version",
@@ -31,12 +32,13 @@ func AddLog(logger log.Logger, commandName string, factory RunnerFactory, outFac
 
 	action := makeAction(outFactory, func(ctx context.Context, cmd *cli.Context, out *output.Output) error {
 		var (
-			schemaName  = schemaNameFlag.Get(cmd)
+			schemaName  = TranslateSchemaNames(schemaNameFlag.Get(cmd), out)
 			versionFlag = versionFlag.Get(cmd)
 			upFlag      = upFlag.Get(cmd)
+			logger      = log.Scoped("up")
 		)
 
-		_, store, err := setupStore(ctx, factory, schemaName)
+		store, err := setupStore(ctx, factory, schemaName)
 		if err != nil {
 			return err
 		}

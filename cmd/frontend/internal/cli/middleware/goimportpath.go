@@ -2,12 +2,12 @@ package middleware
 
 import (
 	"html/template"
-	"log"
+	"log" //nolint:logging // TODO move all logging to sourcegraph/log
 	"net/http"
 	"path"
 	"strings"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
+	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
@@ -36,9 +36,9 @@ var goImportMetaTagTemplate = template.Must(template.New("").Parse(`<html><head>
 //
 // It implements the following mapping:
 //
-// 1. If the username (first path element) is "sourcegraph", consider it to be a vanity
-//    import path pointing to github.com/sourcegraph/<repo> as the clone URL.
-// 2. All other requests are served with 404 Not Found.
+//  1. If the username (first path element) is "sourcegraph", consider it to be a vanity
+//     import path pointing to github.com/sourcegraph/<repo> as the clone URL.
+//  2. All other requests are served with 404 Not Found.
 //
 // 🚨 SECURITY: This handler is served to all clients, even on private servers to clients who have
 // not authenticated. It must not reveal any sensitive information.
@@ -61,7 +61,7 @@ func SourcegraphComGoGetHandler(next http.Handler) http.Handler {
 		// It's a vanity import path that maps to "github.com/{sourcegraph,sqs}/*" clone URLs.
 		pathElements := strings.Split(req.URL.Path[1:], "/")
 		if len(pathElements) >= 2 && (pathElements[0] == "sourcegraph" || pathElements[0] == "sqs") {
-			host := globals.ExternalURL().Host
+			host := conf.ExternalURLParsed().Host
 
 			user := pathElements[0]
 			repo := pathElements[1]

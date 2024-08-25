@@ -3,15 +3,9 @@ import { bufferTime, catchError, concatMap } from 'rxjs/operators'
 
 import { gql } from '@sourcegraph/http-client'
 import { EventSource } from '@sourcegraph/shared/src/graphql-operations'
-import { TelemetryService } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import type { TelemetryService } from '@sourcegraph/shared/src/telemetry/telemetryService'
 
-import {
-    Event,
-    LogEventsResult,
-    LogEventsVariables,
-    LogLegacySearchUserEventResult,
-    LogLegacySearchUserEventVariables,
-} from '../graphql-operations'
+import type { Event, LogEventsResult, LogEventsVariables } from '../graphql-operations'
 import { requestGraphQL } from '../search/lib/requestGraphQl'
 
 // Log events in batches.
@@ -22,22 +16,6 @@ events
         bufferTime(1000),
         concatMap(events => {
             if (events.length > 0) {
-                // For every IDESearchSubmitted, we also fire a legacy logUserEvent event. This is
-                // necessary since we only look at the latter to calculate some activity usage
-                // numbers.
-                //
-                // See sourcegraph/sourcegraph#35178
-                events
-                    .filter(event => event.event === 'IDESearchSubmitted')
-                    .map(event =>
-                        requestGraphQL<LogLegacySearchUserEventResult, LogLegacySearchUserEventVariables>(
-                            logLegacySearchUserEventMutation,
-                            {
-                                userCookieID: event.deviceID ?? '',
-                            }
-                        )
-                    )
-
                 return requestGraphQL<LogEventsResult, LogEventsVariables>(logEventsMutation, {
                     events,
                 })
@@ -60,29 +38,27 @@ const logEventsMutation = gql`
     }
 `
 
-const logLegacySearchUserEventMutation = gql`
-    mutation LogLegacySearchUserEvent($userCookieID: String!) {
-        logUserEvent(event: SEARCHQUERY, userCookieID: $userCookieID) {
-            alwaysNil
-        }
-    }
-`
-
 function logEvent(eventVariable: Event): void {
     events.next(eventVariable)
 }
 
 let eventId = 1
 
+const EXTENSION_DETAILS = { ide: 'JetBrains', ideExtensionType: 'Sourcegraph' }
 // Event Logger for the JetBrains Extension
 export class EventLogger implements TelemetryService {
     private readonly anonymousUserId: string
     private listeners: Set<(eventName: string) => void> = new Set()
+    // this is redudant with the extensionDetails object, but we need to keep it for backwards compatibility
     private readonly editorInfo: { editor: string; version: string }
+    private extensionDetails: { ide: string; ideExtensionType: string }
 
     constructor(anonymousUserId: string, editorInfo: { editor: string; version: string }) {
         this.anonymousUserId = anonymousUserId
         this.editorInfo = editorInfo
+        this.extensionDetails = {
+            ...EXTENSION_DETAILS,
+        }
     }
 
     /**
@@ -118,8 +94,8 @@ export class EventLogger implements TelemetryService {
     ): void {
         this.tracker(
             eventName,
-            { ...eventProperties, ...this.editorInfo },
-            { ...publicArgument, ...this.editorInfo },
+            { ...eventProperties, ...this.editorInfo, extensionDetails: this.extensionDetails },
+            { ...publicArgument, ...this.editorInfo, extensionDetails: this.extensionDetails },
             uri
         )
     }

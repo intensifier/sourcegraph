@@ -16,7 +16,7 @@ func TestSettings_ListAll(t *testing.T) {
 	}
 	t.Parallel()
 	logger := logtest.Scoped(t)
-	db := NewDB(logger, dbtest.NewDB(logger, t))
+	db := NewDB(logger, dbtest.NewDB(t))
 	ctx := context.Background()
 
 	user1, err := db.Users().Create(ctx, NewUser{Username: "u1"})
@@ -63,7 +63,7 @@ func TestSettings_ListAll(t *testing.T) {
 func TestCreateIfUpToDate(t *testing.T) {
 	t.Parallel()
 	logger := logtest.Scoped(t)
-	db := NewDB(logger, dbtest.NewDB(logger, t))
+	db := NewDB(logger, dbtest.NewDB(t))
 	ctx := context.Background()
 	u, err := db.Users().Create(ctx, NewUser{Username: "test"})
 	if err != nil {
@@ -95,11 +95,37 @@ func TestCreateIfUpToDate(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("valid settings", func(t *testing.T) {
+		contents := `{"experimentalFeatures": {}}`
+		_, err := db.Settings().CreateIfUpToDate(ctx, api.SettingsSubject{User: &u.ID}, nil, nil, contents)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("invalid settings per JSON Schema", func(t *testing.T) {
+		contents := `{"experimentalFeatures": 1}`
+		wantErr := "invalid settings: experimentalFeatures: Invalid type. Expected: object, given: integer"
+		_, err := db.Settings().CreateIfUpToDate(ctx, api.SettingsSubject{User: &u.ID}, nil, nil, contents)
+		if err == nil || err.Error() != wantErr {
+			t.Errorf("got err %q, want %q", err, wantErr)
+		}
+	})
+
+	t.Run("syntactically invalid settings", func(t *testing.T) {
+		contents := `{`
+		wantErr := "invalid settings: failed to parse JSON: [CloseBraceExpected]"
+		_, err := db.Settings().CreateIfUpToDate(ctx, api.SettingsSubject{User: &u.ID}, nil, nil, contents)
+		if err == nil || err.Error() != wantErr {
+			t.Errorf("got err %q, want %q", err, wantErr)
+		}
+	})
 }
 
 func TestGetLatestSchemaSettings(t *testing.T) {
 	logger := logtest.Scoped(t)
-	db := NewDB(logger, dbtest.NewDB(logger, t))
+	db := NewDB(logger, dbtest.NewDB(t))
 	ctx := context.Background()
 
 	user1, err := db.Users().Create(ctx, NewUser{Username: "u1"})
@@ -107,16 +133,16 @@ func TestGetLatestSchemaSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := db.Settings().CreateIfUpToDate(ctx, api.SettingsSubject{User: &user1.ID}, nil, &user1.ID, `{"search.uppercase": true }`); err != nil {
+	if _, err := db.Settings().CreateIfUpToDate(ctx, api.SettingsSubject{User: &user1.ID}, nil, &user1.ID, `{"search.defaultMode": "smart" }`); err != nil {
 		t.Error(err)
 	}
 
-	settings, err := db.Settings().GetLastestSchemaSettings(ctx, api.SettingsSubject{User: &user1.ID})
+	settings, err := db.Settings().GetLatestSchemaSettings(ctx, api.SettingsSubject{User: &user1.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if settings.SearchUppercase == nil || !(*settings.SearchUppercase) {
+	if settings.SearchDefaultMode != "smart" {
 		t.Errorf("Got invalid settings: %+v", settings)
 	}
 }

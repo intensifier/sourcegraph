@@ -8,10 +8,14 @@ import (
 
 // Check can be defined for Runner to execute as part of a Category.
 type Check[Args any] struct {
-	// Name is used to identify this Check.
+	// Name is used to identify this Check. It must be unique across categories when used
+	// with Runner, otherwise duplicate Checks are set to be skipped.
 	Name string
 	// Description can be used to provide additional context and manual fix instructions.
 	Description string
+	// LegacyAnnotations disables the automatic creation of annotations in the case of legacy
+	// scripts that are handling them on their own.
+	LegacyAnnotations bool
 
 	// Enabled can be implemented to indicate when this check should be skipped.
 	Enabled EnableFunc[Args]

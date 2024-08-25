@@ -1,5 +1,4 @@
-import { boolean } from '@storybook/addon-knobs'
-import { Story, Meta, DecoratorFn } from '@storybook/react'
+import type { StoryFn, Meta, Decorator } from '@storybook/react'
 import classNames from 'classnames'
 import { addHours } from 'date-fns'
 import { of } from 'rxjs'
@@ -16,18 +15,34 @@ import { ExternalChangesetNode } from './ExternalChangesetNode'
 
 import gridStyles from './BatchChangeChangesets.module.scss'
 
-const decorator: DecoratorFn = story => (
+const decorator: Decorator = story => (
     <div className={classNames(gridStyles.batchChangeChangesetsGrid, 'p-3 container')}>{story()}</div>
 )
 
 const config: Meta = {
     title: 'web/batches/ExternalChangesetNode',
     decorators: [decorator],
+    argTypes: {
+        viewerCanAdminister: {
+            control: { type: 'boolean' },
+        },
+        labeled: {
+            control: { type: 'boolean' },
+        },
+        commitsSigned: {
+            control: { type: 'boolean' },
+        },
+    },
+    args: {
+        viewerCanAdminister: true,
+        labeled: true,
+        commitsSigned: true,
+    },
 }
 
 export default config
 
-export const AllStates: Story = () => {
+export const AllStates: StoryFn = args => {
     const now = new Date()
     return (
         <WebStory>
@@ -51,6 +66,7 @@ export const AllStates: Story = () => {
                                     body: 'This changeset does the following things:\nIs awesome\nIs useful',
                                     checkState: ChangesetCheckState.PENDING,
                                     createdAt: now.toISOString(),
+                                    commitVerification: args.commitsSigned ? { verified: true } : null,
                                     externalID: '123',
                                     externalURL: {
                                         url: 'http://test.test/pr/123',
@@ -58,18 +74,19 @@ export const AllStates: Story = () => {
                                     forkNamespace: index % 2 === 0 ? 'user' : null,
                                     diffStat: {
                                         __typename: 'DiffStat',
-                                        added: 10,
-                                        changed: 20,
-                                        deleted: 8,
+                                        added: 30,
+                                        deleted: 28,
                                     },
-                                    labels: [
-                                        {
-                                            __typename: 'ChangesetLabel',
-                                            color: '93ba13',
-                                            description: 'Very awesome description',
-                                            text: 'Some label',
-                                        },
-                                    ],
+                                    labels: args.labeled
+                                        ? [
+                                              {
+                                                  __typename: 'ChangesetLabel',
+                                                  color: '93ba13',
+                                                  description: 'Very awesome description',
+                                                  text: 'Some label',
+                                              },
+                                          ]
+                                        : [],
                                     repository: {
                                         id: 'repoid',
                                         name: 'github.com/sourcegraph/sourcegraph',
@@ -93,7 +110,7 @@ export const AllStates: Story = () => {
                                                 : { pushUser: false, namespace: null },
                                     },
                                 }}
-                                viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                                viewerCanAdminister={args.viewerCanAdminister}
                                 queryExternalChangesetWithFileDiffs={() =>
                                     of({
                                         diff: {
@@ -119,7 +136,7 @@ export const AllStates: Story = () => {
 
 AllStates.storyName = 'All states'
 
-export const Unpublished: Story = () => {
+export const Unpublished: StoryFn = args => {
     const now = new Date()
     return (
         <WebStory>
@@ -138,14 +155,14 @@ export const Unpublished: Story = () => {
                         body: 'This changeset does the following things:\nIs awesome\nIs useful',
                         checkState: null,
                         createdAt: now.toISOString(),
+                        commitVerification: null,
                         externalID: null,
                         externalURL: null,
                         forkNamespace: null,
                         diffStat: {
                             __typename: 'DiffStat',
-                            added: 10,
-                            changed: 20,
-                            deleted: 8,
+                            added: 30,
+                            deleted: 28,
                         },
                         labels: [
                             {
@@ -172,7 +189,7 @@ export const Unpublished: Story = () => {
                             forkTarget: null,
                         },
                     }}
-                    viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                    viewerCanAdminister={args.viewerCanAdminister}
                     queryExternalChangesetWithFileDiffs={() =>
                         of({
                             diff: {
@@ -194,7 +211,7 @@ export const Unpublished: Story = () => {
     )
 }
 
-export const Importing: Story = () => {
+export const Importing: StoryFn = args => {
     const now = new Date()
     return (
         <WebStory>
@@ -214,6 +231,7 @@ export const Importing: Story = () => {
                         body: null,
                         checkState: null,
                         createdAt: now.toISOString(),
+                        commitVerification: null,
                         externalID: '12345',
                         externalURL: null,
                         forkNamespace: null,
@@ -234,7 +252,7 @@ export const Importing: Story = () => {
                         reviewState: null,
                         currentSpec: null,
                     }}
-                    viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                    viewerCanAdminister={args.viewerCanAdminister}
                     queryExternalChangesetWithFileDiffs={() =>
                         of({
                             diff: {
@@ -256,7 +274,7 @@ export const Importing: Story = () => {
     )
 }
 
-export const ImportingFailed: Story = () => {
+export const ImportingFailed: StoryFn = args => {
     const now = new Date()
     return (
         <WebStory>
@@ -276,6 +294,7 @@ export const ImportingFailed: Story = () => {
                         body: null,
                         checkState: null,
                         createdAt: now.toISOString(),
+                        commitVerification: null,
                         externalID: '99999',
                         externalURL: null,
                         forkNamespace: null,
@@ -296,7 +315,7 @@ export const ImportingFailed: Story = () => {
                         reviewState: null,
                         currentSpec: null,
                     }}
-                    viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                    viewerCanAdminister={args.viewerCanAdminister}
                     queryExternalChangesetWithFileDiffs={() =>
                         of({
                             diff: null,
@@ -310,7 +329,7 @@ export const ImportingFailed: Story = () => {
 
 ImportingFailed.storyName = 'Importing failed'
 
-export const SyncFailed: Story = () => {
+export const SyncFailed: StoryFn = args => {
     const now = new Date()
     return (
         <WebStory>
@@ -330,6 +349,7 @@ export const SyncFailed: Story = () => {
                         body: null,
                         checkState: null,
                         createdAt: now.toISOString(),
+                        commitVerification: null,
                         externalID: '99999',
                         externalURL: null,
                         forkNamespace: null,
@@ -350,7 +370,7 @@ export const SyncFailed: Story = () => {
                         reviewState: null,
                         currentSpec: null,
                     }}
-                    viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                    viewerCanAdminister={args.viewerCanAdminister}
                     queryExternalChangesetWithFileDiffs={() =>
                         of({
                             diff: null,

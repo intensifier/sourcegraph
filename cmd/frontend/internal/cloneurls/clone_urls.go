@@ -5,26 +5,27 @@ import (
 	neturl "net/url"
 	"strings"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf/reposource"
 	"github.com/sourcegraph/sourcegraph/internal/database"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc"
-	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
+	"github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 	"github.com/sourcegraph/sourcegraph/schema"
 )
 
-// ReposourceCloneURLToRepoName maps a Git clone URL (format documented here:
+// RepoSourceCloneURLToRepoName maps a Git clone URL (format documented here:
 // https://git-scm.com/docs/git-clone#_git_urls_a_id_urls_a) to the corresponding repo name if there
 // exists a code host configuration that matches the clone URL. Implicitly, it includes a code host
 // configuration for github.com, even if one is not explicitly specified. Returns the empty string and nil
 // error if a matching code host could not be found. This function does not actually check the code
 // host to see if the repository actually exists.
-func ReposourceCloneURLToRepoName(ctx context.Context, db database.DB, cloneURL string) (repoName api.RepoName, err error) {
-	span, ctx := ot.StartSpanFromContext(ctx, "ReposourceCloneURLToRepoName")
-	defer span.Finish()
+func RepoSourceCloneURLToRepoName(ctx context.Context, db database.DB, cloneURL string) (repoName api.RepoName, err error) {
+	tr, ctx := trace.New(ctx, "RepoSourceCloneURLToRepoName", attribute.String("cloneURL", cloneURL))
+	defer tr.EndWithErr(&err)
 
 	if repoName := reposource.CustomCloneURLToRepoName(cloneURL); repoName != "" {
 		return repoName, nil
@@ -44,6 +45,7 @@ func ReposourceCloneURLToRepoName(ctx context.Context, db database.DB, cloneURL 
 			extsvc.KindGitHub,
 			extsvc.KindGitLab,
 			extsvc.KindBitbucketServer,
+			extsvc.KindBitbucketCloud,
 			extsvc.KindAWSCodeCommit,
 			extsvc.KindGitolite,
 			extsvc.KindPhabricator,
@@ -52,13 +54,6 @@ func ReposourceCloneURLToRepoName(ctx context.Context, db database.DB, cloneURL 
 		LimitOffset: &database.LimitOffset{
 			Limit: 50, // The number is randomly chosen
 		},
-	}
-
-	if envvar.SourcegraphDotComMode() {
-		// We want to check these first as they'll be able to decode the majority of
-		// repos. If our cloud_default services are unable to decode the clone url then
-		// we fall back to going through all services until we find a match.
-		opt.OnlyCloudDefault = true
 	}
 
 	for {
@@ -81,12 +76,6 @@ func ReposourceCloneURLToRepoName(ctx context.Context, db database.DB, cloneURL 
 			}
 		}
 
-		if opt.OnlyCloudDefault {
-			// Try again without narrowing down to cloud_default external services
-			opt.OnlyCloudDefault = false
-			continue
-		}
-
 		if len(svcs) < opt.Limit {
 			break // Less results than limit means we've reached end
 		}
@@ -101,13 +90,13 @@ func ReposourceCloneURLToRepoName(ctx context.Context, db database.DB, cloneURL 
 	return rs.CloneURLToRepoName(cloneURL)
 }
 
-func getRepoNameFromService(ctx context.Context, cloneURL string, svc *types.ExternalService) (api.RepoName, error) {
-	span, _ := ot.StartSpanFromContext(ctx, "getRepoNameFromService")
-	defer span.Finish()
-	span.SetTag("ExternalService.ID", svc.ID)
-	span.SetTag("ExternalService.Kind", svc.Kind)
+func getRepoNameFromService(ctx context.Context, cloneURL string, svc *types.ExternalService) (_ api.RepoName, err error) {
+	tr, ctx := trace.New(ctx, "getRepoNameFromService",
+		attribute.Int64("externalService.ID", svc.ID),
+		attribute.String("externalService.Kind", svc.Kind))
+	defer tr.EndWithErr(&err)
 
-	cfg, err := extsvc.ParseConfig(svc.Kind, svc.Config)
+	cfg, err := extsvc.ParseEncryptableConfig(ctx, svc.Kind, svc.Config)
 	if err != nil {
 		return "", errors.Wrap(err, "parse config")
 	}
@@ -123,6 +112,12 @@ func getRepoNameFromService(ctx context.Context, cloneURL string, svc *types.Ext
 		host = c.Url
 	case *schema.BitbucketServerConnection:
 		rs = reposource.BitbucketServer{BitbucketServerConnection: c}
+		host = c.Url
+	case *schema.BitbucketCloudConnection:
+		rs = reposource.BitbucketCloud{BitbucketCloudConnection: c}
+		host = c.Url
+	case *schema.GerritConnection:
+		rs = reposource.Gerrit{GerritConnection: c}
 		host = c.Url
 	case *schema.AWSCodeCommitConnection:
 		rs = reposource.AWS{AWSCodeCommitConnection: c}

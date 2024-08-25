@@ -1,78 +1,106 @@
-import { Meta, Story, DecoratorFn } from '@storybook/react'
+import type { Decorator, Meta, StoryFn } from '@storybook/react'
+import { MATCH_ANY_PARAMETERS, WildcardMockLink } from 'wildcard-mock-link'
 
-import {
-    EMPTY_SETTINGS_CASCADE,
-    SettingsOrgSubject,
-    SettingsUserSubject,
-} from '@sourcegraph/shared/src/settings/settings'
+import { getDocumentNode } from '@sourcegraph/http-client'
+import { MockedTestProvider } from '@sourcegraph/shared/src/testing/apollo'
 
 import { WebStory } from '../../../components/WebStory'
+import { GET_LICENSE_AND_USAGE_INFO } from '../list/backend'
+import { getLicenseAndUsageInfoResult } from '../list/testData'
 
 import { ConfigurationForm } from './ConfigurationForm'
 
-const decorator: DecoratorFn = story => <div className="p-3 container">{story()}</div>
+const decorator: Decorator = story => <div className="p-3 container">{story()}</div>
 
 const config: Meta = {
     title: 'web/batches/create/ConfigurationForm',
     decorators: [decorator],
-    parameters: {
-        chromatic: {
-            disableSnapshot: false,
-        },
-    },
+    parameters: {},
 }
 
 export default config
 
-const FIXTURE_ORG: SettingsOrgSubject = {
-    __typename: 'Org',
-    name: 'sourcegraph',
-    displayName: 'Sourcegraph',
-    id: 'a',
-    viewerCanAdminister: true,
-}
+const buildMocks = (isLicensed = true, hasBatchChanges = true) =>
+    new WildcardMockLink([
+        {
+            request: { query: getDocumentNode(GET_LICENSE_AND_USAGE_INFO), variables: MATCH_ANY_PARAMETERS },
+            result: { data: getLicenseAndUsageInfoResult(isLicensed, hasBatchChanges) },
+            nMatches: Number.POSITIVE_INFINITY,
+        },
+    ])
 
-const FIXTURE_USER: SettingsUserSubject = {
-    __typename: 'User',
-    username: 'alice',
-    displayName: 'alice',
-    id: 'b',
-    viewerCanAdminister: true,
-}
-
-const SETTINGS_CASCADE = {
-    ...EMPTY_SETTINGS_CASCADE,
-    subjects: [
-        { subject: FIXTURE_ORG, settings: { a: 1 }, lastID: 1 },
-        { subject: FIXTURE_USER, settings: { b: 2 }, lastID: 2 },
-    ],
-}
-
-export const NewBatchChange: Story = () => (
-    <WebStory>{props => <ConfigurationForm {...props} settingsCascade={SETTINGS_CASCADE} />}</WebStory>
+export const NewBatchChange: StoryFn = () => (
+    <WebStory>
+        {props => (
+            <MockedTestProvider link={buildMocks()}>
+                <ConfigurationForm />
+            </MockedTestProvider>
+        )}
+    </WebStory>
 )
 
 NewBatchChange.storyName = 'New batch change'
 
-export const ExistingBatchChange: Story = () => (
+export const NewOrgBatchChange: StoryFn = () => (
     <WebStory>
         {props => (
-            <ConfigurationForm
-                {...props}
-                settingsCascade={SETTINGS_CASCADE}
-                isReadOnly={true}
-                batchChange={{
-                    name: 'My existing batch change',
-                    namespace: {
-                        __typename: 'Org',
-                        namespaceName: 'Sourcegraph',
-                        url: '/orgs/sourcegraph',
-                        id: 'test1234',
-                    },
-                }}
-            />
+            <MockedTestProvider link={buildMocks()}>
+                <ConfigurationForm {...props} initialNamespaceID="acme-corp-id" />
+            </MockedTestProvider>
+        )}
+    </WebStory>
+)
+
+NewOrgBatchChange.storyName = 'New batch change with new Org'
+
+export const ExistingBatchChange: StoryFn = () => (
+    <WebStory>
+        {props => (
+            <MockedTestProvider link={buildMocks()}>
+                <ConfigurationForm
+                    {...props}
+                    isReadOnly={true}
+                    batchChange={{
+                        name: 'My existing batch change',
+                        namespace: {
+                            __typename: 'Org',
+                            namespaceName: 'Sourcegraph',
+                            displayName: null,
+                            name: 'sourcegraph',
+                            url: '/orgs/sourcegraph',
+                            id: 'test1234',
+                        },
+                    }}
+                />
+            </MockedTestProvider>
         )}
     </WebStory>
 )
 
 ExistingBatchChange.storyName = 'Read-only for existing batch change'
+
+export const LicenseAlert: StoryFn = () => (
+    <WebStory>
+        {props => (
+            <MockedTestProvider link={buildMocks(false)}>
+                <ConfigurationForm
+                    {...props}
+                    isReadOnly={true}
+                    batchChange={{
+                        name: 'My existing batch change',
+                        namespace: {
+                            __typename: 'Org',
+                            namespaceName: 'Sourcegraph',
+                            displayName: null,
+                            name: 'sourcegraph',
+                            url: '/orgs/sourcegraph',
+                            id: 'test1234',
+                        },
+                    }}
+                />
+            </MockedTestProvider>
+        )}
+    </WebStory>
+)
+
+LicenseAlert.storyName = 'License alert'

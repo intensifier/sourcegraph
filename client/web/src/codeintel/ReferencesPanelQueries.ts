@@ -20,7 +20,7 @@ const codeIntelFragments = gql`
         }
     }
 
-    fragment GitBlobFields on GitBlob {
+    fragment GitBlobFields on CodeIntelGitBlob {
         path
         content
         repository {
@@ -65,6 +65,15 @@ export const USE_PRECISE_CODE_INTEL_FOR_POSITION_QUERY = gql`
         ) {
             ...LocationConnectionFields
         }
+        prototypes(
+            line: $line
+            character: $character
+            first: $firstPrototypes
+            after: $afterPrototypes
+            filter: $filter
+        ) {
+            ...LocationConnectionFields
+        }
         definitions(line: $line, character: $character, filter: $filter) {
             ...LocationConnectionFields
         }
@@ -80,6 +89,8 @@ export const USE_PRECISE_CODE_INTEL_FOR_POSITION_QUERY = gql`
         $firstReferences: Int
         $afterImplementations: String
         $firstImplementations: Int
+        $afterPrototypes: String
+        $firstPrototypes: Int
         $filter: String
     ) {
         repository(name: $repository) {
@@ -166,21 +177,63 @@ export const LOAD_ADDITIONAL_IMPLEMENTATIONS_QUERY = gql`
     }
 `
 
+export const LOAD_ADDITIONAL_PROTOTYPES_QUERY = gql`
+    ${codeIntelFragments}
+
+    query LoadAdditionalPrototypes(
+        $repository: String!
+        $commit: String!
+        $path: String!
+        $line: Int!
+        $character: Int!
+        $afterPrototypes: String
+        $firstPrototypes: Int
+        $filter: String
+    ) {
+        repository(name: $repository) {
+            id
+            commit(rev: $commit) {
+                id
+                blob(path: $path) {
+                    lsif {
+                        prototypes(
+                            line: $line
+                            character: $character
+                            first: $firstPrototypes
+                            after: $afterPrototypes
+                            filter: $filter
+                        ) {
+                            ...LocationConnectionFields
+                        }
+                    }
+                }
+            }
+        }
+    }
+`
+
 export const FETCH_HIGHLIGHTED_BLOB = gql`
     fragment HighlightedGitBlobFields on GitBlob {
-        highlight(disableTimeout: false) {
+        highlight(disableTimeout: false, format: $format) {
             aborted
-            html
+            lsif
         }
     }
 
-    query ReferencesPanelHighlightedBlob($repository: String!, $commit: String!, $path: String!) {
+    query ReferencesPanelHighlightedBlob(
+        $repository: String!
+        $commit: String!
+        $path: String!
+        $format: HighlightResponseFormat!
+    ) {
         repository(name: $repository) {
             id
             commit(rev: $commit) {
                 id
                 blob(path: $path) {
                     ...HighlightedGitBlobFields
+                    content
+                    languages
                 }
             }
         }
@@ -188,8 +241,8 @@ export const FETCH_HIGHLIGHTED_BLOB = gql`
 `
 
 export const CODE_INTEL_SEARCH_QUERY = gql`
-    query CodeIntelSearch($query: String!) {
-        search(query: $query) {
+    query CodeIntelSearch2($query: String!, $version: SearchVersion!) {
+        search(query: $query, version: $version) {
             __typename
             results {
                 __typename
@@ -205,6 +258,7 @@ export const CODE_INTEL_SEARCH_QUERY = gql`
                             content
                         }
                         repository {
+                            id
                             name
                         }
                         symbols {
@@ -242,8 +296,11 @@ export const CODE_INTEL_SEARCH_QUERY = gql`
 export const LOCAL_CODE_INTEL_QUERY = gql`
     query LocalCodeIntel($repository: String!, $commit: String!, $path: String!) {
         repository(name: $repository) {
+            id
             commit(rev: $commit) {
+                id
                 blob(path: $path) {
+                    canonicalURL
                     localCodeIntel
                 }
             }

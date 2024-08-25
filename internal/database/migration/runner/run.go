@@ -22,6 +22,10 @@ func (r *Runner) Run(ctx context.Context, options Options) error {
 		return errors.Newf("invalid privileged mode")
 	}
 
+	if options.PrivilegedMode == NoopPrivilegedMigrations && options.MatchPrivilegedHash == nil {
+		return errors.Newf("privileged hash matcher was not supplied")
+	}
+
 	schemaNames := make([]string, 0, len(options.Operations))
 	for _, operation := range options.Operations {
 		schemaNames = append(schemaNames, operation.SchemaName)
@@ -54,8 +58,9 @@ func (r *Runner) Run(ctx context.Context, options Options) error {
 			operationMap[schemaName],
 			schemaContext,
 			options.PrivilegedMode,
-			options.PrivilegedHash,
+			options.MatchPrivilegedHash,
 			options.IgnoreSingleDirtyLog,
+			options.IgnoreSinglePendingLog,
 		); err != nil {
 			return errors.Wrapf(err, "failed to run migration for schema %q", schemaName)
 		}
@@ -73,8 +78,9 @@ func (r *Runner) runSchema(
 	operation MigrationOperation,
 	schemaContext schemaContext,
 	privilegedMode PrivilegedMode,
-	privilegedHash string,
+	matchPrivilegedHash func(hash string) bool,
 	ignoreSingleDirtyLog bool,
+	ignoreSinglePendingLog bool,
 ) error {
 	// First, rewrite operations into a smaller set of operations we'll handle below. This call converts
 	// upgrade and revert operations into targeted up and down operations.
@@ -122,14 +128,12 @@ func (r *Runner) runSchema(
 		}
 	}
 
-	logger.Warn("Schema not in expected state",
+	logger.Info("Schema is not in the expected state - applying migration delta",
 		log.Ints("targetDefinitions", extractIDs(definitions)),
 		log.Ints("appliedVersions", extractIDs(byState.applied)),
 		log.Ints("pendingVersions", extractIDs(byState.pending)),
 		log.Ints("failedVersions", extractIDs(byState.failed)),
 	)
-
-	logger.Info("Checking for active migrations")
 
 	for {
 		// Attempt to apply as many migrations as possible. We do this iteratively in chunks as we are unable
@@ -143,8 +147,9 @@ func (r *Runner) runSchema(
 			schemaContext,
 			definitions,
 			privilegedMode,
-			privilegedHash,
+			matchPrivilegedHash,
 			ignoreSingleDirtyLog,
+			ignoreSinglePendingLog,
 		); err != nil {
 			return err
 		} else if !retry {
@@ -166,8 +171,9 @@ func (r *Runner) applyMigrations(
 	schemaContext schemaContext,
 	definitions []definition.Definition,
 	privilegedMode PrivilegedMode,
-	privilegedHash string,
+	matchPrivilegedHash func(hash string) bool,
 	ignoreSingleDirtyLog bool,
+	ignoreSinglePendingLog bool,
 ) (retry bool, _ error) {
 	var droppedLock bool
 	up := operation.Type == MigrationOperationTypeTargetedUp
@@ -191,14 +197,14 @@ func (r *Runner) applyMigrations(
 		// flags specified by the user. A nil error value returned here indicates that application of
 		// each migration file can proceed.
 
-		if err := r.checkPrivilegedState(operation, schemaContext, definitions, privilegedMode, privilegedHash); err != nil {
+		if err := r.checkPrivilegedState(operation, schemaContext, definitions, privilegedMode, matchPrivilegedHash); err != nil {
 			return err
 		}
 
-		for _, definition := range definitions {
-			if up && definition.IsCreateIndexConcurrently {
+		for _, def := range definitions {
+			if up && def.IsCreateIndexConcurrently {
 				// Handle execution of `CREATE INDEX CONCURRENTLY` specially
-				if unlocked, err := r.createIndexConcurrently(ctx, schemaContext, definition, earlyUnlock); err != nil {
+				if unlocked, err := r.createIndexConcurrently(ctx, schemaContext, def, earlyUnlock); err != nil {
 					return err
 				} else if unlocked {
 					// We've forfeited our lock, but want to continue applying the remaining migrations (if any).
@@ -208,7 +214,7 @@ func (r *Runner) applyMigrations(
 				}
 			} else {
 				// Apply all other types of migrations uniformly
-				if err := r.applyMigration(ctx, schemaContext, operation, definition, privilegedMode); err != nil {
+				if err := r.applyMigration(ctx, schemaContext, operation, def, privilegedMode); err != nil {
 					return err
 				}
 			}
@@ -218,7 +224,14 @@ func (r *Runner) applyMigrations(
 		return nil
 	}
 
-	if retry, err := r.withLockedSchemaState(ctx, schemaContext, definitions, ignoreSingleDirtyLog, callback); err != nil {
+	if retry, err := r.withLockedSchemaState(
+		ctx,
+		schemaContext,
+		definitions,
+		ignoreSingleDirtyLog,
+		ignoreSinglePendingLog,
+		callback,
+	); err != nil {
 		return false, err
 	} else if retry {
 		// There are active index creation operations ongoing; wait a short time before requerying
@@ -238,7 +251,7 @@ func (r *Runner) checkPrivilegedState(
 	schemaContext schemaContext,
 	definitions []definition.Definition,
 	privilegedMode PrivilegedMode,
-	expectedPrivilegedHash string,
+	matchPrivilegedHash func(hash string) bool,
 ) error {
 	up := operation.Type == MigrationOperationTypeTargetedUp
 
@@ -253,9 +266,9 @@ func (r *Runner) checkPrivilegedState(
 
 	// Gather only the privileged definitions
 	privilegedDefinitions := make([]definition.Definition, 0, len(definitions))
-	for _, definition := range definitions {
-		if definition.Privileged {
-			privilegedDefinitions = append(privilegedDefinitions, definition)
+	for _, def := range definitions {
+		if def.Privileged {
+			privilegedDefinitions = append(privilegedDefinitions, def)
 		}
 	}
 	if len(privilegedDefinitions) == 0 {
@@ -265,8 +278,8 @@ func (r *Runner) checkPrivilegedState(
 
 	// Extract IDs from privileged definitions
 	privilegedDefinitionIDs := make([]int, 0, len(privilegedDefinitions))
-	for _, definition := range privilegedDefinitions {
-		privilegedDefinitionIDs = append(privilegedDefinitionIDs, definition.ID)
+	for _, def := range privilegedDefinitions {
+		privilegedDefinitionIDs = append(privilegedDefinitionIDs, def.ID)
 	}
 
 	if privilegedMode == RefusePrivilegedMigrations {
@@ -280,19 +293,10 @@ func (r *Runner) checkPrivilegedState(
 		// The user has enabled a mode where we assume the contents of the privileged migrations
 		// have already been applied, or in the down direction will be applied after this operation.
 
-		if privilegedHash := hashDefinitionIDs(privilegedDefinitionIDs); privilegedHash != expectedPrivilegedHash && up {
+		if privilegedHash := hashDefinitionIDs(privilegedDefinitionIDs); !matchPrivilegedHash(privilegedHash) && up {
 			// In order to ensure the user reads the following instructions for this operation, we
 			// fail-fast equivalently to the -unprivileged-only case when a hash of the privileged
 			// migrations to-be-applied is not also supplied.
-
-			if expectedPrivilegedHash != "" {
-				r.logger.Error(
-					"Unexpected value provided for -privileged-hash for this operation. This value is likely left over from an invocation of privileged migrations during a previous upgrade.",
-					log.String("schema", schemaContext.schema.Name),
-					log.String("given", expectedPrivilegedHash),
-					log.String("expected", privilegedHash),
-				)
-			}
 
 			return errors.Newf(
 				"refusing to apply a privileged migration: apply the following SQL and re-run with the added flag `-privileged-hash=%s` to continue.\n\n```\n%s\n```\n",
@@ -332,8 +336,11 @@ func (r *Runner) applyMigration(
 		}
 
 		if privilegedMode == NoopPrivilegedMigrations {
-			if err := schemaContext.store.WithMigrationLog(ctx, definition, up, func() error { return nil }); err != nil {
-				return errors.Wrapf(err, "failed to apply migration %d", definition.ID)
+			noop := func() error {
+				return nil
+			}
+			if err := schemaContext.store.WithMigrationLog(ctx, definition, up, noop); err != nil {
+				return errors.Wrapf(err, "failed to create migration log %d", definition.ID)
 			}
 
 			r.logger.Warn(
@@ -365,18 +372,19 @@ func (r *Runner) applyMigration(
 			defer func() { err = tx.Done(err) }()
 		}
 
-		direction := tx.Up
-		if !up {
-			direction = tx.Down
+		if up {
+			if err := tx.Up(ctx, definition); err != nil {
+				return errors.Wrapf(err, "failed to apply migration %d:\n```\n%s\n```\n", definition.ID, definition.UpQuery.Query(sqlf.PostgresBindVar))
+			}
+		} else {
+			if err := tx.Down(ctx, definition); err != nil {
+				return errors.Wrapf(err, "failed to apply migration %d:\n```\n%s\n```\n", definition.ID, definition.DownQuery.Query(sqlf.PostgresBindVar))
+			}
 		}
 
-		return direction(ctx, definition)
+		return nil
 	}
-	if err := schemaContext.store.WithMigrationLog(ctx, definition, up, applyMigration); err != nil {
-		return errors.Wrapf(err, "failed to apply migration %d", definition.ID)
-	}
-
-	return nil
+	return schemaContext.store.WithMigrationLog(ctx, definition, up, applyMigration)
 }
 
 const indexPollInterval = time.Second * 5
@@ -407,7 +415,24 @@ pollIndexStatusLoop:
 		}
 
 		if exists && indexStatus.IsValid {
-			// Index exists and is valid; nothing to do
+			// Index exists and is valid; nothing to do. We'll return here, but we need to ensure
+			// we add a migration log here before moving on.
+			//
+			// This was a particular problem when we would create an index concurrently on DotCom
+			// ahead of a merge+rollout to confirm expected performance changes. When the migrator
+			// runs, it sees a valid index and exits without adding a log. This causes the frontend
+			// to fail as it's still missing proof that the index's migration was ran.
+			//
+			// This doesn't happen normally, where the migration log is missing AND the index does
+			// not yet exist (or is invalid). This may have affected customers that have previously
+			// downgraded.
+			noop := func() error {
+				return nil
+			}
+			if err := schemaContext.store.WithMigrationLog(ctx, definition, true, noop); err != nil {
+				return false, errors.Wrapf(err, "failed to create migration log %d", definition.ID)
+			}
+
 			return unlocked, nil
 		}
 
@@ -466,14 +491,14 @@ pollIndexStatusLoop:
 		// of the index.
 
 		var (
-			pgErr        pgconn.PgError
+			pgErr        *pgconn.PgError
 			raceDetected bool
 
 			errorFilter = func(err error) error {
 				if err == nil {
 					return err
 				}
-				if !errors.As(err, pgErr) || pgErr.Code != "42P07" {
+				if !errors.As(err, &pgErr) || pgErr.Code != "42P07" {
 					return err
 				}
 
@@ -533,15 +558,15 @@ func filterAppliedDefinitions(
 	appliedVersionMap := intSet(schemaVersion.appliedVersions)
 
 	filtered := make([]definition.Definition, 0, len(definitions))
-	for _, definition := range definitions {
-		if _, ok := appliedVersionMap[definition.ID]; ok == up {
+	for _, def := range definitions {
+		if _, ok := appliedVersionMap[def.ID]; ok == up {
 			// Either
 			// - needs to be applied and already applied, or
 			// - needs to be unapplied and not currently applied.
 			continue
 		}
 
-		filtered = append(filtered, definition)
+		filtered = append(filtered, def)
 	}
 
 	return filtered
@@ -552,8 +577,8 @@ func filterAppliedDefinitions(
 // transaction, and the source of each query will be identified via a SQL comment.
 func concatenateSQL(definitions []definition.Definition, up bool) string {
 	migrationContents := make([]string, 0, len(definitions))
-	for _, definition := range definitions {
-		migrationContents = append(migrationContents, fmt.Sprintf("-- Migration %d\n%s\n", definition.ID, strings.TrimSpace(renderQuery(definition, up))))
+	for _, def := range definitions {
+		migrationContents = append(migrationContents, fmt.Sprintf("-- Migration %d\n%s\n", def.ID, strings.TrimSpace(renderQuery(def, up))))
 	}
 
 	return fmt.Sprintf("BEGIN;\n\n%s\nCOMMIT;\n", strings.Join(migrationContents, "\n"))
@@ -567,7 +592,6 @@ func renderQuery(definition definition.Definition, up bool) string {
 	}
 
 	return query.Query(sqlf.PostgresBindVar)
-
 }
 
 // hashDefinitionIDs returns a deterministic hash of the given definition IDs.

@@ -3,10 +3,14 @@ import React, { useState, useCallback } from 'react'
 import { gql, useMutation } from '@apollo/client'
 import { noop } from 'lodash'
 
-import { Input } from '@sourcegraph/wildcard'
+import { Input, Link } from '@sourcegraph/wildcard'
 
-import { MonitorEmailPriority, SendTestEmailResult, SendTestEmailVariables } from '../../../../graphql-operations'
-import { ActionProps } from '../FormActionArea'
+import {
+    MonitorEmailPriority,
+    type SendTestEmailResult,
+    type SendTestEmailVariables,
+} from '../../../../graphql-operations'
+import type { ActionProps } from '../FormActionArea'
 
 import { ActionEditor } from './ActionEditor'
 
@@ -93,14 +97,38 @@ export const EmailAction: React.FunctionComponent<React.PropsWithChildren<Action
         : undefined
     const testState = loading ? 'loading' : called && !error ? 'called' : error || undefined
 
+    const emailConfigured = window.context.emailEnabled
+    const userPrimaryEmail = authenticatedUser.emails.find(email => email.isPrimary)
+
+    const emailNotConfiguredMessage = !emailConfigured ? (
+        !action ? (
+            <>
+                SMTP is not configured. Please ask your admin to{' '}
+                <Link to="/help/admin/config/email">configure email sending</Link> to enable this feature.
+            </>
+        ) : (
+            <>
+                SMTP is not configured, email notifications won't be sent. Please ask your admin to{' '}
+                <Link to="/help/admin/config/email">configure email sending</Link>.
+            </>
+        )
+    ) : !userPrimaryEmail?.verified ? (
+        <>
+            Please <Link to={`${authenticatedUser.settingsURL!}/emails`}>verify your email</Link> to enable this
+            feature.
+        </>
+    ) : undefined
+
+    const disabledBasedOnEmailConfig = !userPrimaryEmail?.verified || (!emailConfigured && !action) || disabled
+
     return (
         <ActionEditor
             title="Send email notifications"
             subtitle="Deliver email notifications to specified recipients."
             idName="email"
-            disabled={disabled}
+            disabled={disabledBasedOnEmailConfig}
             completed={!!action}
-            completedSubtitle={authenticatedUser.email}
+            completedSubtitle={userPrimaryEmail?.email || ''}
             actionEnabled={enabled}
             toggleActionEnabled={toggleEmailNotificationEnabled}
             includeResults={includeResults}
@@ -109,6 +137,7 @@ export const EmailAction: React.FunctionComponent<React.PropsWithChildren<Action
             onCancel={onCancel}
             canDelete={!!action}
             onDelete={onDelete}
+            warningMessage={emailNotConfiguredMessage}
             testState={testState}
             testButtonDisabledReason={testButtonDisabledReason}
             testButtonText={testButtonText}
@@ -121,7 +150,7 @@ export const EmailAction: React.FunctionComponent<React.PropsWithChildren<Action
                     id="code-monitoring-form-actions-recipients"
                     className="mb-2"
                     label="Recipients"
-                    value={`${authenticatedUser.email || ''} (you)`}
+                    value={`${userPrimaryEmail?.email || ''} (you)`}
                     disabled={true}
                     autoFocus={true}
                     required={true}

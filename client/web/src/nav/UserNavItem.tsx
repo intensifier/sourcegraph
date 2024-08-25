@@ -1,16 +1,19 @@
-import React, { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, type ChangeEventHandler, type FC } from 'react'
 
 import { mdiChevronDown, mdiChevronUp, mdiOpenInNew } from '@mdi/js'
-import { Shortcut } from '@slimsag/react-shortcuts'
 import classNames from 'classnames'
-// eslint-disable-next-line no-restricted-imports
 
 import { Toggle } from '@sourcegraph/branded/src/components/Toggle'
-import { KeyboardShortcut } from '@sourcegraph/shared/src/keyboardShortcuts'
-import { KEYBOARD_SHORTCUT_SHOW_HELP } from '@sourcegraph/shared/src/keyboardShortcuts/keyboardShortcuts'
-import { useCoreWorkflowImprovementsEnabled } from '@sourcegraph/shared/src/settings/useCoreWorkflowImprovementsEnabled'
-import { ThemeProps } from '@sourcegraph/shared/src/theme'
+import { UserAvatar } from '@sourcegraph/shared/src/components/UserAvatar'
+import { useKeyboardShortcut } from '@sourcegraph/shared/src/keyboardShortcuts/useKeyboardShortcut'
+import { Shortcut } from '@sourcegraph/shared/src/react-shortcuts'
+import { useExperimentalFeatures } from '@sourcegraph/shared/src/settings/settings'
+import type { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import { ThemeSetting, useTheme } from '@sourcegraph/shared/src/theme'
 import {
+    AnchorLink,
+    Icon,
+    Link,
     Menu,
     MenuButton,
     MenuDivider,
@@ -18,93 +21,86 @@ import {
     MenuItem,
     MenuLink,
     MenuList,
-    Link,
     Position,
-    AnchorLink,
     Select,
-    Icon,
-    Badge,
-    ProductStatusBadge,
 } from '@sourcegraph/wildcard'
 
-import { AuthenticatedUser } from '../auth'
-import { useFeatureFlag } from '../featureFlags/useFeatureFlag'
-import { ThemePreference } from '../stores/themeState'
-import { ThemePreferenceProps } from '../theme'
-import { UserAvatar } from '../user/UserAvatar'
+import type { AuthenticatedUser } from '../auth'
+import { CodyProRoutes } from '../cody/codyProRoutes'
+import { PageRoutes } from '../routes.constants'
+import { enableDevSettings, isSourcegraphDev, useDeveloperSettings } from '../stores'
+
+import { useNewSearchNavigation } from './new-global-navigation'
 
 import styles from './UserNavItem.module.scss'
 
-export interface UserNavItemProps extends ThemeProps, ThemePreferenceProps {
-    authenticatedUser: Pick<
-        AuthenticatedUser,
-        'username' | 'avatarURL' | 'settingsURL' | 'organizations' | 'siteAdmin' | 'session' | 'displayName'
-    >
-    showDotComMarketing: boolean
-    keyboardShortcutForSwitchTheme?: KeyboardShortcut
-    codeHostIntegrationMessaging: 'browser-extension' | 'native-integration'
-    showRepositorySection?: boolean
-    position?: Position
+const MAX_VISIBLE_ORGS = 5
+
+type MinimalAuthenticatedUser = Pick<
+    AuthenticatedUser,
+    'username' | 'avatarURL' | 'settingsURL' | 'organizations' | 'siteAdmin' | 'session' | 'displayName' | 'emails'
+>
+
+export interface UserNavItemProps extends TelemetryProps {
+    authenticatedUser: MinimalAuthenticatedUser
+    isSourcegraphDotCom: boolean
     menuButtonRef?: React.Ref<HTMLButtonElement>
-}
-
-/**
- * Triggers Keyboard Shortcut help when the button is clicked in the Menu Nav item
- */
-
-const showKeyboardShortcutsHelp = (): void => {
-    const keybinding = KEYBOARD_SHORTCUT_SHOW_HELP.keybindings[0]
-    const shiftKey = !!keybinding.held?.includes('Shift')
-    const altKey = !!keybinding.held?.includes('Alt')
-    const metaKey = !!keybinding.held?.includes('Meta')
-    const ctrlKey = !!keybinding.held?.includes('Control')
-
-    for (const key of keybinding.ordered) {
-        document.dispatchEvent(new KeyboardEvent('keydown', { key, shiftKey, metaKey, ctrlKey, altKey }))
-    }
+    showFeedbackModal: () => void
+    showKeyboardShortcutsHelp: () => void
+    className?: string
 }
 
 /**
  * Displays the user's avatar and/or username in the navbar and exposes a dropdown menu with more options for
  * authenticated viewers.
  */
-export const UserNavItem: React.FunctionComponent<React.PropsWithChildren<UserNavItemProps>> = props => {
+export const UserNavItem: FC<UserNavItemProps> = props => {
     const {
+        authenticatedUser,
+        isSourcegraphDotCom,
         menuButtonRef,
-        themePreference,
-        onThemePreferenceChange,
-        codeHostIntegrationMessaging,
-        position = Position.bottomEnd,
+        showFeedbackModal,
+        showKeyboardShortcutsHelp,
+        className,
     } = props
+
+    const { themeSetting, setThemeSetting } = useTheme()
+    const keyboardShortcutSwitchTheme = useKeyboardShortcut('switchTheme')
 
     const supportsSystemTheme = useMemo(
         () => Boolean(window.matchMedia?.('not all and (prefers-color-scheme), (prefers-color-scheme)').matches),
         []
     )
 
-    const onThemeChange: React.ChangeEventHandler<HTMLSelectElement> = useCallback(
+    const onThemeChange: ChangeEventHandler<HTMLSelectElement> = useCallback(
         event => {
-            onThemePreferenceChange(event.target.value as ThemePreference)
+            setThemeSetting(event.target.value as ThemeSetting)
         },
-        [onThemePreferenceChange]
+        [setThemeSetting]
     )
 
     const onThemeCycle = useCallback((): void => {
-        onThemePreferenceChange(themePreference === ThemePreference.Dark ? ThemePreference.Light : ThemePreference.Dark)
-    }, [onThemePreferenceChange, themePreference])
+        setThemeSetting(themeSetting === ThemeSetting.Dark ? ThemeSetting.Light : ThemeSetting.Dark)
+    }, [setThemeSetting, themeSetting])
 
-    const [coreWorkflowImprovementsEnabled, setCoreWorkflowImprovementsEnabled] = useCoreWorkflowImprovementsEnabled()
+    const organizations = authenticatedUser.organizations.nodes
+    const newSearchNavigationUI = useExperimentalFeatures(features => features.newSearchNavigationUI)
+    const [newNavigationEnabled, setNewNavigationEnabled] = useNewSearchNavigation()
+    const developerMode = useDeveloperSettings(settings => settings.enabled)
 
-    // Target ID for tooltip
-    const targetID = 'target-user-avatar'
-    const [isOpenBetaEnabled] = useFeatureFlag('open-beta-enabled')
+    const onNewSearchNavigationChange = useCallback(
+        (enabled: boolean) => {
+            setNewNavigationEnabled(enabled)
+        },
+        [setNewNavigationEnabled]
+    )
 
     return (
         <>
-            {props.keyboardShortcutForSwitchTheme?.keybindings.map((keybinding, index) => (
+            {keyboardShortcutSwitchTheme?.keybindings.map((keybinding, index) => (
                 // `Shortcut` doesn't update its states when `onMatch` changes
                 // so we put `themePreference` in `key` binding to make it
-                <Shortcut key={`${themePreference}-${index}`} {...keybinding} onMatch={onThemeCycle} />
+                <Shortcut key={`${themeSetting}-${index}`} {...keybinding} onMatch={onThemeCycle} />
             ))}
             <Menu>
                 {({ isExpanded }) => (
@@ -113,55 +109,47 @@ export const UserNavItem: React.FunctionComponent<React.PropsWithChildren<UserNa
                             ref={menuButtonRef}
                             variant="link"
                             data-testid="user-nav-item-toggle"
-                            className={classNames('d-flex align-items-center text-decoration-none', styles.menuButton)}
+                            className={classNames(
+                                'd-flex align-items-center text-decoration-none',
+                                styles.menuButton,
+                                className
+                            )}
                             aria-label={`${isExpanded ? 'Close' : 'Open'} user profile menu`}
                         >
                             <div className="position-relative">
                                 <div className="align-items-center d-flex">
-                                    <UserAvatar
-                                        user={props.authenticatedUser}
-                                        targetID={targetID}
-                                        className={styles.avatar}
-                                    />
+                                    <UserAvatar user={authenticatedUser} className={styles.avatar} />
                                     <Icon svgPath={isExpanded ? mdiChevronUp : mdiChevronDown} aria-hidden={true} />
                                 </div>
                             </div>
                         </MenuButton>
 
-                        <MenuList position={position} className={styles.dropdownMenu} aria-label="User. Open menu">
+                        <MenuList
+                            position={Position.bottomEnd}
+                            className={styles.dropdownMenu}
+                            aria-label="User. Open menu"
+                        >
                             <MenuHeader className={styles.dropdownHeader}>
-                                Signed in as <strong>@{props.authenticatedUser.username}</strong>
+                                Signed in as <strong>@{authenticatedUser.username}</strong>
                             </MenuHeader>
                             <MenuDivider className={styles.dropdownDivider} />
-                            <MenuLink
-                                className={styles.dropdownItem}
-                                as={Link}
-                                to={props.authenticatedUser.settingsURL!}
-                            >
+                            <MenuLink as={Link} to={authenticatedUser.settingsURL!}>
                                 Settings
                             </MenuLink>
-                            {props.showRepositorySection && (
+                            {window.context.codyEnabledForCurrentUser && (
                                 <MenuLink
-                                    className={styles.dropdownItem}
                                     as={Link}
-                                    to={`/users/${props.authenticatedUser.username}/settings/repositories`}
+                                    to={isSourcegraphDotCom ? CodyProRoutes.Manage : PageRoutes.CodyDashboard}
                                 >
-                                    Your repositories
+                                    Cody dashboard
                                 </MenuLink>
                             )}
-                            <MenuLink
-                                className={styles.dropdownItem}
-                                as={Link}
-                                to={`/users/${props.authenticatedUser.username}/searches`}
-                            >
+                            <MenuLink as={Link} to={PageRoutes.SavedSearches}>
                                 Saved searches
                             </MenuLink>
-                            {isOpenBetaEnabled && (
-                                <MenuLink
-                                    as={Link}
-                                    to={`/users/${props.authenticatedUser.username}/settings/organizations`}
-                                >
-                                    Your organizations <Badge variant="info">NEW</Badge>
+                            {!isSourcegraphDotCom && window.context.ownEnabled && (
+                                <MenuLink as={Link} to="/teams">
+                                    Teams
                                 </MenuLink>
                             )}
                             <MenuDivider />
@@ -174,15 +162,15 @@ export const UserNavItem: React.FunctionComponent<React.PropsWithChildren<UserNa
                                         selectSize="sm"
                                         data-testid="theme-toggle"
                                         onChange={onThemeChange}
-                                        value={props.themePreference}
+                                        value={themeSetting}
                                         className="mb-0 flex-1"
                                     >
-                                        <option value={ThemePreference.Light}>Light</option>
-                                        <option value={ThemePreference.Dark}>Dark</option>
-                                        <option value={ThemePreference.System}>System</option>
+                                        <option value={ThemeSetting.Light}>Light</option>
+                                        <option value={ThemeSetting.Dark}>Dark</option>
+                                        <option value={ThemeSetting.System}>System</option>
                                     </Select>
                                 </div>
-                                {props.themePreference === ThemePreference.System && !supportsSystemTheme && (
+                                {themeSetting === ThemeSetting.System && !supportsSystemTheme && (
                                     <div className="text-wrap">
                                         <small>
                                             <AnchorLink
@@ -197,76 +185,68 @@ export const UserNavItem: React.FunctionComponent<React.PropsWithChildren<UserNa
                                     </div>
                                 )}
                             </div>
-                            <div className="px-2 py-1">
-                                <div className="d-flex align-items-center justify-content-between">
-                                    <div className="mr-2">
-                                        Simple UI <ProductStatusBadge status="beta" className="ml-1" />
+
+                            {!newSearchNavigationUI && (
+                                <div className="px-2 py-1">
+                                    <div className="d-flex align-items-center justify-content-between">
+                                        <div className="mr-2">Minimize navigation</div>
+                                        <Toggle value={newNavigationEnabled} onToggle={onNewSearchNavigationChange} />
                                     </div>
-                                    <Toggle
-                                        value={coreWorkflowImprovementsEnabled}
-                                        onToggle={setCoreWorkflowImprovementsEnabled}
-                                    />
                                 </div>
-                            </div>
-                            {!isOpenBetaEnabled && props.authenticatedUser.organizations.nodes.length > 0 && (
+                            )}
+
+                            {process.env.NODE_ENV !== 'development' && isSourcegraphDev(authenticatedUser) && (
+                                <div className="px-2 py-1">
+                                    <div className="d-flex align-items-center justify-content-between">
+                                        <div className="mr-2">Developer mode</div>
+                                        <Toggle value={developerMode} onToggle={enableDevSettings} />
+                                    </div>
+                                </div>
+                            )}
+
+                            {organizations.length > 0 && (
                                 <>
                                     <MenuDivider className={styles.dropdownDivider} />
                                     <MenuHeader className={styles.dropdownHeader}>Your organizations</MenuHeader>
-                                    {props.authenticatedUser.organizations.nodes.map(org => (
-                                        <MenuLink
-                                            className={styles.dropdownItem}
-                                            as={Link}
-                                            key={org.id}
-                                            to={org.settingsURL || org.url}
-                                        >
-                                            {org.displayName || org.name}
+                                    {organizations.slice(0, MAX_VISIBLE_ORGS).map(org => (
+                                        <MenuLink as={Link} key={org.id} to={org.settingsURL || org.url}>
+                                            {org.name}
                                         </MenuLink>
                                     ))}
+                                    {organizations.length > MAX_VISIBLE_ORGS && (
+                                        <MenuLink as={Link} to={authenticatedUser.settingsURL!}>
+                                            Show all organizations
+                                        </MenuLink>
+                                    )}
                                 </>
                             )}
+
                             <MenuDivider className={styles.dropdownDivider} />
-                            {props.authenticatedUser.siteAdmin && (
-                                <MenuLink className={styles.dropdownItem} as={Link} to="/site-admin">
+                            {authenticatedUser.siteAdmin && (
+                                <MenuLink as={Link} to="/site-admin">
                                     Site admin
                                 </MenuLink>
                             )}
-                            <MenuLink
-                                className={styles.dropdownItem}
-                                as={Link}
-                                to="/help"
-                                target="_blank"
-                                rel="noopener"
-                            >
+                            {authenticatedUser.siteAdmin && window.context.applianceMenuTarget !== '' && (
+                                <MenuLink as={Link} to={window.context.applianceMenuTarget}>
+                                    Appliance
+                                </MenuLink>
+                            )}
+                            <MenuLink as={Link} to="/help" target="_blank" rel="noopener">
                                 Help <Icon aria-hidden={true} svgPath={mdiOpenInNew} />
                             </MenuLink>
+                            <MenuItem onSelect={showFeedbackModal}>Feedback</MenuItem>
                             <MenuItem onSelect={showKeyboardShortcutsHelp}>Keyboard shortcuts</MenuItem>
-
-                            {props.authenticatedUser.session?.canSignOut && (
-                                <MenuLink className={styles.dropdownItem} as={AnchorLink} to="/-/sign-out">
+                            {authenticatedUser.session?.canSignOut && (
+                                <MenuLink as={AnchorLink} to="/-/sign-out">
                                     Sign out
                                 </MenuLink>
                             )}
-                            <MenuDivider className={styles.dropdownDivider} />
-                            {props.showDotComMarketing && (
-                                <MenuLink
-                                    className={styles.dropdownItem}
-                                    as={AnchorLink}
-                                    to="https://about.sourcegraph.com"
-                                    target="_blank"
-                                    rel="noopener"
-                                >
+
+                            {isSourcegraphDotCom && <MenuDivider className={styles.dropdownDivider} />}
+                            {isSourcegraphDotCom && (
+                                <MenuLink as={AnchorLink} to="https://sourcegraph.com" target="_blank" rel="noopener">
                                     About Sourcegraph <Icon aria-hidden={true} svgPath={mdiOpenInNew} />
-                                </MenuLink>
-                            )}
-                            {codeHostIntegrationMessaging === 'browser-extension' && (
-                                <MenuLink
-                                    className={styles.dropdownItem}
-                                    as={AnchorLink}
-                                    to="/help/integration/browser_extension"
-                                    target="_blank"
-                                    rel="noopener"
-                                >
-                                    Browser extension <Icon aria-hidden={true} svgPath={mdiOpenInNew} />
                                 </MenuLink>
                             )}
                         </MenuList>

@@ -2,16 +2,17 @@ package monitoring
 
 import (
 	"fmt"
-	"math/rand"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/grafana-tools/sdk"
+	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/lib/pointers"
 	"github.com/sourcegraph/sourcegraph/monitoring/monitoring/internal/grafana"
+	"github.com/sourcegraph/sourcegraph/monitoring/monitoring/internal/promql"
 )
 
 // Dashboard usually describes a Service,
@@ -51,11 +52,12 @@ type Dashboard struct {
 }
 
 func (c *Dashboard) validate() error {
-	if !isValidGrafanaUID(c.Name) {
-		return errors.Errorf("Name must be lowercase alphanumeric + dashes; found \"%s\"", c.Name)
+	if err := grafana.ValidateUID(c.Name); err != nil {
+		return errors.Wrapf(err, "Name %q is invalid", c.Name)
 	}
-	if c.Title != strings.Title(c.Title) {
-		return errors.Errorf("Title must be in Title Case; found \"%s\" want \"%s\"", c.Title, strings.Title(c.Title))
+
+	if c.Title != Title(c.Title) {
+		return errors.Errorf("Title must be in Title Case; found \"%s\" want \"%s\"", c.Title, Title(c.Title))
 	}
 	if c.Description != withPeriod(c.Description) || c.Description != upperFirst(c.Description) {
 		return errors.Errorf("Description must be sentence starting with an uppercase letter and ending with period; found \"%s\"", c.Description)
@@ -68,7 +70,7 @@ func (c *Dashboard) validate() error {
 		}
 	}
 	for i, g := range c.Groups {
-		if err := g.validate(); err != nil {
+		if err := g.validate(c.Variables); err != nil {
 			errs = errors.Append(errs, errors.Errorf("Group %d %q: %v", i, g.Title, err))
 		}
 	}
@@ -90,18 +92,22 @@ func (c *Dashboard) noAlertsDefined() bool {
 }
 
 // renderDashboard generates the Grafana renderDashboard for this container.
-func (c *Dashboard) renderDashboard() *sdk.Board {
-	board := sdk.NewBoard(c.Title)
-	board.Version = uint(rand.Uint32())
-	board.UID = c.Name
-	board.ID = 0
-	board.Timezone = "utc"
-	board.Timepicker.RefreshIntervals = []string{"5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"}
-	board.Time.From = "now-6h"
-	board.Time.To = "now"
-	board.SharedCrosshair = true
-	board.Editable = false
-	board.AddTags("builtin")
+// UIDs are globally unique identifiers for a given dashboard on Grafana. For normal Sourcegraph usage,
+// there is only ever a single dashboard with a given name but Cloud usage requires multiple copies
+// of the same dashboards to exist for different folders so we allow the ability to inject custom
+// label matchers and folder names to uniquely id the dashboards. UIDs need to be deterministic however
+// to generate appropriate alerts and documentations
+func (c *Dashboard) renderDashboard(injectLabelMatchers []*labels.Matcher, folder string) (*sdk.Board, error) {
+	// If the folder is not specified simply use the name for the UID
+	uid := c.Name
+	if folder != "" {
+		uid = fmt.Sprintf("%s-%s", folder, uid)
+		if err := grafana.ValidateUID(uid); err != nil {
+			return nil, errors.Wrapf(err, "generated UID %q is invalid", uid)
+		}
+	}
+	board := grafana.NewBoard(uid, c.Title, []string{"builtin"})
+
 	if !c.noAlertsDefined() {
 		alertLevelVariable := ContainerVariable{
 			Label: "Alert level",
@@ -110,17 +116,32 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 				Options: []string{"critical", "warning"},
 			},
 		}
-		board.Templating.List = []sdk.TemplateVar{alertLevelVariable.toGrafanaTemplateVar()}
+		templateVar, err := alertLevelVariable.toGrafanaTemplateVar(injectLabelMatchers)
+		if err != nil {
+			return nil, errors.Wrap(err, "Alert level")
+		}
+		board.Templating.List = []sdk.TemplateVar{templateVar}
 	}
 	for _, variable := range c.Variables {
-		board.Templating.List = append(board.Templating.List, variable.toGrafanaTemplateVar())
+		templateVar, err := variable.toGrafanaTemplateVar(injectLabelMatchers)
+		if err != nil {
+			return nil, errors.Wrap(err, variable.Name)
+		}
+		board.Templating.List = append(board.Templating.List, templateVar)
 	}
 	if !c.noAlertsDefined() {
+		// Show alerts matching the selected alert_level (see template variable above)
+		expr, err := promql.InjectMatchers(
+			fmt.Sprintf(`ALERTS{service_name=%q,level=~"$alert_level",alertstate="firing"}`, c.Name),
+			injectLabelMatchers, newVariableApplier(c.Variables))
+		if err != nil {
+			return nil, errors.Wrap(err, "alerts overlay query")
+		}
+
 		board.Annotations.List = []sdk.Annotation{{
-			Name:       "Alert events",
-			Datasource: StringPtr("Prometheus"),
-			// Show alerts matching the selected alert_level (see template variable above)
-			Expr:        fmt.Sprintf(`ALERTS{service_name=%q,level=~"$alert_level",alertstate="firing"}`, c.Name),
+			Name:        "Alert events",
+			Datasource:  pointers.Ptr("Prometheus"),
+			Expr:        expr,
 			Step:        "60s",
 			TitleFormat: "{{ description }} ({{ name }})",
 			TagKeys:     "level,owner",
@@ -132,13 +153,22 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 	// Annotation layers that require a service to export information required by the
 	// Sourcegraph debug server - see the `NoSourcegraphDebugServer` docstring.
 	if !c.NoSourcegraphDebugServer {
+		// Per version, instance generate an annotation whenever labels change
+		// inspired by https://github.com/grafana/grafana/issues/11948#issuecomment-403841249
+		// We use `job=~.*SERVICE` because of frontend being called sourcegraph-frontend
+		// in certain environments
+		expr, err := promql.InjectMatchers(
+			fmt.Sprintf(`group by(version, instance) (src_service_metadata{job=~".*%[1]s"} unless (src_service_metadata{job=~".*%[1]s"} offset 1m))`, c.Name),
+			injectLabelMatchers,
+			newVariableApplier(c.Variables))
+		if err != nil {
+			return nil, errors.Wrap(err, "debug server version expression")
+		}
+
 		board.Annotations.List = append(board.Annotations.List, sdk.Annotation{
-			Name:       "Version changes",
-			Datasource: StringPtr("Prometheus"),
-			// Per version, instance generate an annotation whenever labels change
-			// inspired by https://github.com/grafana/grafana/issues/11948#issuecomment-403841249
-			// We use `job=~.*SERVICE` because of frontend being called sourcegraph-frontend in certain environments
-			Expr:        fmt.Sprintf(`group by(version, instance) (src_service_metadata{job=~".*%[1]s"} unless (src_service_metadata{job=~".*%[1]s"} offset 1m))`, c.Name),
+			Name:        "Version changes",
+			Datasource:  pointers.Ptr("Prometheus"),
+			Expr:        expr,
 			Step:        "60s",
 			TitleFormat: "v{{ version }}",
 			TagKeys:     "instance",
@@ -155,17 +185,27 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 	description.TextPanel.Content = fmt.Sprintf(`
 	<div style="text-align: left;">
 	  <img src="https://sourcegraphstatic.com/sourcegraph-logo-light.png" style="height:30px; margin:0.5rem"></img>
-	  <div style="margin-left: 1rem; margin-top: 0.5rem; font-size: 20px;"><b>%s:</b> %s <a style="font-size: 15px" target="_blank" href="https://docs.sourcegraph.com/dev/background-information/architecture">(⧉ architecture diagram)</a></span>
+	  <div style="margin-left: 1rem; margin-top: 0.5rem; font-size: 20px;"><b>%s:</b> %s <a style="font-size: 15px" target="_blank" href="https://docs-legacy.sourcegraph.com/dev/background-information/architecture">(⧉ architecture diagram)</a></span>
 	</div>
 	`, c.Name, c.Description)
 	board.Panels = append(board.Panels, description)
 
 	if !c.noAlertsDefined() {
+		expr, err := promql.InjectMatchers(fmt.Sprintf(`label_replace(
+			sum(
+				max by (level,service_name,name,description,grafana_panel_id)(alert_count{service_name="%s",name!="",level=~"$alert_level"})
+			) by (
+				level,description,service_name,grafana_panel_id,
+			),
+			"description", "$1",
+			"description", ".*: (.*)"
+		)`, c.Name), injectLabelMatchers, newVariableApplier(c.Variables))
+		if err != nil {
+			return nil, errors.Wrap(err, "alerts overview expression")
+		}
+
 		alertsDefined := grafana.NewContainerAlertsDefinedTable(sdk.Target{
-			Expr: fmt.Sprintf(`label_replace(
-				sum(max by (level,service_name,name,description,grafana_panel_id)(alert_count{service_name="%s",name!="",level=~"$alert_level"})) by (level,description,service_name,grafana_panel_id),
-				"description", "$1", "description", ".*: (.*)"
-			)`, c.Name),
+			Expr:    expr,
 			Format:  "table",
 			Instant: true,
 		})
@@ -200,14 +240,22 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 				Show:    true,
 			},
 		}
+		alertsFiringExpr, err := promql.InjectMatchers(
+			fmt.Sprintf(`sum by (service_name,level,name,grafana_panel_id)(max by (level,service_name,name,description,grafana_panel_id)(alert_count{service_name="%s",name!="",level=~"$alert_level"}) >= 1)`, c.Name),
+			injectLabelMatchers,
+			newVariableApplier(c.Variables),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "Alerts firing")
+		}
 		alertsFiring.AddTarget(&sdk.Target{
-			Expr:         fmt.Sprintf(`sum by (service_name,level,name,grafana_panel_id)(max by (level,service_name,name,description,grafana_panel_id)(alert_count{service_name="%s",name!="",level=~"$alert_level"}) >= 1)`, c.Name),
+			Expr:         alertsFiringExpr,
 			LegendFormat: "{{level}}: {{name}}",
 		})
 		alertsFiring.GraphPanel.FieldConfig = &sdk.FieldConfig{}
 		alertsFiring.GraphPanel.FieldConfig.Defaults.Links = []sdk.Link{{
 			Title: "Graph panel",
-			URL:   StringPtr("/-/debug/grafana/d/${__field.labels.service_name}/${__field.labels.service_name}?viewPanel=${__field.labels.grafana_panel_id}"),
+			URL:   pointers.Ptr("/-/debug/grafana/d/${__field.labels.service_name}/${__field.labels.service_name}?viewPanel=${__field.labels.grafana_panel_id}"),
 		}}
 		board.Panels = append(board.Panels, alertsFiring)
 	}
@@ -218,14 +266,9 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 		// Non-general groups are shown as collapsible panels.
 		var rowPanel *sdk.Panel
 		if group.Title != "General" {
-			rowPanel = &sdk.Panel{RowPanel: &sdk.RowPanel{}}
-			rowPanel.OfType = sdk.RowType
-			rowPanel.Type = "row"
-			rowPanel.Title = group.Title
 			offsetY++
-			setPanelPos(rowPanel, 0, offsetY)
+			rowPanel = grafana.NewRowPanel(offsetY, group.Title)
 			rowPanel.Collapsed = group.Hidden
-			rowPanel.Panels = []sdk.Panel{} // cannot be null
 			board.Panels = append(board.Panels, rowPanel)
 		}
 
@@ -233,39 +276,20 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 		for rowIndex, row := range group.Rows {
 			panelWidth := 24 / len(row)
 			offsetY++
-			for i, o := range row {
-				panelTitle := strings.ToTitle(string([]rune(o.Description)[0])) + string([]rune(o.Description)[1:])
-
-				var panel *sdk.Panel
-				switch o.Panel.panelType {
-				case PanelTypeGraph:
-					panel = sdk.NewGraph(panelTitle)
-				case PanelTypeHeatmap:
-					panel = sdk.NewHeatmap(panelTitle)
+			for panelIndex, o := range row {
+				panel, err := o.renderPanel(c, panelManipulationOptions{
+					injectLabelMatchers: injectLabelMatchers,
+				}, &panelRenderOptions{
+					groupIndex:  groupIndex,
+					rowIndex:    rowIndex,
+					panelIndex:  panelIndex,
+					panelWidth:  panelWidth,
+					panelHeight: 5,
+					offsetY:     offsetY,
+				})
+				if err != nil {
+					return nil, errors.Wrapf(err, "render panel for %q", o.Name)
 				}
-
-				panel.ID = observablePanelID(groupIndex, rowIndex, i)
-
-				// Set positioning
-				setPanelSize(panel, panelWidth, 5)
-				setPanelPos(panel, i*panelWidth, offsetY)
-
-				// Add reference links
-				panel.Links = []sdk.Link{{
-					Title:       "Panel reference",
-					URL:         StringPtr(fmt.Sprintf("%s#%s", canonicalDashboardsDocsURL, observableDocAnchor(c, o))),
-					TargetBlank: boolPtr(true),
-				}}
-				if !o.NoAlert {
-					panel.Links = append(panel.Links, sdk.Link{
-						Title:       "Alerts reference",
-						URL:         StringPtr(fmt.Sprintf("%s#%s", canonicalAlertDocsURL, observableDocAnchor(c, o))),
-						TargetBlank: boolPtr(true),
-					})
-				}
-
-				// Build the graph panel
-				o.Panel.build(o, panel)
 
 				// Attach panel to board
 				if rowPanel != nil && group.Hidden {
@@ -276,7 +300,7 @@ func (c *Dashboard) renderDashboard() *sdk.Board {
 			}
 		}
 	}
-	return board
+	return board, nil
 }
 
 // alertDescription generates an alert description for the specified coontainer's alert.
@@ -284,12 +308,15 @@ func (c *Dashboard) alertDescription(o Observable, alert *ObservableAlertDefinit
 	if alert.isEmpty() {
 		return "", errors.New("cannot generate description for empty alert")
 	}
+
 	var description string
 
 	// description based on thresholds. no special description for 'alert.strictCompare',
 	// because the description is pretty ambiguous to fit different alerts.
 	units := o.Panel.unitType.short()
-	if alert.greaterThan {
+	if alert.description != "" {
+		description = fmt.Sprintf("%s: %s", c.Name, alert.description)
+	} else if alert.greaterThan {
 		// e.g. "zoekt-indexserver: 20+ indexed search request errors every 5m by code"
 		description = fmt.Sprintf("%s: %v%s+ %s", c.Name, alert.threshold, units, o.Description)
 	} else if alert.lessThan {
@@ -306,14 +333,13 @@ func (c *Dashboard) alertDescription(o Observable, alert *ObservableAlertDefinit
 	return description, nil
 }
 
-// renderRules generates the Prometheus rules file which defines our
+// RenderPrometheusRules generates the Prometheus rules file which defines our
 // high-level alerting metrics for the container. For more information about
 // how these work, see:
 //
-// https://docs.sourcegraph.com/admin/observability/metrics#high-level-alerting-metrics
-//
-func (c *Dashboard) renderRules() (*promRulesFile, error) {
-	group := promGroup{Name: c.Name}
+// https://sourcegraph.com/docs/admin/observability/metrics#high-level-alerting-metrics
+func (c *Dashboard) RenderPrometheusRules(injectLabelMatchers []*labels.Matcher) (*PrometheusRules, error) {
+	group := newPrometheusRuleGroup(c.Name)
 	for groupIndex, g := range c.Groups {
 		for rowIndex, r := range g.Rows {
 			for observableIndex, o := range r {
@@ -325,17 +351,12 @@ func (c *Dashboard) renderRules() (*promRulesFile, error) {
 						continue
 					}
 
-					// The alertQuery must contribute a query that returns true when it should be firing.
-					var alertQuery string
-					if a.query != "" {
-						alertQuery = fmt.Sprintf("%s((%s) %s %v)", a.aggregator, a.query, a.comparator, a.threshold)
-					} else {
-						alertQuery = fmt.Sprintf("%s((%s) %s %v)", a.aggregator, o.Query, a.comparator, a.threshold)
-					}
-
-					// If the data must exist, we alert if the query returns no value as well
-					if o.DataMustExist {
-						alertQuery = fmt.Sprintf("(%s) OR (absent(%s) == 1)", alertQuery, o.Query)
+					alertQuery, err := a.generateAlertQuery(o, injectLabelMatchers,
+						// Alert queries cannot use variable intervals
+						newVariableApplierWith(c.Variables, false))
+					if err != nil {
+						return nil, errors.Errorf("%s.%s.%s: unable to generate query: %+v",
+							c.Name, o.Name, level, err)
 					}
 
 					// Build the rule with appropriate labels. Labels are leveraged in various integrations, such as with prom-wrapper.
@@ -344,17 +365,23 @@ func (c *Dashboard) renderRules() (*promRulesFile, error) {
 						return nil, errors.Errorf("%s.%s.%s: unable to generate labels: %+v",
 							c.Name, o.Name, level, err)
 					}
-					group.appendRow(alertQuery, map[string]string{
+
+					labelMap := map[string]string{
 						"name":         o.Name,
 						"level":        level,
 						"service_name": c.Name,
 						"description":  description,
-						"owner":        o.Owner.identifier,
+						"owner":        o.Owner.opsgenieTeam,
 
 						// in the corresponding dashboard, this label should indicate
 						// the panel associated with this rule
 						"grafana_panel_id": strconv.Itoa(int(observablePanelID(groupIndex, rowIndex, observableIndex))),
-					}, a.duration)
+					}
+					// Inject labels as fixed values for alert rules
+					for _, l := range injectLabelMatchers {
+						labelMap[l.Name] = l.Value
+					}
+					group.appendRow(alertQuery, labelMap, a.duration)
 				}
 			}
 		}
@@ -362,165 +389,9 @@ func (c *Dashboard) renderRules() (*promRulesFile, error) {
 	if err := group.validate(); err != nil {
 		return nil, err
 	}
-	return &promRulesFile{
-		Groups: []promGroup{group},
+	return &PrometheusRules{
+		Groups: []PrometheusRuleGroup{group},
 	}, nil
-}
-
-type ContainerVariableOptionType string
-
-const (
-	OptionTypeInterval = "interval"
-)
-
-type ContainerVariableOptions struct {
-	Options []string
-	// DefaultOption is the option that should be selected by default.
-	DefaultOption string
-	// Type of the options. You can usually leave this unset.
-	Type ContainerVariableOptionType
-}
-
-// ContainerVariable describes a template variable that can be applied container dashboard
-// for filtering purposes.
-type ContainerVariable struct {
-	// Name is the name of the variable to substitute the value for, e.g. "alert_level"
-	// to replace "$alert_level" in queries
-	Name string
-	// Label is a human-readable name for the variable, e.g. "Alert level"
-	Label string
-
-	// OptionsQuery is the query to generate the possible values for this variable. Cannot
-	// be used in conjunction with Options
-	OptionsQuery string
-	// Options are the pre-defined possible values for this variable. Cannot be used in
-	// conjunction with Query
-	Options ContainerVariableOptions
-
-	// WildcardAllValue indicates to Grafana that is should NOT use Query or Options to
-	// generate a concatonated 'All' value for the variable, and use a '.*' wildcard
-	// instead. Setting this to true primarily useful if you use Query and expect it to be
-	// a large enough result set to cause issues when viewing the dashboard.
-	//
-	// We allow Grafana to generate a value by default because simply using '.*' wildcard
-	// can pull in unintended metrics if adequate filtering is not performed on the query,
-	// for example if multiple services export the same metric. If set to true, make sure
-	// the queries that use this variable perform adequate filtering to avoid pulling in
-	// unintended metrics.
-	WildcardAllValue bool
-
-	// Multi indicates whether or not to allow multi-selection for this variable filter
-	Multi bool
-
-	// RawTransform is can be used to extend ContainerVariable to modify underlying
-	// Grafana variables specification.
-	//
-	// It is recommended to use or extend the standardized ContainerVariable options
-	// instead.
-	RawTransform func(*sdk.TemplateVar)
-}
-
-func (c *ContainerVariable) validate() error {
-	if c.Name == "" {
-		return errors.New("ContainerVariable.Name is required")
-	}
-	if c.Label == "" {
-		return errors.New("ContainerVariable.Label is required")
-	}
-	if c.OptionsQuery == "" && len(c.Options.Options) == 0 {
-		return errors.New("one of ContainerVariable.Query and ContainerVariable.Options must be set")
-	}
-	if c.OptionsQuery != "" && len(c.Options.Options) > 0 {
-		return errors.New("ContainerVariable.Query and ContainerVariable.Options cannot both be set")
-	}
-	return nil
-}
-
-// toGrafanaTemplateVar generates the Grafana template variable configuration for this
-// container variable.
-func (c *ContainerVariable) toGrafanaTemplateVar() sdk.TemplateVar {
-	variable := sdk.TemplateVar{
-		Name:  c.Name,
-		Label: c.Label,
-		Multi: c.Multi,
-
-		Datasource: StringPtr("Prometheus"),
-		IncludeAll: true,
-
-		// Apply the AllValue to a template variable by default
-		Current: sdk.Current{Text: &sdk.StringSliceString{Value: []string{"all"}, Valid: true}, Value: "$__all"},
-	}
-
-	if c.WildcardAllValue {
-		variable.AllValue = ".*"
-	} else {
-		// Rely on Grafana to create a union of only the values
-		// generated by the specified query.
-		//
-		// See https://grafana.com/docs/grafana/latest/variables/formatting-multi-value-variables/#multi-value-variables-with-a-prometheus-or-influxdb-data-source
-		// for more information.
-		variable.AllValue = ""
-	}
-
-	switch {
-	case c.OptionsQuery != "":
-		variable.Type = "query"
-		variable.Query = c.OptionsQuery
-		variable.Refresh = sdk.BoolInt{
-			Flag:  true,
-			Value: Int64Ptr(2), // Refresh on time range change
-		}
-		variable.Sort = 3
-
-	case len(c.Options.Options) > 0:
-		// Set the type
-		variable.Type = "custom"
-		if c.Options.Type != "" {
-			variable.Type = string(c.Options.Type)
-		}
-		// Generate our options
-		variable.Query = strings.Join(c.Options.Options, ",")
-
-		// On interval options, don't allow the selection of 'all' intervals, since
-		// this is a one-of-many selection
-		var hasAllOption bool
-		if c.Options.Type != OptionTypeInterval {
-			// Add the AllValue as a default, only selected if a default is not configured
-			hasAllOption = true
-			selected := c.Options.DefaultOption == ""
-			variable.Options = append(variable.Options, sdk.Option{Text: "all", Value: "$__all", Selected: selected})
-		}
-		// Generate options
-		for i, option := range c.Options.Options {
-			// Whether this option should be selected
-			var selected bool
-			if c.Options.DefaultOption != "" {
-				// If an default option is provided, select that
-				selected = option == c.Options.DefaultOption
-			} else if !hasAllOption {
-				// Otherwise if there is no 'all' option generated, select the first
-				selected = i == 0
-			}
-
-			variable.Options = append(variable.Options, sdk.Option{Text: option, Value: option, Selected: selected})
-			if selected {
-				// Also configure current
-				variable.Current = sdk.Current{
-					Text: &sdk.StringSliceString{
-						Value: []string{option},
-						Valid: true,
-					},
-					Value: option,
-				}
-			}
-		}
-	}
-
-	if c.RawTransform != nil {
-		c.RawTransform(&variable)
-	}
-
-	return variable
 }
 
 // Group describes a group of observable information about a container.
@@ -543,13 +414,13 @@ type Group struct {
 	Rows []Row
 }
 
-func (g Group) validate() error {
+func (g Group) validate(variables []ContainerVariable) error {
 	if g.Title != upperFirst(g.Title) || g.Title == withPeriod(g.Title) {
 		return errors.Errorf("Title must start with an uppercase letter and not end with a period; found \"%s\"", g.Title)
 	}
 	var errs error
 	for i, r := range g.Rows {
-		if err := r.validate(); err != nil {
+		if err := r.validate(variables); err != nil {
 			errs = errors.Append(errs, errors.Errorf("Row %d: %v", i, err))
 		}
 	}
@@ -561,97 +432,18 @@ func (g Group) validate() error {
 // These correspond to a row of Grafana graphs.
 type Row []Observable
 
-func (r Row) validate() error {
+func (r Row) validate(variables []ContainerVariable) error {
 	if len(r) < 1 || len(r) > 4 {
 		return errors.Errorf("row must have 1 to 4 observables only, found %v", len(r))
 	}
 
 	var errs error
 	for i, o := range r {
-		if err := o.validate(); err != nil {
+		if err := o.validate(variables); err != nil {
 			errs = errors.Append(errs, errors.Errorf("Observable %d %q: %v", i, o.Name, err))
 		}
 	}
 	return errs
-}
-
-// ObservableOwner denotes a team that owns an Observable. The current teams are described in
-// the handbook: https://handbook.sourcegraph.com/departments/engineering/
-type ObservableOwner struct {
-	// identifier is the team's name on OpsGenie and is used for routing alerts.
-	identifier       string
-	handbookSlug     string
-	handbookTeamName string
-}
-
-// identifer must be all lowercase, and optionally  hyphenated.
-//
-// Some examples of valid identifiers:
-// foo
-// foo-bar
-// foo-bar-baz
-//
-// Some examples of invalid identifiers:
-// Foo
-// FOO
-// Foo-Bar
-// foo_bar
-var identifierPattern = regexp.MustCompile("^([a-z]+)(-[a-z]+)*?$")
-
-var (
-	ObservableOwnerSearch = ObservableOwner{
-		identifier:       "search",
-		handbookSlug:     "search/product",
-		handbookTeamName: "Search",
-	}
-	ObservableOwnerSearchCore = ObservableOwner{
-		identifier:       "search-core",
-		handbookSlug:     "search/core",
-		handbookTeamName: "Search Core",
-	}
-	ObservableOwnerBatches = ObservableOwner{
-		identifier:       "batch-changes",
-		handbookSlug:     "batch-changes",
-		handbookTeamName: "Batch Changes",
-	}
-	ObservableOwnerCodeIntel = ObservableOwner{
-		identifier:       "code-intel",
-		handbookSlug:     "code-intelligence",
-		handbookTeamName: "Code intelligence",
-	}
-	ObservableOwnerSecurity = ObservableOwner{
-		identifier:       "security",
-		handbookSlug:     "security",
-		handbookTeamName: "Security",
-	}
-	ObservableOwnerRepoManagement = ObservableOwner{
-		identifier:       "repo-management",
-		handbookSlug:     "repo-management",
-		handbookTeamName: "Repo Management",
-	}
-	ObservableOwnerCodeInsights = ObservableOwner{
-		identifier:       "code-insights",
-		handbookSlug:     "code-insights",
-		handbookTeamName: "Code Insights",
-	}
-	ObservableOwnerDevOps = ObservableOwner{
-		identifier:       "devops",
-		handbookSlug:     "devops",
-		handbookTeamName: "Cloud DevOps",
-	}
-	ObservableOwnerIAM = ObservableOwner{
-		identifier:       "iam",
-		handbookSlug:     "iam",
-		handbookTeamName: "Identity and Access Management",
-	}
-)
-
-// toMarkdown returns a Markdown string that also links to the owner's team page in the handbook.
-func (o ObservableOwner) toMarkdown() string {
-	return fmt.Sprintf(
-		"[Sourcegraph %s team](https://handbook.sourcegraph.com/departments/engineering/teams/%s)",
-		o.handbookTeamName, o.handbookSlug,
-	)
 }
 
 // Observable describes a metric about a container that can be observed. For example, memory usage.
@@ -711,14 +503,14 @@ type Observable struct {
 	// suggest checking in on these periodically, or using a notification channel that
 	// will not bother anyone if it is spammed.
 	//
-	// Learn more about how alerting is used: https://docs.sourcegraph.com/admin/observability/alerting
+	// Learn more about how alerting is used: https://sourcegraph.com/docs/admin/observability/alerting
 	Warning *ObservableAlertDefinition
 
 	// Critical alerts indicate that something is definitively wrong with Sourcegraph,
 	// in a way that is very likely to be noticeable to users. We suggest using a
 	// high-visibility notification channel, such as paging, for these alerts.
 	//
-	// Learn more about how alerting is used: https://docs.sourcegraph.com/admin/observability/alerting
+	// Learn more about how alerting is used: https://sourcegraph.com/docs/admin/observability/alerting
 	Critical *ObservableAlertDefinition
 
 	// NoAlerts must be set by Observables that do not have any alerts. This ensures the
@@ -791,31 +583,47 @@ type Observable struct {
 	// the provided `ObservablePanel` is insufficient - see `ObservablePanelOption` for
 	// more details.
 	Panel ObservablePanel
+
+	// MultiInstance allows a panel to opt-in to a generated multi-instance overview
+	// dashboard, which is created for Sourcegraph Cloud's centralized observability.
+	MultiInstance bool
 }
 
-func (o Observable) validate() error {
+func (o Observable) validate(variables []ContainerVariable) error {
 	if strings.Contains(o.Name, " ") || strings.ToLower(o.Name) != o.Name {
 		return errors.Errorf("Name must be in lower_snake_case; found \"%s\"", o.Name)
 	}
 	if len(o.Description) == 0 {
 		return errors.New("Description must be set")
 	}
+	// Avoid paragraphs in the brief description
+	const maxDescriptionLength = 120
+	if len(o.Description) > maxDescriptionLength {
+		return errors.Newf("Description must be under %d characters (current length: %d) - to provide more context, use Interpretation and NextSteps fields instead",
+			maxDescriptionLength, len(o.Description))
+	}
 	if first, second := string([]rune(o.Description)[0]), string([]rune(o.Description)[1]); first != strings.ToLower(first) && second == strings.ToLower(second) {
 		return errors.Errorf("Description must be lowercase except for acronyms; found \"%s\"", o.Description)
 	}
-	if o.Owner.identifier == "" && !o.NoAlert {
-		return errors.New("Owner.identifier must be defined for observables with alerts")
-	}
 
-	// In some cases, the identifier is an empty string. We don't want to run it through the regex.
-	if o.Owner.identifier != "" && !identifierPattern.Match([]byte(o.Owner.identifier)) {
-		return errors.Errorf(`Owner.identifier has invalid format: "%v"`, []byte(o.Owner.identifier))
+	// If there is an alert, the given owner must be valid
+	if !o.NoAlert {
+		if err := o.Owner.validate(); err != nil {
+			return err
+		}
 	}
 
 	if !o.Panel.panelType.validate() {
 		return errors.New(`Panel.panelType must be "graph" or "heatmap"`)
 	}
 
+	// Check if query is valid
+	allowIntervalVariables := o.NoAlert // if no alert is configured, allow interval variables
+	if err := promql.Validate(o.Query, newVariableApplierWith(variables, allowIntervalVariables)); err != nil {
+		return errors.Wrapf(err, "Query is invalid")
+	}
+
+	// Validate alerting on this observable
 	allAlertsEmpty := o.alertsCount() == 0
 	if allAlertsEmpty || o.NoAlert {
 		// Ensure lack of alerts is intentional
@@ -880,6 +688,84 @@ func (o Observable) alertsCount() (count int) {
 	return
 }
 
+type panelRenderOptions struct {
+	groupIndex  int
+	rowIndex    int
+	panelIndex  int
+	panelWidth  int
+	panelHeight int
+
+	offsetY int
+}
+
+type panelManipulationOptions struct {
+	injectLabelMatchers []*labels.Matcher
+	injectGroupings     []string
+}
+
+func (o Observable) renderPanel(c *Dashboard, manipulations panelManipulationOptions, opts *panelRenderOptions) (*sdk.Panel, error) {
+	panelTitle := strings.ToTitle(string([]rune(o.Description)[0])) + string([]rune(o.Description)[1:])
+
+	var panel *sdk.Panel
+	switch o.Panel.panelType {
+	case PanelTypeGraph:
+		panel = sdk.NewGraph(panelTitle)
+	case PanelTypeHeatmap:
+		panel = sdk.NewHeatmap(panelTitle)
+	}
+
+	// Set attributes based on position, if available
+	if opts != nil {
+		// Generating a stable ID
+		panel.ID = observablePanelID(opts.groupIndex, opts.rowIndex, opts.panelIndex)
+
+		// Set positioning
+		setPanelSize(panel, opts.panelWidth, opts.panelHeight)
+		setPanelPos(panel, opts.panelIndex*opts.panelWidth, opts.offsetY)
+	}
+
+	// Add reference links
+	panel.Links = []sdk.Link{{
+		Title:       "Panel reference",
+		URL:         pointers.Ptr(fmt.Sprintf("%s#%s", canonicalDashboardsDocsURL, observableDocAnchor(c, o))),
+		TargetBlank: pointers.Ptr(true),
+	}}
+	if !o.NoAlert {
+		panel.Links = append(panel.Links, sdk.Link{
+			Title:       "Alerts reference",
+			URL:         pointers.Ptr(fmt.Sprintf("%s#%s", canonicalAlertDocsURL, observableDocAnchor(c, o))),
+			TargetBlank: pointers.Ptr(true),
+		})
+	}
+
+	// Build the graph panel
+	o.Panel.build(o, panel)
+
+	// Apply injected label matchers
+	for _, target := range *panel.GetTargets() {
+		var err error
+		target.Expr, err = promql.InjectMatchers(target.Expr, manipulations.injectLabelMatchers, newVariableApplier(c.Variables))
+		if err != nil {
+			return nil, errors.Wrap(err, target.Query)
+		}
+
+		if len(manipulations.injectGroupings) > 0 {
+			target.Expr, err = promql.InjectGroupings(target.Expr, manipulations.injectGroupings, newVariableApplier(c.Variables))
+			if err != nil {
+				return nil, errors.Wrap(err, target.Query)
+			}
+
+			for _, g := range manipulations.injectGroupings {
+				target.LegendFormat = fmt.Sprintf("%s - {{%s}}", target.LegendFormat, g)
+			}
+		}
+
+		panel.SetTarget(&target)
+	}
+
+	return panel, nil
+}
+
 // Alert provides a builder for defining alerting on an Observable.
 func Alert() *ObservableAlertDefinition {
 	return &ObservableAlertDefinition{}
@@ -901,8 +787,10 @@ type ObservableAlertDefinition struct {
 	comparator string
 	// Threshold sets the value to be compared against.
 	threshold float64
-	// alternative query to use for an alert instead of the observables query.
-	query string
+	// alternative customQuery to use for an alert instead of the observables customQuery.
+	customQuery string
+	// alternative description to use for an alert instead of the observables description.
+	description string
 }
 
 // GreaterOrEqual indicates the alert should fire when greater or equal the given value.
@@ -953,7 +841,14 @@ func (a *ObservableAlertDefinition) For(d time.Duration) *ObservableAlertDefinit
 // ensure the panel query still makes sense in the context of an alert with a custom
 // query.
 func (a *ObservableAlertDefinition) CustomQuery(query string) *ObservableAlertDefinition {
-	a.query = query
+	a.customQuery = query
+	return a
+}
+
+// CustomDescription sets a different description to be used for this alert instead of the description
+// used for the Grafana panel.
+func (a *ObservableAlertDefinition) CustomDescription(desc string) *ObservableAlertDefinition {
+	a.description = desc
 	return a
 }
 
@@ -986,5 +881,31 @@ func (a *ObservableAlertDefinition) validate() error {
 	if a.greaterThan && a.lessThan {
 		return errors.New("only one bound (greater or less) can be set")
 	}
+
+	if a.customQuery != "" {
+		// Check if custom query is a valid alert query. Also note that custom queries
+		// should not use variables, so we don't provide them here.
+		if _, err := promql.InjectAsAlert(a.customQuery, nil, nil); err != nil {
+			return errors.Wrapf(err, "CustomQuery is invalid")
+		}
+	}
 	return nil
+}
+
+func (a *ObservableAlertDefinition) generateAlertQuery(o Observable, injectLabelMatchers []*labels.Matcher, vars promql.VariableApplier) (string, error) {
+	// The alertQuery must contribute a query that returns true when it should be firing.
+	var alertQuery string
+	if a.customQuery != "" {
+		alertQuery = fmt.Sprintf("%s((%s) %s %v)", a.aggregator, a.customQuery, a.comparator, a.threshold)
+	} else {
+		alertQuery = fmt.Sprintf("%s((%s) %s %v)", a.aggregator, o.Query, a.comparator, a.threshold)
+	}
+
+	// If the data must exist, we alert if the query returns no value as well
+	if o.DataMustExist {
+		alertQuery = fmt.Sprintf("(%s) OR (absent(%s) == 1)", alertQuery, o.Query)
+	}
+
+	// Inject label matchers
+	return promql.InjectAsAlert(alertQuery, injectLabelMatchers, vars)
 }

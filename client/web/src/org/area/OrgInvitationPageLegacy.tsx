@@ -1,34 +1,31 @@
 import * as React from 'react'
 
-import { Redirect } from 'react-router-dom'
-import { concat, Observable, Subject, Subscription } from 'rxjs'
-import { catchError, concatMap, distinctUntilKeyChanged, map, mapTo, tap, withLatestFrom } from 'rxjs/operators'
+import { Navigate } from 'react-router-dom'
+import { concat, type Observable, Subject, Subscription } from 'rxjs'
+import { catchError, concatMap, distinctUntilKeyChanged, map, tap, withLatestFrom } from 'rxjs/operators'
 
-import { ErrorAlert } from '@sourcegraph/branded/src/components/alerts'
-import { Form } from '@sourcegraph/branded/src/components/Form'
-import { asError, ErrorLike, isErrorLike } from '@sourcegraph/common'
+import { asError, type ErrorLike, isErrorLike, logger } from '@sourcegraph/common'
 import { dataOrThrowErrors, gql } from '@sourcegraph/http-client'
 import { OrganizationInvitationResponseType } from '@sourcegraph/shared/src/graphql-operations'
-import * as GQL from '@sourcegraph/shared/src/schema'
-import { LoadingSpinner, Button, Link, Alert, H3, Text } from '@sourcegraph/wildcard'
+import { EVENT_LOGGER } from '@sourcegraph/shared/src/telemetry/web/eventLogger'
+import { LoadingSpinner, Button, Link, Alert, H3, Text, ErrorAlert, Form } from '@sourcegraph/wildcard'
 
 import { orgURL } from '..'
-import { refreshAuthenticatedUser, AuthenticatedUser } from '../../auth'
+import { refreshAuthenticatedUser, type AuthenticatedUser } from '../../auth'
 import { withAuthenticatedUser } from '../../auth/withAuthenticatedUser'
 import { requestGraphQL } from '../../backend/graphql'
 import { ModalPage } from '../../components/ModalPage'
 import { PageTitle } from '../../components/PageTitle'
-import {
+import type {
     RespondToOrganizationInvitationResult,
     RespondToOrganizationInvitationVariables,
 } from '../../graphql-operations'
-import { eventLogger } from '../../tracking/eventLogger'
 import { userURL } from '../../user'
 import { OrgAvatar } from '../OrgAvatar'
 
-import { OrgAreaPageProps } from './OrgArea'
+import type { OrgAreaRouteContext } from './OrgArea'
 
-interface Props extends OrgAreaPageProps {
+interface Props extends OrgAreaRouteContext {
     authenticatedUser: AuthenticatedUser
 
     /** Called when the viewer responds to the invitation. */
@@ -54,7 +51,8 @@ export const OrgInvitationPageLegacy = withAuthenticatedUser(
         private subscriptions = new Subscription()
 
         public componentDidMount(): void {
-            eventLogger.logViewEvent('OrgInvitation')
+            EVENT_LOGGER.logViewEvent('OrgInvitation')
+            this.props.telemetryRecorder.recordEvent('org.invitation', 'view')
 
             const orgChanges = this.componentUpdates.pipe(
                 distinctUntilKeyChanged('org'),
@@ -77,7 +75,8 @@ export const OrgInvitationPageLegacy = withAuthenticatedUser(
                                     organizationInvitation: org.viewerPendingInvitation!.id,
                                     responseType,
                                 }).pipe(
-                                    tap(() => eventLogger.log('OrgInvitationRespondedTo')),
+                                    tap(() => EVENT_LOGGER.log('OrgInvitationRespondedTo')),
+                                    tap(() => this.props.telemetryRecorder.recordEvent('org.invitation', 'responded')),
                                     tap(() =>
                                         this.props.onDidRespondToInvitation(
                                             responseType === OrganizationInvitationResponseType.ACCEPT
@@ -91,7 +90,7 @@ export const OrgInvitationPageLegacy = withAuthenticatedUser(
                     )
                     .subscribe(
                         stateUpdate => this.setState(stateUpdate as State),
-                        error => console.error(error)
+                        error => logger.error(error)
                     )
             )
 
@@ -111,7 +110,7 @@ export const OrgInvitationPageLegacy = withAuthenticatedUser(
                 // Go to organization profile after accepting invitation, or user's own profile after declining
                 // invitation.
                 return (
-                    <Redirect
+                    <Navigate
                         to={
                             this.state.lastResponse
                                 ? orgURL(this.props.org.name)
@@ -191,9 +190,7 @@ export const OrgInvitationPageLegacy = withAuthenticatedUser(
             this.responses.next(OrganizationInvitationResponseType.REJECT)
         }
 
-        private respondToOrganizationInvitation = (
-            args: GQL.IRespondToOrganizationInvitationOnMutationArguments
-        ): Observable<void> =>
+        private respondToOrganizationInvitation = (args: RespondToOrganizationInvitationVariables): Observable<void> =>
             requestGraphQL<RespondToOrganizationInvitationResult, RespondToOrganizationInvitationVariables>(
                 gql`
                     mutation RespondToOrganizationInvitation(
@@ -209,6 +206,9 @@ export const OrgInvitationPageLegacy = withAuthenticatedUser(
                     }
                 `,
                 args
-            ).pipe(map(dataOrThrowErrors), mapTo(undefined))
+            ).pipe(
+                map(dataOrThrowErrors),
+                map(() => undefined)
+            )
     }
 )

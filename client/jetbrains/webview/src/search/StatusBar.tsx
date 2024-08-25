@@ -1,7 +1,7 @@
 import React from 'react'
 
-import { StreamingProgressCount } from '@sourcegraph/search-ui'
-import { Progress, StreamingResultsState } from '@sourcegraph/shared/src/search/stream'
+import { StreamingProgressCount } from '@sourcegraph/branded'
+import type { Progress, StreamingResultsState } from '@sourcegraph/shared/src/search/stream'
 
 import styles from './StatusBar.module.scss'
 
@@ -11,16 +11,18 @@ interface Props {
     authState: 'initial' | 'validating' | 'success' | 'failure'
 }
 
-export const StatusBar: React.FunctionComponent<Props> = ({ progress, progressState }: Props) => (
+export const StatusBar: React.FunctionComponent<Props> = props => (
     <div className={styles.statusBar}>
-        {progressState !== null && (
-            <StreamingProgressCount
-                progress={progress}
-                state={progressState}
-                showTrace={false}
-                className={styles.progressCount}
-            />
-        )}
+        {props.progressState !== null &&
+            (props.progressState === 'error' ? (
+                ''
+            ) : (
+                <StreamingProgressCount
+                    progress={props.progress}
+                    state={props.progressState}
+                    className={styles.progressCount}
+                />
+            ))}
         <div className={styles.spacer} />
     </div>
 )

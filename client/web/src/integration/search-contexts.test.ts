@@ -1,21 +1,22 @@
 import { subDays } from 'date-fns'
 import expect from 'expect'
 import { range } from 'lodash'
-import { test } from 'mocha'
+import { afterEach, beforeEach, describe, test } from 'mocha'
 
-import { highlightFileResult, mixedSearchStreamEvents } from '@sourcegraph/search'
-import { SharedGraphQlOperations } from '@sourcegraph/shared/src/graphql-operations'
-import { ISearchContext } from '@sourcegraph/shared/src/schema'
+import type { SearchContextMinimalFields, SharedGraphQlOperations } from '@sourcegraph/shared/src/graphql-operations'
+import {
+    highlightFileResult,
+    mixedSearchStreamEvents,
+} from '@sourcegraph/shared/src/search/integration/streaming-search-mocks'
 import { accessibilityAudit } from '@sourcegraph/shared/src/testing/accessibility'
-import { Driver, createDriverForTest } from '@sourcegraph/shared/src/testing/driver'
+import { createDriverForTest, type Driver } from '@sourcegraph/shared/src/testing/driver'
 import { afterEachSaveScreenshotIfFailed } from '@sourcegraph/shared/src/testing/screenshotReporter'
 
-import { WebGraphQlOperations } from '../graphql-operations'
+import type { WebGraphQlOperations } from '../graphql-operations'
 
-import { WebIntegrationTestContext, createWebIntegrationTestContext } from './context'
-import { createRepositoryRedirectResult } from './graphQlResponseHelpers'
+import { createWebIntegrationTestContext, type WebIntegrationTestContext } from './context'
 import { commonWebGraphQlResults, createViewerSettingsGraphQLOverride } from './graphQlResults'
-import { createEditorAPI, enableEditor, percySnapshotWithVariants, withSearchQueryInput } from './utils'
+import { createEditorAPI, getSearchQueryInputConfig } from './utils'
 
 const commonSearchGraphQLResults: Partial<WebGraphQlOperations & SharedGraphQlOperations> = {
     ...commonWebGraphQlResults,
@@ -47,28 +48,7 @@ describe('Search contexts', () => {
             user: {
                 experimentalFeatures: {
                     showSearchContext: true,
-                    showSearchContextManagement: true,
-                },
-            },
-        }),
-        UserRepositories: () => ({
-            node: {
-                __typename: 'User',
-                repositories: {
-                    totalCount: 1,
-                    nodes: [
-                        {
-                            id: '1',
-                            name: 'repo',
-                            viewerCanAdminister: false,
-                            createdAt: '',
-                            url: '',
-                            isPrivate: false,
-                            mirrorInfo: { cloned: true, cloneInProgress: false, updatedAt: null, lastError: null },
-                            externalRepository: { serviceType: '', serviceID: '' },
-                        },
-                    ],
-                    pageInfo: { hasNextPage: false },
+                    searchQueryInput: 'v1',
                 },
             },
         }),
@@ -79,8 +59,6 @@ describe('Search contexts', () => {
 
     const isSearchContextDropdownDisabled = () =>
         driver.page.evaluate(() => document.querySelector<HTMLButtonElement>('.test-search-context-dropdown')?.disabled)
-
-    const clearLocalStorage = () => driver.page.evaluate(() => localStorage.clear())
 
     test('Search context selected based on URL', async () => {
         testContext.overrideGraphQL({
@@ -97,61 +75,86 @@ describe('Search contexts', () => {
         expect(await getSelectedSearchContextSpec()).toStrictEqual('context:@test')
     })
 
-    test('Missing context filter should default to global context', async () => {
-        // Initialize localStorage to a valid context, that should not be used
-        await driver.page.goto(driver.sourcegraphBaseUrl + '/search')
-        await driver.page.evaluate(() => localStorage.setItem('sg-last-search-context', '@test'))
+    test('Missing context filter should default to global context, even if another default is set', async () => {
+        testContext.overrideGraphQL({
+            ...testContextForSearchContexts,
+            DefaultSearchContextSpec: () => ({
+                defaultSearchContext: {
+                    __typename: 'SearchContext',
+                    spec: 'ctx-1',
+                },
+            }),
+        })
+
         // Visit the search page with a query without a context filter
-        await driver.page.goto(driver.sourcegraphBaseUrl + '/search?q=test&patternType=regexp')
+        await driver.page.goto(driver.sourcegraphBaseUrl + '/search?q=test', {
+            waitUntil: 'networkidle0',
+        })
         await driver.page.waitForSelector('.test-selected-search-context-spec', { visible: true })
         expect(await getSelectedSearchContextSpec()).toStrictEqual('context:global')
-        await clearLocalStorage()
     })
 
-    withSearchQueryInput(editorName => {
-        test(`Unavailable search context should remain in the query and disable the search context dropdown (${editorName})`, async () => {
-            testContext.overrideGraphQL({
-                ...testContextForSearchContexts,
-                ...createViewerSettingsGraphQLOverride({
-                    user: {
-                        experimentalFeatures: {
-                            showSearchContext: true,
-                            showSearchContextManagement: true,
-                            ...enableEditor(editorName).experimentalFeatures,
-                        },
+    test('Unavailable search context should remain in the query and disable the search context dropdown with default context', async () => {
+        const { waitForInput, applySettings } = getSearchQueryInputConfig('codemirror6')
+
+        testContext.overrideGraphQL({
+            ...testContextForSearchContexts,
+            ...createViewerSettingsGraphQLOverride({
+                user: applySettings({
+                    experimentalFeatures: {
+                        showSearchContext: true,
                     },
                 }),
-            })
-
-            await driver.page.goto(
-                driver.sourcegraphBaseUrl + '/search?q=context:%40unavailableCtx+test&patternType=regexp',
-                { waitUntil: 'networkidle0' }
-            )
-            await driver.page.waitForSelector('.test-selected-search-context-spec', { visible: true })
-            const editor = await createEditorAPI(driver, '[data-testid="searchbox"] .test-query-input')
-            expect(await editor.getValue()).toStrictEqual('context:@unavailableCtx test')
-            expect(await isSearchContextDropdownDisabled()).toBeTruthy()
+            }),
+            DefaultSearchContextSpec: () => ({
+                defaultSearchContext: {
+                    __typename: 'SearchContext',
+                    spec: 'ctx-1',
+                },
+            }),
         })
+
+        await driver.page.goto(
+            driver.sourcegraphBaseUrl + '/search?q=context:%40unavailableCtx+test&patternType=regexp',
+            { waitUntil: 'networkidle0' }
+        )
+        await driver.page.waitForSelector('.test-selected-search-context-spec', { visible: true })
+        const editor = await waitForInput(driver, '[data-testid="searchbox"] .test-query-input')
+        expect(await editor.getValue()).toStrictEqual('context:@unavailableCtx test')
+        expect(await isSearchContextDropdownDisabled()).toBeTruthy()
+        expect(await getSelectedSearchContextSpec()).toStrictEqual('context:ctx-1')
     })
 
-    test('Reset unavailable search context from localStorage if query is not present', async () => {
-        // First initialize localStorage on the page
-        await driver.page.goto(driver.sourcegraphBaseUrl + '/search')
-        await driver.page.evaluate(() => localStorage.setItem('sg-last-search-context', 'doesnotexist'))
-        // Visit the page again with localStorage initialized
+    test('Reset unavailable search context from default if query is not present', async () => {
+        testContext.overrideGraphQL({
+            ...testContextForSearchContexts,
+            DefaultSearchContextSpec: () => ({
+                defaultSearchContext: null,
+            }),
+        })
         await driver.page.goto(driver.sourcegraphBaseUrl + '/search', {
             waitUntil: 'networkidle0',
         })
         await driver.page.waitForSelector('.test-selected-search-context-spec', { visible: true })
         expect(await getSelectedSearchContextSpec()).toStrictEqual('context:global')
-        await clearLocalStorage()
     })
 
     test('Create static search context', async () => {
         testContext.overrideGraphQL({
             ...testContextForSearchContexts,
-            RepositoriesByNames: ({ names }) => ({
-                repositories: { nodes: names.map((name, index) => ({ id: `index-${index}`, name })) },
+            RepositoriesByNames: ({ names, first, after }) => ({
+                repositories: {
+                    nodes: names.map((name, index) => ({ id: `index-${index}`, name })),
+                    pageInfo: {
+                        endCursor: null,
+                        hasNextPage: false,
+                    },
+                },
+                variables: {
+                    names,
+                    first,
+                    after,
+                },
             }),
             CreateSearchContext: ({ searchContext, repositories }) => ({
                 createSearchContext: {
@@ -165,6 +168,8 @@ describe('Search contexts', () => {
                     autoDefined: false,
                     updatedAt: '',
                     viewerCanManage: true,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     query: searchContext.query,
                     repositories: repositories.map(repository => ({
                         __typename: 'SearchContextRepositoryRevisions',
@@ -201,7 +206,7 @@ describe('Search contexts', () => {
 
         // Enter repositories
         const repositoriesConfig =
-            '[{ "repository": "github.com/example/example", "revisions": ["main", "pr/feature1"] }]'
+            '[{ "repository": "github.com/example/example", "revisions": ["main", "pr/feature1"] }]'
         {
             const editor = await createEditorAPI(driver, '[data-testid="repositories-config-area"] .test-editor')
             await editor.replace(repositoriesConfig, 'paste')
@@ -214,7 +219,6 @@ describe('Search contexts', () => {
         )
 
         // Take Snapshot
-        await percySnapshotWithVariants(driver.page, 'Create static search context page')
         await accessibilityAudit(driver.page)
         // Click create
         await driver.page.click('[data-testid="search-context-submit-button"]')
@@ -238,6 +242,8 @@ describe('Search contexts', () => {
                     autoDefined: false,
                     updatedAt: '',
                     viewerCanManage: true,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     query: searchContext.query,
                     repositories: repositories.map(repository => ({
                         __typename: 'SearchContextRepositoryRevisions',
@@ -279,7 +285,6 @@ describe('Search contexts', () => {
         await editor.focus()
 
         // Take Snapshot
-        await percySnapshotWithVariants(driver.page, 'Create dynamic query search context page')
 
         // Enter search query
         await editor.replace('repo:abc')
@@ -295,8 +300,19 @@ describe('Search contexts', () => {
     test('Edit search context', async () => {
         testContext.overrideGraphQL({
             ...testContextForSearchContexts,
-            RepositoriesByNames: ({ names }) => ({
-                repositories: { nodes: names.map((name, index) => ({ id: `index-${index}`, name })) },
+            RepositoriesByNames: ({ names, first, after }) => ({
+                repositories: {
+                    nodes: names.map((name, index) => ({ id: `index-${index}`, name })),
+                    pageInfo: {
+                        endCursor: null,
+                        hasNextPage: false,
+                    },
+                },
+                variables: {
+                    names,
+                    first,
+                    after,
+                },
             }),
             UpdateSearchContext: ({ id, searchContext, repositories }) => ({
                 updateSearchContext: {
@@ -314,6 +330,8 @@ describe('Search contexts', () => {
                     autoDefined: false,
                     updatedAt: subDays(new Date(), 1).toISOString(),
                     viewerCanManage: true,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     query: '',
                     repositories: repositories.map(repository => ({
                         __typename: 'SearchContextRepositoryRevisions',
@@ -338,6 +356,8 @@ describe('Search contexts', () => {
                     autoDefined: false,
                     updatedAt: subDays(new Date(), 1).toISOString(),
                     viewerCanManage: true,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     query: '',
                     repositories: [
                         {
@@ -376,8 +396,7 @@ describe('Search contexts', () => {
         })
 
         // Enter repositories
-        const repositoriesConfig =
-            '[{ "repository": "github.com/example/example", "revisions": ["main", "pr/feature1"] }]'
+        const repositoriesConfig = '[{ "repository": "github.com/example/example", "revisions": ["main"] }]'
         const editor = await createEditorAPI(driver, '[data-testid="repositories-config-area"] .test-editor')
         await editor.replace(repositoriesConfig, 'paste')
 
@@ -409,6 +428,8 @@ describe('Search contexts', () => {
                     autoDefined: false,
                     updatedAt: subDays(new Date(), 1).toISOString(),
                     viewerCanManage: false,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     query: '',
                     repositories: [],
                 },
@@ -427,7 +448,6 @@ describe('Search contexts', () => {
     test('Delete search context', async () => {
         testContext.overrideGraphQL({
             ...testContextForSearchContexts,
-            RepositoryRedirect: ({ repoName }) => createRepositoryRedirectResult(repoName),
             DeleteSearchContext: () => ({
                 deleteSearchContext: {
                     alwaysNil: '',
@@ -449,6 +469,8 @@ describe('Search contexts', () => {
                     autoDefined: false,
                     updatedAt: subDays(new Date(), 1).toISOString(),
                     viewerCanManage: true,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     query: '',
                     repositories: [
                         {
@@ -481,9 +503,6 @@ describe('Search contexts', () => {
 
         testContext.overrideGraphQL({
             ...testContextForSearchContexts,
-            AutoDefinedSearchContexts: () => ({
-                autoDefinedSearchContexts: [],
-            }),
             ListSearchContexts: ({ after }) => {
                 const searchContexts = range(0, searchContextsCount).map(index => ({
                     __typename: 'SearchContext',
@@ -494,11 +513,13 @@ describe('Search contexts', () => {
                     public: true,
                     autoDefined: false,
                     viewerCanManage: false,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     description: '',
                     repositories: [],
                     query: '',
                     updatedAt: subDays(new Date(), 1).toISOString(),
-                })) as ISearchContext[]
+                })) as SearchContextMinimalFields[]
 
                 if (after === null) {
                     return {
@@ -550,8 +571,6 @@ describe('Search contexts', () => {
             {},
             searchContextsCount
         )
-
-        await percySnapshotWithVariants(driver.page, 'Search contexts list page')
         await accessibilityAudit(driver.page)
     })
 
@@ -560,9 +579,6 @@ describe('Search contexts', () => {
             ...testContextForSearchContexts,
             IsSearchContextAvailable: () => ({
                 isSearchContextAvailable: true,
-            }),
-            AutoDefinedSearchContexts: () => ({
-                autoDefinedSearchContexts: [],
             }),
             ListSearchContexts: () => {
                 const nodes = range(0, 2).map(index => ({
@@ -574,11 +590,13 @@ describe('Search contexts', () => {
                     public: true,
                     autoDefined: false,
                     viewerCanManage: false,
+                    viewerHasAsDefault: false,
+                    viewerHasStarred: false,
                     description: '',
                     repositories: [],
                     query: '',
                     updatedAt: subDays(new Date(), 1).toISOString(),
-                })) as ISearchContext[]
+                })) as SearchContextMinimalFields[]
 
                 return {
                     searchContexts: {
@@ -605,7 +623,9 @@ describe('Search contexts', () => {
             // A search will be submitted on context click, wait for the navigation
             driver.page.waitForNavigation({ waitUntil: 'networkidle0' }),
             // Click second context item in the dropdown
-            driver.page.click('[data-testid="search-context-menu-item-name"][title="ctx-1"]'),
+            driver.page.click(
+                '[data-testid="search-context-menu-item"]:nth-child(2) [data-testid="search-context-menu-item-name"]'
+            ),
         ])
 
         await driver.page.waitForSelector('.test-search-context-dropdown', { visible: true })

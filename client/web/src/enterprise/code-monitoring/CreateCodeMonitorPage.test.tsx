@@ -1,34 +1,36 @@
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import * as H from 'history'
+import { Route, Routes } from 'react-router-dom'
 import { NEVER, of } from 'rxjs'
 import sinon from 'sinon'
+import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 
-import { renderWithBrandedContext } from '@sourcegraph/shared/src/testing'
+import { noOpTelemetryRecorder } from '@sourcegraph/shared/src/telemetry'
 import { MockedTestProvider } from '@sourcegraph/shared/src/testing/apollo'
+import { assertAriaDisabled } from '@sourcegraph/testing'
+import { renderWithBrandedContext } from '@sourcegraph/wildcard/src/testing'
 
-import { AuthenticatedUser } from '../../auth'
-import { CreateCodeMonitorVariables } from '../../graphql-operations'
+import type { AuthenticatedUser } from '../../auth'
+import type { CreateCodeMonitorVariables } from '../../graphql-operations'
 
 import { CreateCodeMonitorPage } from './CreateCodeMonitorPage'
 import { mockCodeMonitor } from './testing/util'
 
-describe('CreateCodeMonitorPage', () => {
+// TODO: these tests trigger an error with CodeMirror, complaining about being
+// loaded twice, see https://github.com/uiwjs/react-codemirror/issues/506
+describe.skip('CreateCodeMonitorPage', () => {
     const mockUser = {
         id: 'userID',
         username: 'username',
-        email: 'user@me.com',
+        emails: [{ email: 'user@me.com', isPrimary: true, verified: true }],
         siteAdmin: true,
     } as AuthenticatedUser
 
-    const history = H.createMemoryHistory()
     const props = {
-        location: history.location,
         authenticatedUser: mockUser,
         breadcrumbs: [{ depth: 0, breadcrumb: null }],
         setBreadcrumb: sinon.spy(),
         useBreadcrumb: sinon.spy(),
-        history,
         deleteCodeMonitor: sinon.spy((id: string) => NEVER),
         createCodeMonitor: sinon.spy((monitor: CreateCodeMonitorVariables) =>
             of({ description: mockCodeMonitor.node.description })
@@ -37,28 +39,40 @@ describe('CreateCodeMonitorPage', () => {
         isSourcegraphDotCom: false,
     }
 
+    const origContext = window.context
+    beforeEach(() => {
+        window.context = {
+            emailEnabled: true,
+        } as any
+    })
     afterEach(() => {
+        window.context = origContext
         props.createCodeMonitor.resetHistory()
     })
 
     test('createCodeMonitor is called on submit', async () => {
+        const search = new URLSearchParams({
+            'trigger-query': 'test type:diff repo:test',
+        }).toString()
+
         renderWithBrandedContext(
             <MockedTestProvider>
-                <CreateCodeMonitorPage {...props} />
-            </MockedTestProvider>
+                <Routes>
+                    <Route
+                        path="/code-monitoring/new"
+                        element={<CreateCodeMonitorPage {...props} telemetryRecorder={noOpTelemetryRecorder} />}
+                    />
+                </Routes>
+            </MockedTestProvider>,
+            {
+                route: '/code-monitoring/new?' + search,
+            }
         )
         const nameInput = screen.getByTestId('name-input')
         userEvent.type(nameInput, 'Test updated')
-        userEvent.click(screen.getByTestId('trigger-button'))
 
         const triggerInput = screen.getByTestId('trigger-query-edit')
         expect(triggerInput).toBeInTheDocument()
-
-        await waitFor(() => expect(triggerInput.querySelector('textarea[role="textbox"]')).toBeInTheDocument())
-
-        const textbox = triggerInput.querySelector('textarea[role="textbox"]')!
-        userEvent.type(textbox, 'test type:diff repo:test')
-
         await waitFor(() => expect(triggerInput).toHaveClass('test-is-valid'))
 
         userEvent.click(screen.getByTestId('submit-trigger'))
@@ -69,35 +83,29 @@ describe('CreateCodeMonitorPage', () => {
         sinon.assert.called(props.createCodeMonitor)
     })
 
-    test('createCodeMonitor is not called on submit when trigger or action is incomplete', async () => {
+    test('createCodeMonitor is not called on submit when action is incomplete', () => {
+        const search = new URLSearchParams({
+            'trigger-query': 'test type:diff repo:test',
+        }).toString()
+
         renderWithBrandedContext(
             <MockedTestProvider>
-                <CreateCodeMonitorPage {...props} />
-            </MockedTestProvider>
+                <Routes>
+                    <Route
+                        path="/code-monitoring/new"
+                        element={<CreateCodeMonitorPage {...props} telemetryRecorder={noOpTelemetryRecorder} />}
+                    />
+                </Routes>
+            </MockedTestProvider>,
+            {
+                route: '/code-monitoring/new?' + search,
+            }
         )
         const nameInput = screen.getByTestId('name-input')
         userEvent.type(nameInput, 'Test updated')
         userEvent.click(screen.getByTestId('submit-monitor'))
 
-        // Pressing enter does not call createCodeMonitor because other fields not complete
-        sinon.assert.notCalled(props.createCodeMonitor)
-
-        userEvent.click(screen.getByTestId('trigger-button'))
-
-        const triggerInput = screen.getByTestId('trigger-query-edit')
-        expect(triggerInput).toBeInTheDocument()
-
-        await waitFor(() => expect(triggerInput.querySelector('textarea[role="textbox"]')).toBeInTheDocument())
-
-        const textbox = triggerInput.querySelector('textarea[role="textbox"]')!
-        userEvent.type(textbox, 'test type:diff repo:test')
-
-        await waitFor(() => expect(triggerInput).toHaveClass('test-is-valid'))
-
-        userEvent.click(screen.getByTestId('submit-trigger'))
-        userEvent.click(screen.getByTestId('submit-monitor'))
-
-        // Pressing enter still does not call createCodeMonitor
+        // Pressing enter does not call createCodeMonitor
         sinon.assert.notCalled(props.createCodeMonitor)
 
         userEvent.click(screen.getByTestId('form-action-toggle-email'))
@@ -112,10 +120,16 @@ describe('CreateCodeMonitorPage', () => {
     test('Actions area button is disabled while trigger is incomplete', () => {
         renderWithBrandedContext(
             <MockedTestProvider>
-                <CreateCodeMonitorPage {...props} />
-            </MockedTestProvider>
+                <Routes>
+                    <Route
+                        path="/code-monitoring/new"
+                        element={<CreateCodeMonitorPage {...props} telemetryRecorder={noOpTelemetryRecorder} />}
+                    />
+                </Routes>
+            </MockedTestProvider>,
+            { route: '/code-monitoring/new' }
         )
         const actionButton = screen.getByTestId('form-action-toggle-email')
-        expect(actionButton).toBeDisabled()
+        assertAriaDisabled(actionButton)
     })
 })

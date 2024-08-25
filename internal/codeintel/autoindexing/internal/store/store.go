@@ -4,66 +4,90 @@ import (
 	"context"
 	"time"
 
-	"github.com/keegancsmith/sqlf"
-	"github.com/opentracing/opentracing-go/log"
+	logger "github.com/sourcegraph/log"
 
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/autoindexing/shared"
+	uploadsshared "github.com/sourcegraph/sourcegraph/internal/codeintel/uploads/shared"
 	"github.com/sourcegraph/sourcegraph/internal/database"
 	"github.com/sourcegraph/sourcegraph/internal/database/basestore"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
-// Store provides the interface for autoindexing storage.
 type Store interface {
-	// Not in use yet.
-	List(ctx context.Context, opts ListOpts) (indexJobs []shared.IndexJob, err error)
+	WithTransaction(ctx context.Context, f func(tx Store) error) error
 
-	// Commits
-	GetStaleSourcedCommits(ctx context.Context, minimumTimeSinceLastCheck time.Duration, limit int, now time.Time) (_ []shared.SourcedCommits, err error)
-	UpdateSourcedCommits(ctx context.Context, repositoryID int, commit string, now time.Time) (indexesUpdated int, err error)
-	DeleteSourcedCommits(ctx context.Context, repositoryID int, commit string, maximumCommitLag time.Duration) (indexesDeleted int, err error)
+	// Inference configuration
+	GetInferenceScript(ctx context.Context) (string, error)
+	SetInferenceScript(ctx context.Context, script string) error
 
-	// Indexes
-	DeleteIndexesWithoutRepository(ctx context.Context, now time.Time) (_ map[int]int, err error)
+	// Repository configuration
+	RepositoryExceptions(ctx context.Context, repositoryID int) (canSchedule, canInfer bool, _ error)
+	SetRepositoryExceptions(ctx context.Context, repositoryID int, canSchedule, canInfer bool) error
+	GetIndexConfigurationByRepositoryID(ctx context.Context, repositoryID int) (shared.IndexConfiguration, bool, error)
+	UpdateIndexConfigurationByRepositoryID(ctx context.Context, repositoryID int, data []byte) error
+
+	// Coverage summaries
+	TopRepositoriesToConfigure(ctx context.Context, limit int) ([]uploadsshared.RepositoryWithCount, error)
+	RepositoryIDsWithConfiguration(ctx context.Context, offset, limit int) ([]uploadsshared.RepositoryWithAvailableIndexers, int, error)
+	GetLastIndexScanForRepository(ctx context.Context, repositoryID int) (*time.Time, error)
+	SetConfigurationSummary(ctx context.Context, repositoryID int, numEvents int, availableIndexers map[string]uploadsshared.AvailableIndexer) error
+	TruncateConfigurationSummary(ctx context.Context, numRecordsToRetain int) error
+
+	// Scheduler
+	GetQueuedRepoRev(ctx context.Context, batchSize int) ([]RepoRev, error)
+	MarkRepoRevsAsProcessed(ctx context.Context, ids []int) error
+
+	// Enqueuer
+	IsQueued(ctx context.Context, repositoryID int, commit string) (bool, error)
+	IsQueuedRootIndexer(ctx context.Context, repositoryID int, commit string, root string, indexer string) (bool, error)
+	InsertJobs(context.Context, []uploadsshared.AutoIndexJob) ([]uploadsshared.AutoIndexJob, error)
+
+	// Dependency indexing
+	InsertDependencyIndexingJob(ctx context.Context, uploadID int, externalServiceKind string, syncTime time.Time) (int, error)
+	QueueRepoRev(ctx context.Context, repositoryID int, commit string) error
 }
 
-// store manages the autoindexing store.
+type RepoRev struct {
+	ID           int
+	RepositoryID int
+	Rev          string
+}
+
 type store struct {
 	db         *basestore.Store
+	logger     logger.Logger
 	operations *operations
 }
 
-// New returns a new autoindexing store.
-func New(db database.DB, observationContext *observation.Context) Store {
+func New(observationCtx *observation.Context, db database.DB) Store {
 	return &store{
 		db:         basestore.NewWithHandle(db.Handle()),
-		operations: newOperations(observationContext),
+		logger:     logger.Scoped("autoindexing.store"),
+		operations: newOperations(observationCtx),
 	}
 }
 
-// ListOpts specifies options for listing index jobs.
-type ListOpts struct {
-	Limit int
+func (s *store) WithTransaction(ctx context.Context, f func(s Store) error) error {
+	return s.withTransaction(ctx, func(s *store) error { return f(s) })
 }
 
-// List returns the list of index jobs.
-func (s *store) List(ctx context.Context, opts ListOpts) (indexJobs []shared.IndexJob, err error) {
-	ctx, _, endObservation := s.operations.list.With(ctx, &err, observation.Args{})
-	defer func() {
-		endObservation(1, observation.Args{LogFields: []log.Field{
-			log.Int("numIndexJobs", len(indexJobs)),
-		}})
-	}()
-
-	// This is only a stub and will be replaced or significantly modified
-	// in https://github.com/sourcegraph/sourcegraph/issues/33377
-	_, _ = scanIndexJobs(s.db.Query(ctx, sqlf.Sprintf(listQuery, opts.Limit)))
-	return nil, errors.Newf("unimplemented: autoindexing.store.List")
+func (s *store) withTransaction(ctx context.Context, f func(s *store) error) error {
+	return basestore.InTransaction[*store](ctx, s, f)
 }
 
-const listQuery = `
--- source: internal/codeintel/autoindexing/store/store.go:List
-SELECT id FROM TODO
-LIMIT %s
-`
+func (s *store) Transact(ctx context.Context) (*store, error) {
+	tx, err := s.db.Transact(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &store{
+		logger:     s.logger,
+		db:         tx,
+		operations: s.operations,
+	}, nil
+}
+
+func (s *store) Done(err error) error {
+	return s.db.Done(err)
+}

@@ -1,8 +1,8 @@
-import { mkdirSync, WriteStream, createWriteStream } from 'fs'
+import { mkdirSync, type WriteStream, createWriteStream } from 'fs'
 import path from 'path'
-import { Readable } from 'stream'
+import type { Readable } from 'stream'
 
-import { Entry, open as _openZip, ZipFile } from 'yauzl'
+import { type Entry, open as _openZip, type ZipFile } from 'yauzl'
 
 export function installExtension(extensionPath: string, extensionDirectory: string): Promise<void> {
     return openZip(extensionPath, true).then(zipfile => extractZip(zipfile, extensionDirectory))
@@ -10,7 +10,7 @@ export function installExtension(extensionPath: string, extensionDirectory: stri
 
 function openZip(zipFile: string, lazy: boolean = false): Promise<ZipFile> {
     return new Promise<ZipFile>((resolve, reject) => {
-        _openZip(zipFile, lazy ? { lazyEntries: true } : {}, (error?: Error, zipfile?: ZipFile) => {
+        _openZip(zipFile, lazy ? { lazyEntries: true } : {}, (error?: Error | null, zipfile?: ZipFile) => {
             if (error || zipfile === undefined) {
                 reject(error)
             } else {
@@ -22,7 +22,7 @@ function openZip(zipFile: string, lazy: boolean = false): Promise<ZipFile> {
 
 function openZipStream(zipFile: ZipFile, entry: Entry): Promise<Readable> {
     return new Promise<Readable>((resolve, reject) => {
-        zipFile.openReadStream(entry, (error?: Error, stream?: Readable) => {
+        zipFile.openReadStream(entry, (error?: Error | null, stream?: Readable) => {
             if (error || stream === undefined) {
                 reject(error)
             } else {
@@ -50,7 +50,7 @@ function extractZip(zipfile: ZipFile, targetPath: string): Promise<void> {
             }
         })
         zipfile.readEntry()
-        // eslint-disable-next-line @typescript-eslint/no-misused-promises
+
         zipfile.on('entry', async (entry: Entry) => {
             const fileName = entry.fileName // .replace(options.sourcePathRegex, '')
 

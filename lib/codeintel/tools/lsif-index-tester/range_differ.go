@@ -43,9 +43,8 @@ func fmtLine(line int, prefixWidth int, text string) string {
 // | |     ^^^^^^^^^^^^^^^^ actual
 // |6|   return;
 //
-//
-// Only operates on locations with the same URI.
-//    It doesn't make sense to diff anything here when we don't have that.
+// Only operates on locations with the same URI. It doesn't make sense to diff
+// anything here when we don't have that.
 func DrawLocations(contents string, expected, actual Location, context int) (string, error) {
 	if expected.URI != actual.URI {
 		return "", errors.New("Must pass in two locations with the same URI")
@@ -80,7 +79,7 @@ func DrawLocations(contents string, expected, actual Location, context int) (str
 			fmtLine(-1, prefixWidth, lineCarets(actual.Range, "actual")),
 		)
 
-		for offset := 0; offset < context; offset++ {
+		for offset := range context {
 			newLine := line + offset + 1
 			if newLine < len(splitLines) {
 				text += fmtLine(newLine, prefixWidth, splitLines[newLine]) + "\n"

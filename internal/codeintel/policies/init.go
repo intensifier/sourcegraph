@@ -1,39 +1,40 @@
 package policies
 
 import (
-	"sync"
-
-	"github.com/opentracing/opentracing-go"
-	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/sourcegraph/log"
-
+	"github.com/sourcegraph/sourcegraph/internal/codeintel/policies/internal/background"
+	repomatcher "github.com/sourcegraph/sourcegraph/internal/codeintel/policies/internal/background/repository_matcher"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/policies/internal/store"
 	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/goroutine"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
-	"github.com/sourcegraph/sourcegraph/internal/trace"
 )
 
-var (
-	svc     *Service
-	svcOnce sync.Once
-)
+func NewService(
+	observationCtx *observation.Context,
+	db database.DB,
+	uploadSvc UploadService,
+	gitserverClient gitserver.Client,
+) *Service {
+	return newService(
+		scopedContext("service", observationCtx),
+		store.New(scopedContext("store", observationCtx), db),
+		db.Repos(),
+		uploadSvc,
+		gitserverClient,
+	)
+}
 
-// GetService creates or returns an already-initialized policies service. If the service is
-// new, it will use the given database handle.
-func GetService(db database.DB) *Service {
-	svcOnce.Do(func() {
-		oc := func(name string) *observation.Context {
-			return &observation.Context{
-				Logger:     log.Scoped("policies."+name, "codeintel policies "+name),
-				Tracer:     &trace.Tracer{Tracer: opentracing.GlobalTracer()},
-				Registerer: prometheus.DefaultRegisterer,
-			}
-		}
+var RepositoryMatcherConfigInst = &repomatcher.Config{}
 
-		store := store.New(db, oc("store"))
-		svc = newService(store, oc("service"))
-	})
+func NewRepositoryMatcherRoutines(observationCtx *observation.Context, service *Service) []goroutine.BackgroundRoutine {
+	return background.PolicyMatcherJobs(
+		scopedContext("repository-matcher", observationCtx),
+		service.store,
+		RepositoryMatcherConfigInst,
+	)
+}
 
-	return svc
+func scopedContext(component string, parent *observation.Context) *observation.Context {
+	return observation.ScopedContext("codeintel", "policies", component, parent)
 }

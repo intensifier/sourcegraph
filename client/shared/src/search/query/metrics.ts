@@ -15,7 +15,7 @@ interface Metrics {
     count_select_symbol?: number
     count_select_commit_diff_added?: number
     count_select_commit_diff_removed?: number
-    count_repo_contains?: number
+    count_repo_contains_path?: number
     count_repo_contains_file?: number
     count_repo_contains_content?: number
     count_repo_contains_commit_after?: number
@@ -41,11 +41,11 @@ export const collectMetrics = (query: string): Metrics | undefined => {
     let count_select_symbol = 0
     let count_select_commit_diff_added = 0
     let count_select_commit_diff_removed = 0
-    let count_repo_contains = 0
+    let count_repo_contains_path = 0
     let count_repo_contains_file = 0
     let count_repo_contains_content = 0
     let count_repo_contains_commit_after = 0
-    let count_repo_dependencies = 0
+    const count_repo_dependencies = 0
     let count_count_all = 0
     let count_non_global_context = 0
     let count_only_patterns = 0
@@ -77,15 +77,18 @@ export const collectMetrics = (query: string): Metrics | undefined => {
         switch (token.type) {
             case 'keyword': {
                 switch (token.kind) {
-                    case KeywordKind.Or:
+                    case KeywordKind.Or: {
                         count_or += 1
                         break
-                    case KeywordKind.And:
+                    }
+                    case KeywordKind.And: {
                         count_and += 1
                         break
-                    case KeywordKind.Not:
+                    }
+                    case KeywordKind.Not: {
                         count_not += 1
                         break
+                    }
                 }
                 break
             }
@@ -94,51 +97,56 @@ export const collectMetrics = (query: string): Metrics | undefined => {
                     continue
                 }
                 switch (resolveFieldAlias(token.field.value)) {
-                    case 'select':
+                    case 'select': {
                         switch (token.value.value) {
-                            case 'repo':
+                            case 'repo': {
                                 count_select_repo += 1
                                 break
-                            case 'file':
+                            }
+                            case 'file': {
                                 count_select_file += 1
                                 break
-                            case 'content':
+                            }
+                            case 'content': {
                                 count_select_content += 1
                                 break
-                            case 'symbol':
+                            }
+                            case 'symbol': {
                                 count_select_symbol += 1
                                 break
-                            case 'commit.diff.added':
+                            }
+                            case 'commit.diff.added': {
                                 count_select_commit_diff_added += 1
                                 break
-                            case 'commit.diff.removed':
+                            }
+                            case 'commit.diff.removed': {
                                 count_select_commit_diff_removed += 1
                                 break
+                            }
                         }
+                    }
                     case 'repo': {
                         const predicate = scanPredicate('repo', token.value.value)
                         if (!predicate) {
                             continue
                         }
-                        switch (predicate.path.join('.')) {
-                            case 'contains':
-                                count_repo_contains += 1
+                        switch (predicate.name) {
+                            case 'contains.path': {
+                                count_repo_contains_path += 1
                                 break
-                            case 'contains.file':
+                            }
+                            case 'contains.file': {
                                 count_repo_contains_file += 1
                                 break
-                            case 'contains.content':
+                            }
+                            case 'contains.content': {
                                 count_repo_contains_content += 1
                                 break
-                            case 'contains.commit.after':
+                            }
+                            case 'contains.commit.after': {
                                 count_repo_contains_commit_after += 1
                                 break
-                            case 'deps':
-                                count_repo_dependencies += 1
-                                break
-                            case 'dependencies':
-                                count_repo_dependencies += 1
-                                break
+                            }
                         }
                     }
                     case 'count': {
@@ -170,7 +178,7 @@ export const collectMetrics = (query: string): Metrics | undefined => {
         count_select_commit_diff_added: nonzero(count_select_commit_diff_added),
         count_select_commit_diff_removed: nonzero(count_select_commit_diff_removed),
         // RFC 384: predicate usage
-        count_repo_contains: nonzero(count_repo_contains),
+        count_repo_contains_path: nonzero(count_repo_contains_path),
         count_repo_contains_file: nonzero(count_repo_contains_file),
         count_repo_contains_content: nonzero(count_repo_contains_content),
         count_repo_contains_commit_after: nonzero(count_repo_contains_commit_after),

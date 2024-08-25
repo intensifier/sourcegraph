@@ -1,4 +1,4 @@
-FROM golang:1.18.1-alpine@sha256:42d35674864fbb577594b60b84ddfba1be52b4d4298c961b46ba95e9fb4712e8 AS builder
+FROM golang:1.21-alpine3.18 AS builder
 
 WORKDIR /go/src/tracking-issue
 COPY . .
@@ -6,6 +6,6 @@ RUN go mod init tracking-issue
 RUN go get ./...
 RUN CGO_ENABLED=0 go install .
 
-FROM sourcegraph/alpine-3.14:159028_2022-07-07_1f3b17ce1db8@sha256:25d682b5fd069c716c2b29dcf757c0dc0ce29810a07f91e1347901920272b4a7
+FROM sourcegraph/alpine-3.14:213466_2023-04-17_5.0-bdda34a71619@sha256:6354a4ff578b685e36c8fbde81f62125ae0011b047fb2cc22d1b0de616b3c59a
 COPY --from=builder /go/bin/* /usr/local/bin/
 ENTRYPOINT ["tracking-issue"]

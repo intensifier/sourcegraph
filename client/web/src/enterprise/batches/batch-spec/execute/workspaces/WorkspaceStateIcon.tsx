@@ -19,9 +19,10 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
     className,
 }) => {
     switch (state) {
-        case BatchSpecWorkspaceState.PENDING:
+        case BatchSpecWorkspaceState.PENDING: {
             return null
-        case BatchSpecWorkspaceState.QUEUED:
+        }
+        case BatchSpecWorkspaceState.QUEUED: {
             return (
                 <Tooltip content="This workspace is queued for execution.">
                     <Icon
@@ -31,17 +32,22 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
                     />
                 </Tooltip>
             )
-        case BatchSpecWorkspaceState.PROCESSING:
+        }
+        case BatchSpecWorkspaceState.PROCESSING: {
             return (
                 <Tooltip content="This workspace is currently executing.">
-                    <Icon
-                        aria-label="This workspace is currently executing."
-                        className={classNames('text-muted', className)}
-                        as={LoadingSpinner}
-                    />
+                    <span>
+                        <Icon
+                            aria-label="This workspace is currently executing."
+                            className={className}
+                            as={LoadingSpinner}
+                            aria-live="off"
+                        />
+                    </span>
                 </Tooltip>
             )
-        case BatchSpecWorkspaceState.SKIPPED:
+        }
+        case BatchSpecWorkspaceState.SKIPPED: {
             return (
                 <Tooltip content="This workspace was skipped.">
                     <Icon
@@ -51,7 +57,8 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
                     />
                 </Tooltip>
             )
-        case BatchSpecWorkspaceState.CANCELED:
+        }
+        case BatchSpecWorkspaceState.CANCELED: {
             return (
                 <Tooltip content="The execution for this workspace was canceled.">
                     <Icon
@@ -61,7 +68,8 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
                     />
                 </Tooltip>
             )
-        case BatchSpecWorkspaceState.CANCELING:
+        }
+        case BatchSpecWorkspaceState.CANCELING: {
             return (
                 <Tooltip content="The execution for this workspace is being canceled.">
                     <Icon
@@ -71,7 +79,8 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
                     />
                 </Tooltip>
             )
-        case BatchSpecWorkspaceState.FAILED:
+        }
+        case BatchSpecWorkspaceState.FAILED: {
             return (
                 <Tooltip content="The execution for this workspace failed.">
                     <Icon
@@ -81,7 +90,8 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
                     />
                 </Tooltip>
             )
-        case BatchSpecWorkspaceState.COMPLETED:
+        }
+        case BatchSpecWorkspaceState.COMPLETED: {
             if (cachedResultFound) {
                 return (
                     <Tooltip content="Cached result found for this workspace.">
@@ -102,5 +112,6 @@ export const WorkspaceStateIcon: React.FunctionComponent<React.PropsWithChildren
                     />
                 </Tooltip>
             )
+        }
     }
 }

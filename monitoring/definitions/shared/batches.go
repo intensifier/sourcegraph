@@ -166,3 +166,45 @@ func (batches) NewWorkspaceExecutionDBWorkerStoreGroup(containerName string) mon
 		},
 	})
 }
+
+// src_batches_httpapi_total
+// src_batches_httpapi_duration_seconds_bucket
+// src_batches_httpapi_errors_total
+func (batches) NewBatchesHTTPAPIGroup(containerName string) monitoring.Group {
+	return Observation.NewGroup(containerName, monitoring.ObservableOwnerBatches, ObservationGroupOptions{
+		GroupConstructorOptions: GroupConstructorOptions{
+			Namespace:       "batches",
+			DescriptionRoot: "HTTP API File Handler",
+			Hidden:          true,
+
+			ObservableConstructorOptions: ObservableConstructorOptions{
+				MetricNameRoot:        "batches_httpapi",
+				MetricDescriptionRoot: "http handler",
+				By:                    []string{"op"},
+			},
+		},
+
+		SharedObservationGroupOptions: SharedObservationGroupOptions{
+			Total:     NoAlertsOption("none"),
+			Duration:  NoAlertsOption("none"),
+			Errors:    NoAlertsOption("none"),
+			ErrorRate: NoAlertsOption("none"),
+		},
+		Aggregate: &SharedObservationGroupOptions{
+			Total:     NoAlertsOption("none"),
+			Duration:  NoAlertsOption("none"),
+			Errors:    NoAlertsOption("none"),
+			ErrorRate: NoAlertsOption("none"),
+		},
+	})
+}
+
+// NewExecutorQueueGroup creates a Executors.NewExecutorQueueGroup tailored for batches
+// workloads.
+func (batches) NewExecutorQueueGroup() monitoring.Group {
+	// queueContainerName is the set of potential sources of executor queue metrics,
+	// copied from CodeIntelligence.NewAutoindexingSummaryGroup
+	const queueContainerName = "(executor|sourcegraph-code-intel-indexers|executor-batches|frontend|sourcegraph-frontend|worker|sourcegraph-executors)"
+
+	return Executors.NewExecutorQueueGroup("batches", queueContainerName, "batches")
+}

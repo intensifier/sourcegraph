@@ -1,42 +1,53 @@
-import React, { useCallback, useMemo } from 'react'
+import React, { useCallback, useEffect, useMemo } from 'react'
 
-import { mdiAlertCircle, mdiAlert, mdiArrowLeftBold, mdiArrowRightBold } from '@mdi/js'
+import { mdiAlert, mdiAlertCircle, mdiArrowLeftBold, mdiArrowRightBold } from '@mdi/js'
 import classNames from 'classnames'
-import { RouteComponentProps } from 'react-router'
-import { Observable, of, timer } from 'rxjs'
-import { catchError, concatMap, delay, map, repeatWhen, takeWhile } from 'rxjs/operators'
-import { parse as _parseVersion, SemVer } from 'semver'
+import { of, timer, type Observable } from 'rxjs'
+import { catchError, concatMap, map, repeat, takeWhile } from 'rxjs/operators'
+import { parse as _parseVersion, type SemVer } from 'semver'
 
-import { ErrorAlert } from '@sourcegraph/branded/src/components/alerts'
-import { asError, ErrorLike, isErrorLike } from '@sourcegraph/common'
-import { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
-import { LoadingSpinner, useObservable, Alert, Icon, Code, H2, H3, Text, Tooltip } from '@sourcegraph/wildcard'
+import { Timestamp } from '@sourcegraph/branded/src/components/Timestamp'
+import { asError, isErrorLike, type ErrorLike } from '@sourcegraph/common'
+import type { TelemetryV2Props } from '@sourcegraph/shared/src/telemetry'
+import type { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import {
+    Alert,
+    Code,
+    Container,
+    ErrorAlert,
+    H3,
+    Icon,
+    LoadingSpinner,
+    PageHeader,
+    Text,
+    Tooltip,
+    useObservable,
+} from '@sourcegraph/wildcard'
 
 import { Collapsible } from '../components/Collapsible'
-import { FilteredConnection, FilteredConnectionFilter, Connection } from '../components/FilteredConnection'
+import { FilteredConnection, type Connection, type Filter } from '../components/FilteredConnection'
 import { PageTitle } from '../components/PageTitle'
-import { Timestamp } from '../components/time/Timestamp'
-import { OutOfBandMigrationFields } from '../graphql-operations'
+import type { OutOfBandMigrationFields } from '../graphql-operations'
 
 import {
-    fetchAllOutOfBandMigrations as defaultFetchAllMigrations,
+    fetchOutOfBandMigrations as defaultFetchMigrations,
     fetchSiteUpdateCheck as defaultFetchSiteUpdateCheck,
 } from './backend'
 
 import styles from './SiteAdminMigrationsPage.module.scss'
 
-export interface SiteAdminMigrationsPageProps extends RouteComponentProps<{}>, TelemetryProps {
-    fetchAllMigrations?: typeof defaultFetchAllMigrations
+export interface SiteAdminMigrationsPageProps extends TelemetryProps, TelemetryV2Props {
+    fetchMigrations?: typeof defaultFetchMigrations
     fetchSiteUpdateCheck?: () => Observable<{ productVersion: string }>
     now?: () => Date
 }
 
-const filters: FilteredConnectionFilter[] = [
+const filters: Filter[] = [
     {
         id: 'filters',
         label: 'Migration state',
         type: 'select',
-        values: [
+        options: [
             {
                 label: 'All',
                 value: 'all',
@@ -71,25 +82,29 @@ const DOWNGRADE_RANGE = 1
 export const SiteAdminMigrationsPage: React.FunctionComponent<
     React.PropsWithChildren<SiteAdminMigrationsPageProps>
 > = ({
-    fetchAllMigrations = defaultFetchAllMigrations,
+    fetchMigrations = defaultFetchMigrations,
     fetchSiteUpdateCheck = defaultFetchSiteUpdateCheck,
     now,
-    telemetryService,
-    ...props
+    telemetryRecorder,
 }) => {
+    useEffect(() => {
+        telemetryRecorder.recordEvent('admin.migrations', 'view')
+    }, [telemetryRecorder])
+
     const migrationsOrError = useObservable(
         useMemo(
             () =>
                 timer(0, REFRESH_INTERVAL_MS, undefined).pipe(
                     concatMap(() =>
-                        fetchAllMigrations().pipe(
+                        // Exclude ExcludeDeprecatedBeforeFirstVersion: true
+                        fetchMigrations(true).pipe(
                             catchError((error): [ErrorLike] => [asError(error)]),
-                            repeatWhen(observable => observable.pipe(delay(REFRESH_INTERVAL_MS)))
+                            repeat({ delay: REFRESH_INTERVAL_MS })
                         )
                     ),
                     takeWhile(() => true, true)
                 ),
-            [fetchAllMigrations]
+            [fetchMigrations]
         )
     )
 
@@ -127,30 +142,35 @@ export const SiteAdminMigrationsPage: React.FunctionComponent<
             ) : (
                 <>
                     <PageTitle title="Out of band migrations - Admin" />
-                    <H2>Out-of-band migrations</H2>
-
-                    <Text>
-                        Out-of-band migrations run in the background of the Sourcegraph instance convert data from an
-                        old format into a new format. Consult this page prior to upgrading your Sourcegraph instance to
-                        ensure that all expected migrations have completed.
-                    </Text>
+                    <PageHeader
+                        path={[{ text: 'Out-of-band migrations' }]}
+                        headingElement="h2"
+                        description={
+                            <>
+                                Out-of-band migrations run in the background of the Sourcegraph instance convert data
+                                from an old format into a new format. Consult this page prior to upgrading your
+                                Sourcegraph instance to ensure that all expected migrations have completed.
+                            </>
+                        }
+                        className="mb-3"
+                    />
 
                     <MigrationBanners migrations={migrationsOrError} fetchSiteUpdateCheck={fetchSiteUpdateCheck} />
 
-                    <div className="list-group">
+                    <Container className="mb-3">
                         <FilteredConnection<OutOfBandMigrationFields, Omit<MigrationNodeProps, 'node'>>
+                            className="mb-0"
                             listComponent="div"
-                            listClassName={classNames('mb-3', styles.migrationsGrid)}
+                            listClassName={classNames('list-group mb-3', styles.migrationsGrid)}
                             noun="migration"
                             pluralNoun="migrations"
                             queryConnection={queryMigrations}
                             nodeComponent={MigrationNode}
                             nodeComponentProps={{ now }}
-                            history={props.history}
-                            location={props.location}
                             filters={filters}
+                            autoFocus={false}
                         />
-                    </div>
+                    </Container>
                 </>
             )}
         </div>
@@ -167,16 +187,23 @@ const MigrationBanners: React.FunctionComponent<React.PropsWithChildren<Migratio
     fetchSiteUpdateCheck = defaultFetchSiteUpdateCheck,
 }) => {
     const productVersion = useObservable(
-        useMemo(() => fetchSiteUpdateCheck().pipe(map(site => parseVersion(site.productVersion))), [
-            fetchSiteUpdateCheck,
-        ])
+        useMemo(
+            () => fetchSiteUpdateCheck().pipe(map(site => parseVersion(site.productVersion))),
+            [fetchSiteUpdateCheck]
+        )
     )
     if (!productVersion) {
         return <></>
     }
 
-    const nextVersion = parseVersion(`${productVersion.major}.${productVersion.minor + UPGRADE_RANGE}.0`)
-    const previousVersion = parseVersion(`${productVersion.major}.${productVersion.minor - DOWNGRADE_RANGE}.0`)
+    const nextVersion =
+        productVersion.major === 3 && productVersion.minor === 43
+            ? parseVersion('4.0.0')
+            : parseVersion(`${productVersion.major}.${productVersion.minor + UPGRADE_RANGE}.0`)
+    const previousVersion =
+        productVersion.major === 4 && productVersion.minor === 0
+            ? parseVersion('3.43.0')
+            : parseVersion(`${productVersion.major}.${productVersion.minor - DOWNGRADE_RANGE}.0`)
 
     const invalidMigrations = migrationsInvalidForVersion(migrations, productVersion)
     const invalidMigrationsAfterUpgrade = migrationsInvalidForVersion(migrations, nextVersion)
@@ -400,6 +427,10 @@ export const isInvalidForVersion = (migration: OutOfBandMigrationFields, version
         // Migrations only store major/minor version components
         const deprecated = parseVersion(`${migration.deprecated}.0`)
         if (deprecated && version.major === deprecated.major && version.minor >= deprecated.minor) {
+            return migration.progress !== 1
+        }
+
+        if (deprecated && version.major > deprecated.major) {
             return migration.progress !== 1
         }
     }

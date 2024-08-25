@@ -1,10 +1,10 @@
 import React from 'react'
 
+import { UserAvatar } from '@sourcegraph/shared/src/components/UserAvatar'
 import { H3, Tooltip } from '@sourcegraph/wildcard'
 
-import { VisibleChangesetApplyPreviewFields } from '../../../../graphql-operations'
+import type { VisibleChangesetApplyPreviewFields } from '../../../../graphql-operations'
 import { formatPersonName, PersonLink } from '../../../../person/PersonLink'
-import { UserAvatar } from '../../../../user/UserAvatar'
 
 import styles from './GitBranchChangesetDescriptionInfo.module.scss'
 
@@ -45,7 +45,9 @@ export const GitBranchChangesetDescriptionInfo: React.FunctionComponent<React.Pr
                         >
                             <div className="d-flex flex-column align-items-center mr-3">
                                 <Tooltip content={formatPersonName(previousCommit.author)}>
-                                    <UserAvatar inline={true} className="mb-1" user={previousCommit.author} />
+                                    <span>
+                                        <UserAvatar inline={true} className="mb-1" user={previousCommit.author} />
+                                    </span>
                                 </Tooltip>{' '}
                                 <PersonLink person={previousCommit.author} className="font-weight-bold text-nowrap" />
                             </div>
@@ -64,7 +66,9 @@ export const GitBranchChangesetDescriptionInfo: React.FunctionComponent<React.Pr
                 )}
             <div className="d-flex flex-column align-items-center mr-3">
                 <Tooltip content={formatPersonName(commit.author)}>
-                    <UserAvatar inline={true} className="mb-1" user={commit.author} />
+                    <span>
+                        <UserAvatar inline={true} className="mb-1" user={commit.author} />
+                    </span>
                 </Tooltip>{' '}
                 <PersonLink person={commit.author} className="font-weight-bold text-nowrap" />
             </div>

@@ -1,30 +1,27 @@
-import React, { useMemo } from 'react'
+import { type FC, useMemo } from 'react'
 
 import { mdiStar, mdiStarOutline } from '@mdi/js'
 import classNames from 'classnames'
-import * as H from 'history'
 
+import { Timestamp } from '@sourcegraph/branded/src/components/Timestamp'
 import { renderMarkdown, pluralize } from '@sourcegraph/common'
-import { IMarkdownBlock, NotebookBlock } from '@sourcegraph/shared/src/schema'
 import { Link, Badge, Icon } from '@sourcegraph/wildcard'
 
-import { Timestamp } from '../../components/time/Timestamp'
-import { NotebookFields } from '../../graphql-operations'
+import type { NotebookFields } from '../../graphql-operations'
 import { PageRoutes } from '../../routes.constants'
 
 import styles from './NotebookNode.module.scss'
 
 export interface NotebookNodeProps {
     node: NotebookFields
-    location: H.Location
-    history: H.History
 }
 
 // Find the first Markdown block in the notebook, and use the first line in the block
 // as the notebook description.
-function getNotebookDescription(blocks: NotebookBlock[]): string {
-    const firstMarkdownBlock = blocks.find<IMarkdownBlock>(
-        (block): block is IMarkdownBlock => block.__typename === 'MarkdownBlock'
+function getNotebookDescription(blocks: NotebookFields['blocks']): string {
+    const firstMarkdownBlock = blocks.find(
+        (block): block is Extract<NotebookFields['blocks'][number], { __typename: 'MarkdownBlock' }> =>
+            block.__typename === 'MarkdownBlock'
     )
     if (!firstMarkdownBlock) {
         return ''
@@ -33,10 +30,9 @@ function getNotebookDescription(blocks: NotebookBlock[]): string {
     return renderedPlainTextMarkdown.split('\n')[0]
 }
 
-export const NotebookNode: React.FunctionComponent<React.PropsWithChildren<NotebookNodeProps>> = ({
-    node,
-}: NotebookNodeProps) => {
+export const NotebookNode: FC<NotebookNodeProps> = ({ node }: NotebookNodeProps) => {
     const description = useMemo(() => getNotebookDescription(node.blocks), [node.blocks])
+
     return (
         <li className={classNames('py-3', styles.notebookNode)}>
             <div className="d-flex align-items-center">

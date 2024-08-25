@@ -3,7 +3,7 @@ import React, { useEffect, useState } from 'react'
 import { VSCodeButton } from '@vscode/webview-ui-toolkit/react'
 import classNames from 'classnames'
 
-import { Text } from '@sourcegraph/wildcard'
+import { Button, Text } from '@sourcegraph/wildcard'
 
 import { version } from '../../../../package.json'
 import {
@@ -14,7 +14,7 @@ import {
     VSCE_SG_LOGOMARK_LIGHT,
     VSCE_LINK_SIGNUP,
 } from '../../../common/links'
-import { WebviewPageProps } from '../../platform/context'
+import type { WebviewPageProps } from '../../platform/context'
 import { AuthSidebarView } from '../auth/AuthSidebarView'
 
 import styles from './HelpSidebarView.module.scss'
@@ -38,11 +38,10 @@ export const HelpSidebarView: React.FunctionComponent<React.PropsWithChildren<He
         if (isLightTheme === undefined) {
             extensionCoreAPI.getEditorTheme
                 .then(theme => {
-                    console.log(theme)
                     setIsLightTheme(theme === 'Light')
                 })
                 .catch(error => {
-                    console.log(error)
+                    console.error(error)
                     setIsLightTheme(false)
                 })
         }
@@ -53,48 +52,55 @@ export const HelpSidebarView: React.FunctionComponent<React.PropsWithChildren<He
         await extensionCoreAPI.openLink(url)
     }
 
+    const onLogoutClick = async (): Promise<void> => {
+        if (authenticatedUser) {
+            await extensionCoreAPI.removeAccessToken()
+        }
+    }
+
     return (
         <div className={classNames(styles.sidebarContainer)}>
-            <VSCodeButton
+            <Button
+                as={VSCodeButton}
                 onClick={() => onHelpItemClick(VSCE_LINK_FEEDBACK, 'Feedback')}
-                className="btn btn-text text-left p-0 m-0"
+                className={classNames('p-0 m-0', styles.sidebarViewButton)}
             >
-                <i className="codicon codicon-github" slot="start" />
                 Give feedback
-            </VSCodeButton>
-            <VSCodeButton
+            </Button>
+            <Button
+                as={VSCodeButton}
                 onClick={() => onHelpItemClick(VSCE_LINK_ISSUES, 'Issues')}
-                className="btn btn-text text-left p-0 m-0"
+                className={classNames('p-0 m-0', styles.sidebarViewButton)}
             >
-                <i className="codicon codicon-bug" slot="start" />
-                Report issue
-            </VSCodeButton>
-            <VSCodeButton
+                Report an issue
+            </Button>
+            <Button
+                as={VSCodeButton}
                 onClick={() => onHelpItemClick(VSCE_LINK_TROUBLESHOOT, 'Troubleshoot')}
-                className="btn btn-text text-left p-0 m-0"
+                className={classNames('p-0 m-0', styles.sidebarViewButton)}
             >
-                <i className="codicon codicon-notebook" slot="start" />
                 Troubleshooting docs
-            </VSCodeButton>
-            <VSCodeButton
+            </Button>
+            <Button
+                as={VSCodeButton}
                 onClick={() => onHelpItemClick(VSCE_LINK_SIGNUP, 'Authenticate')}
-                className="btn btn-text text-left p-0 m-0"
+                className={classNames('p-0 m-0', styles.sidebarViewButton)}
             >
                 <img
                     alt="sg-logo"
-                    className={classNames(styles.icon, 'codicon')}
+                    className={styles.icon}
                     slot="start"
                     src={isLightTheme ? VSCE_SG_LOGOMARK_DARK : VSCE_SG_LOGOMARK_LIGHT}
                 />
-                Create an account
-            </VSCodeButton>
-            <VSCodeButton
+                Create new account
+            </Button>
+            <Button
+                as={VSCodeButton}
                 onClick={() => setOpenAuthPanel(previousOpenAuthPanel => !previousOpenAuthPanel)}
-                className="btn btn-text text-left p-0 m-0"
+                className={classNames('p-0 m-0', styles.sidebarViewButton)}
             >
-                <i className="codicon codicon-account" slot="start" />
                 {authenticatedUser ? `User: ${authenticatedUser.username}` : 'Authenticate account'}
-            </VSCodeButton>
+            </Button>
             {openAuthPanel && (
                 <div className="ml-3 mt-1">
                     {!authenticatedUser ? (
@@ -105,14 +111,26 @@ export const HelpSidebarView: React.FunctionComponent<React.PropsWithChildren<He
                             authenticatedUser={authenticatedUser}
                         />
                     ) : (
-                        <Text className="ml-2">Connected to {new URL(instanceURL).hostname}</Text>
+                        <div className="mt-1">
+                            <Text className="ml-2 small">
+                                Click button below to sign out of {new URL(instanceURL).hostname}. VS Code will be
+                                reloaded upon sign out.
+                            </Text>
+                            <Button
+                                variant="primary"
+                                size="sm"
+                                className="font-weight-normal w-100 my-1 border-0 small"
+                                onClick={() => onLogoutClick()}
+                            >
+                                Sign out
+                            </Button>
+                        </div>
                     )}
                 </div>
             )}
-            <VSCodeButton className="btn btn-text text-left p-0 m-0">
-                <i className="codicon codicon-calendar" slot="start" />
+            <Button as={VSCodeButton} className={classNames('p-0 m-0', styles.sidebarViewButton)}>
                 Version v{version}
-            </VSCodeButton>
+            </Button>
         </div>
     )
 }

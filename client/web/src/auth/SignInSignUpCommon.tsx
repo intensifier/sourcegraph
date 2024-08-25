@@ -1,12 +1,13 @@
 import * as React from 'react'
 
-import * as H from 'history'
+import type * as H from 'history'
 
-import { Input, InputProps } from '@sourcegraph/wildcard'
+import { Input, type InputProps } from '@sourcegraph/wildcard'
 
+import { PageRoutes } from '../routes.constants'
 import { USERNAME_MAX_LENGTH, VALID_USERNAME_REGEXP } from '../user'
 
-interface CommonInputProps extends InputProps {
+interface CommonInputProps extends InputProps, React.InputHTMLAttributes<HTMLInputElement> {
     inputRef?: React.Ref<HTMLInputElement>
 }
 
@@ -69,31 +70,14 @@ export const UsernameInput: React.FunctionComponent<React.PropsWithChildren<Comm
  *
  * 🚨 SECURITY: We must disallow open redirects (to arbitrary hosts).
  */
-export function getReturnTo(location: H.Location): string {
+export function getReturnTo(location: H.Location, defaultReturnTo: string = PageRoutes.Search): string {
     const searchParameters = new URLSearchParams(location.search)
-    const returnTo = searchParameters.get('returnTo') || '/search'
-    const newURL = new URL(returnTo, window.location.href)
+    const returnTo = searchParameters.get('returnTo') || defaultReturnTo
 
-    newURL.searchParams.append('toast', 'integrations')
-    return newURL.pathname + newURL.search + newURL.hash
-}
-
-export function maybeAddPostSignUpRedirect(url?: string): string {
-    const enablePostSignupFlow = window.context?.experimentalFeatures?.enablePostSignupFlow
-    const isDotCom = window.context?.sourcegraphDotComMode
-    const shouldAddRedirect = isDotCom && enablePostSignupFlow
-
-    if (url) {
-        if (shouldAddRedirect) {
-            // second param to protect against relative urls
-            const urlObject = new URL(url, window.location.href)
-
-            urlObject.searchParams.append('redirect', '/welcome')
-            return urlObject.toString()
-        }
-
-        return url
+    // 🚨 SECURITY: check newURL scheme http or https or relative
+    if (returnTo.startsWith('http:') || returnTo.startsWith('https:') || returnTo.startsWith('/')) {
+        const newURL = new URL(returnTo, window.location.href)
+        return newURL.pathname + newURL.search + newURL.hash
     }
-
-    return shouldAddRedirect ? '/welcome' : ''
+    return defaultReturnTo
 }

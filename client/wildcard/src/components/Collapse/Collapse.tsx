@@ -1,10 +1,10 @@
-import React, { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import React, { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 
 import classNames from 'classnames'
 import { noop } from 'lodash'
 import FocusLock from 'react-focus-lock'
 
-import { ForwardReferenceComponent } from '../..'
+import type { ForwardReferenceComponent } from '../..'
 
 import styles from './Collapse.module.scss'
 
@@ -13,7 +13,9 @@ type CollapseControlledProps =
     | { isOpen: boolean; onOpenChange: (opened: boolean) => void; openByDefault?: boolean }
 
 interface CollapseCommonProps {
-    children: React.FunctionComponent<React.PropsWithChildren<{ isOpen?: boolean }>> | ReactNode
+    children:
+        | React.FunctionComponent<React.PropsWithChildren<{ isOpen?: boolean; setOpen: (open: boolean) => void }>>
+        | ReactNode
 }
 
 export type CollapseProps = CollapseControlledProps & CollapseCommonProps
@@ -35,7 +37,6 @@ export const Collapse: React.FunctionComponent<CollapseProps> = React.memo(funct
     const isControlled = isOpen !== undefined
     const isCollapseOpen = isControlled ? isOpen : isInternalOpen
     const ChildrenComponent = typeof children === 'function' && children
-    const collapseContent = ChildrenComponent ? <ChildrenComponent isOpen={isCollapseOpen} /> : children
 
     const setOpen = useCallback(
         (opened: boolean) => {
@@ -57,7 +58,11 @@ export const Collapse: React.FunctionComponent<CollapseProps> = React.memo(funct
         [isCollapseOpen, setOpen]
     )
 
-    return <CollapseContext.Provider value={context}>{collapseContent}</CollapseContext.Provider>
+    return (
+        <CollapseContext.Provider value={context}>
+            {ChildrenComponent ? <ChildrenComponent isOpen={isCollapseOpen} setOpen={setOpen} /> : children}
+        </CollapseContext.Provider>
+    )
 })
 
 interface CollapseHeaderProps extends React.HTMLAttributes<HTMLButtonElement> {
@@ -110,11 +115,22 @@ export const CollapseHeader = React.forwardRef(function CollapseHeader(props, re
     )
 }) as ForwardReferenceComponent<'button', CollapseHeaderProps>
 
-export const CollapsePanel = React.forwardRef(function CollapsePanel(
-    { children, className, as: Component = 'div', ...attributes },
-    reference
-) {
+interface CollapsePanelProps {
+    forcedRender?: boolean
+}
+
+export const CollapsePanel = React.forwardRef(function CollapsePanel(props, reference) {
+    const { forcedRender = true, children, className, as: Component = 'div', ...attributes } = props
     const { isOpen } = useContext(CollapseContext)
+
+    // When we enforce rendering we always render a DOM element and hide it with
+    // display: none CSS rule, on other cases when we explicitly say forcedRender={false}
+    // we render/not render DOM element based on isOpen state
+    const shouldRender = forcedRender ? true : isOpen
+
+    if (!shouldRender) {
+        return null
+    }
 
     return (
         <Component
@@ -125,4 +141,4 @@ export const CollapsePanel = React.forwardRef(function CollapsePanel(
             {children}
         </Component>
     )
-}) as ForwardReferenceComponent<'div'>
+}) as ForwardReferenceComponent<'div', CollapsePanelProps>

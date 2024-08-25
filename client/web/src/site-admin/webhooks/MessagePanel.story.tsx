@@ -1,20 +1,15 @@
-import { number } from '@storybook/addon-knobs'
-import { DecoratorFn, Meta, Story } from '@storybook/react'
+import type { Decorator, Meta, StoryFn } from '@storybook/react'
 
 import { WebStory } from '../../components/WebStory'
 
 import { MessagePanel } from './MessagePanel'
 import { BODY_JSON, BODY_PLAIN, HEADERS_JSON, HEADERS_PLAIN } from './story/fixtures'
 
-const decorator: DecoratorFn = story => <div className="p-3 container">{story()}</div>
+const decorator: Decorator = story => <div className="p-3 container">{story()}</div>
 const config: Meta = {
     title: 'web/site-admin/webhooks/MessagePanel',
     decorators: [decorator],
-    parameters: {
-        chromatic: {
-            viewports: [576, 1440],
-        },
-    },
+    parameters: {},
 }
 
 export default config
@@ -24,7 +19,7 @@ const messagePanelObject = {
     plain: { headers: HEADERS_PLAIN, body: BODY_PLAIN },
 }
 
-export const JSONRequest: Story = () => (
+export const JSONRequest: StoryFn = () => (
     <WebStory>
         {() => (
             <MessagePanel
@@ -44,7 +39,7 @@ export const JSONRequest: Story = () => (
 
 JSONRequest.storyName = 'JSON request'
 
-export const JSONResponse: Story = () => (
+export const JSONResponse: StoryFn = args => (
     <WebStory>
         {() => (
             <MessagePanel
@@ -52,18 +47,23 @@ export const JSONResponse: Story = () => (
                     headers: messagePanelObject.JSON.headers,
                     body: messagePanelObject.JSON.body,
                 }}
-                requestOrStatusCode={number('status code', 200, {
-                    min: 100,
-                    max: 599,
-                })}
+                requestOrStatusCode={args.requestOrStatusCode}
             />
         )}
     </WebStory>
 )
+JSONResponse.argTypes = {
+    requestOrStatusCode: {
+        control: { type: 'number', min: 100, max: 599 },
+    },
+}
+JSONResponse.args = {
+    requestOrStatusCode: 200,
+}
 
 JSONResponse.storyName = 'JSON response'
 
-export const PlainRequest: Story = () => (
+export const PlainRequest: StoryFn = () => (
     <WebStory>
         {() => (
             <MessagePanel
@@ -83,7 +83,7 @@ export const PlainRequest: Story = () => (
 
 PlainRequest.storyName = 'plain request'
 
-export const PlainResponse: Story = () => (
+export const PlainResponse: StoryFn = args => (
     <WebStory>
         {() => (
             <MessagePanel
@@ -91,13 +91,18 @@ export const PlainResponse: Story = () => (
                     headers: messagePanelObject.plain.headers,
                     body: messagePanelObject.plain.body,
                 }}
-                requestOrStatusCode={number('status code', 200, {
-                    min: 100,
-                    max: 599,
-                })}
+                requestOrStatusCode={args.requestOrStatusCode}
             />
         )}
     </WebStory>
 )
+PlainResponse.argTypes = {
+    requestOrStatusCode: {
+        control: { type: 'number', min: 100, max: 599 },
+    },
+}
+PlainResponse.args = {
+    requestOrStatusCode: 200,
+}
 
 PlainResponse.storyName = 'plain response'

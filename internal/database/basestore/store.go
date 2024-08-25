@@ -23,22 +23,22 @@ import (
 // return a modified base store with no methods from the outer layer. All other methods
 // of the base store are available on the outer layer without needing to be re-defined.
 //
-//     type SprocketStore struct {
-//         *basestore.Store
-//     }
+//	type SprocketStore struct {
+//	    *basestore.Store
+//	}
 //
-//     func NewWithDB(database dbutil.DB) *SprocketStore {
-//         return &SprocketStore{Store: basestore.NewWithDB(database, sql.TxOptions{})}
-//     }
+//	func NewWithDB(database dbutil.DB) *SprocketStore {
+//	    return &SprocketStore{Store: basestore.NewWithDB(database, sql.TxOptions{})}
+//	}
 //
-//     func (s *SprocketStore) With(other basestore.ShareableStore) *SprocketStore {
-//         return &SprocketStore{Store: s.Store.With(other)}
-//     }
+//	func (s *SprocketStore) With(other basestore.ShareableStore) *SprocketStore {
+//	    return &SprocketStore{Store: s.Store.With(other)}
+//	}
 //
-//     func (s *SprocketStore) Transact(ctx context.Context) (*SprocketStore, error) {
-//         txBase, err := s.Store.Transact(ctx)
-//         return &SprocketStore{Store: txBase}, err
-//     }
+//	func (s *SprocketStore) Transact(ctx context.Context) (*SprocketStore, error) {
+//	    txBase, err := s.Store.Transact(ctx)
+//	    return &SprocketStore{Store: txBase}, err
+//	}
 type Store struct {
 	handle TransactableHandle
 }
@@ -67,12 +67,12 @@ func (s *Store) Handle() TransactableHandle {
 // This method should be used when two distinct store instances need to perform an
 // operation within the same shared transaction.
 //
-//     txn1 := store1.Transact(ctx) // Creates a transaction
-//     txn2 := store2.With(txn1)    // References the same transaction
+//	txn1 := store1.Transact(ctx) // Creates a transaction
+//	txn2 := store2.With(txn1)    // References the same transaction
 //
-//     txn1.A(ctx) // Occurs within shared transaction
-//     txn2.B(ctx) // Occurs within shared transaction
-//     txn1.Done() // closes shared transaction
+//	txn1.A(ctx) // Occurs within shared transaction
+//	txn2.B(ctx) // Occurs within shared transaction
+//	txn1.Done() // closes shared transaction
 //
 // Note that once a handle is shared between two stores, committing or rolling back
 // a transaction will affect the handle of both stores. Most notably, two stores that
@@ -133,6 +133,39 @@ func (s *Store) Transact(ctx context.Context) (*Store, error) {
 	}
 
 	return &Store{handle: handle}, nil
+}
+
+var ErrPanicDuringTransaction = errors.New("encountered panic during transaction")
+
+// WithTransact executes the callback using a transaction on the store. If the callback
+// returns an error or panics, the transaction will be rolled back.
+func (s *Store) WithTransact(ctx context.Context, f func(tx *Store) error) error {
+	return InTransaction[*Store](ctx, s, f)
+}
+
+// InTransaction executes the callback using a transaction on the given transactable store. If
+// the callback returns an error or panics, the transaction will be rolled back.
+func InTransaction[T Transactable[T]](ctx context.Context, t Transactable[T], f func(tx T) error) (err error) {
+	tx, err := t.Transact(ctx)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			// If we're panicking, roll back the transaction
+			// even when err is nil.
+			err = tx.Done(ErrPanicDuringTransaction)
+			// Re-throw the panic after rolling back the transaction
+			panic(r)
+		} else {
+			// If we're not panicking, roll back the transaction if the
+			// operation on the transaction failed for whatever reason.
+			err = tx.Done(err)
+		}
+	}()
+
+	return f(tx)
 }
 
 // Done performs a commit or rollback of the underlying transaction/savepoint depending

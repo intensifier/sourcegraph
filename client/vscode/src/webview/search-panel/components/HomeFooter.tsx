@@ -2,20 +2,21 @@ import React, { useCallback } from 'react'
 
 import classNames from 'classnames'
 
-import { QueryState } from '@sourcegraph/search'
-import { SyntaxHighlightedSearchQuery } from '@sourcegraph/search-ui'
-import { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
-import { ThemeProps } from '@sourcegraph/shared/src/theme'
+import { SyntaxHighlightedSearchQuery } from '@sourcegraph/branded'
+import type { QueryState } from '@sourcegraph/shared/src/search'
+import type { TelemetryProps } from '@sourcegraph/shared/src/telemetry/telemetryService'
+import { Card, Text } from '@sourcegraph/wildcard'
 
 import { ModalVideo } from '../alias/ModalVideo'
 
-import { SearchExample, exampleQueries } from './SearchExamples'
+import { type SearchExample, exampleQueries } from './SearchExamples'
 
 import styles from './HomeFooter.module.scss'
 
-export interface HomeFooterProps extends TelemetryProps, ThemeProps {
+export interface HomeFooterProps extends TelemetryProps {
     setQuery: (newState: QueryState) => void
 }
+
 interface SearchExamplesProps extends TelemetryProps {
     title: string
     subtitle: string
@@ -48,9 +49,9 @@ const SearchExamples: React.FunctionComponent<React.PropsWithChildren<SearchExam
             <div className={styles.searchExamples}>
                 {examples.map(example => (
                     <div key={example.queryPreview} className="search-example-card-wrapper">
-                        <button
-                            type="button"
-                            className={classNames('card p-0 w-100', styles.searchExampleCard)}
+                        <Card
+                            as="button"
+                            className={classNames('p-0 w-100', styles.searchExampleCard)}
                             onClick={searchExampleClicked(example.trackEventName, example.fullQuery)}
                         >
                             <div className={classNames('search-example-example-icons', styles.searchExampleIcon)}>
@@ -61,8 +62,8 @@ const SearchExamples: React.FunctionComponent<React.PropsWithChildren<SearchExam
                                     <SyntaxHighlightedSearchQuery query={example.queryPreview} />
                                 </div>
                             </div>
-                        </button>
-                        <p className={styles.searchExampleLabel}>{example.label}</p>
+                        </Card>
+                        <Text className={styles.searchExampleLabel}>{example.label}</Text>
                     </div>
                 ))}
             </div>

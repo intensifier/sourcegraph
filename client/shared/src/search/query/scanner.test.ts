@@ -1,3 +1,5 @@
+import { describe, expect, test } from 'vitest'
+
 import { SearchPatternType } from '../../graphql-operations'
 
 import { scanSearchQuery, scanBalancedLiteral, toPatternResult } from './scanner'
@@ -6,6 +8,32 @@ import { PatternKind } from './token'
 expect.addSnapshotSerializer({
     serialize: value => JSON.stringify(value),
     test: () => true,
+})
+
+describe('keyword()', () => {
+    test('double quoted patterns are interpreted as literal', () => {
+        expect(scanSearchQuery('"foo and bar"', false, SearchPatternType.keyword)).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":13},"kind":1,"value":"foo and bar","delimited":true,"delimiter":"\\""}]}'
+        )
+    })
+
+    test('single quoted patterns are interpreted as literal', () => {
+        expect(scanSearchQuery("'foo or bar'", false, SearchPatternType.keyword)).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":12},"kind":1,"value":"foo or bar","delimited":true,"delimiter":"\'"}]}'
+        )
+    })
+
+    test('recognize keywords outside quoted patterns', () => {
+        expect(scanSearchQuery('"foo or bar" or bas', false, SearchPatternType.keyword)).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":12},"kind":1,"value":"foo or bar","delimited":true,"delimiter":"\\""},{"type":"whitespace","range":{"start":12,"end":13}},{"type":"keyword","value":"or","range":{"start":13,"end":15},"kind":"or"},{"type":"whitespace","range":{"start":15,"end":16}},{"type":"pattern","range":{"start":16,"end":19},"kind":1,"value":"bas","delimited":false}]}'
+        )
+    })
+
+    test('scan literal and regexp patterns', () => {
+        expect(scanSearchQuery('pfalz /mosel/', false, SearchPatternType.keyword)).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":5},"kind":1,"value":"pfalz","delimited":false},{"type":"whitespace","range":{"start":5,"end":6}},{"type":"pattern","range":{"start":6,"end":13},"kind":2,"value":"mosel","delimited":true,"delimiter":"/"}]}'
+        )
+    })
 })
 
 describe('scanBalancedPattern()', () => {
@@ -108,7 +136,7 @@ describe('scanSearchQuery() for literal search', () => {
 
     test('filter with quoted value', () => {
         expect(scanSearchQuery('f:"b"')).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":5},"field":{"type":"literal","value":"f","range":{"start":0,"end":1}},"value":{"type":"literal","value":"b","range":{"start":2,"end":5},"quoted":true},"negated":false}]}'
+            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":5},"field":{"type":"literal","value":"f","range":{"start":0,"end":1}},"value":{"type":"literal","value":"b","range":{"start":2,"end":5},"quoted":true,"quotes":"\\""},"negated":false}]}'
         )
     })
 
@@ -131,7 +159,7 @@ describe('scanSearchQuery() for literal search', () => {
 
     test('quoted, double quotes, regexp', () =>
         expect(scanSearchQuery('"a:b"', false, SearchPatternType.regexp)).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"literal","value":"a:b","range":{"start":0,"end":5},"quoted":true}]}'
+            '{"type":"success","term":[{"type":"literal","value":"a:b","range":{"start":0,"end":5},"quoted":true,"quotes":"\\""}]}'
         ))
 
     test('quoted, single quotes, literal', () =>
@@ -141,7 +169,7 @@ describe('scanSearchQuery() for literal search', () => {
 
     test('quoted, single quotes, regexp', () =>
         expect(scanSearchQuery("'a:b'", false, SearchPatternType.regexp)).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"literal","value":"a:b","range":{"start":0,"end":5},"quoted":true}]}'
+            '{"type":"success","term":[{"type":"literal","value":"a:b","range":{"start":0,"end":5},"quoted":true,"quotes":"\'"}]}'
         ))
 
     test('quoted (do not escape quotes in literal mode)', () =>
@@ -151,7 +179,7 @@ describe('scanSearchQuery() for literal search', () => {
 
     test('quoted (escape quotes in regex mode)', () =>
         expect(scanSearchQuery('"-\\"a\\":b"', false, SearchPatternType.regexp)).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"literal","value":"-\\\\\\"a\\\\\\":b","range":{"start":0,"end":10},"quoted":true}]}'
+            '{"type":"success","term":[{"type":"literal","value":"-\\\\\\"a\\\\\\":b","range":{"start":0,"end":10},"quoted":true,"quotes":"\\""}]}'
         ))
 
     test('complex query', () =>
@@ -197,7 +225,7 @@ describe('scanSearchQuery() for regexp', () => {
 
     test('interpret regexp slash quotes', () => {
         expect(scanSearchQuery('r:a /a regexp \\ pattern/', false, SearchPatternType.regexp)).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":3},"field":{"type":"literal","value":"r","range":{"start":0,"end":1}},"value":{"type":"literal","value":"a","range":{"start":2,"end":3},"quoted":false},"negated":false},{"type":"whitespace","range":{"start":3,"end":4}},{"type":"literal","value":"a regexp \\\\ pattern","range":{"start":4,"end":24},"quoted":true}]}'
+            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":3},"field":{"type":"literal","value":"r","range":{"start":0,"end":1}},"value":{"type":"literal","value":"a","range":{"start":2,"end":3},"quoted":false},"negated":false},{"type":"whitespace","range":{"start":3,"end":4}},{"type":"literal","value":"a regexp \\\\ pattern","range":{"start":4,"end":24},"quoted":true,"quotes":"/"}]}'
         )
     })
 })
@@ -205,7 +233,7 @@ describe('scanSearchQuery() for regexp', () => {
 describe('scanSearchQuery() for standard', () => {
     test('scan literal and regexp patterns', () => {
         expect(scanSearchQuery('pfalz /mosel/', false, SearchPatternType.standard)).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":5},"kind":1,"value":"pfalz","delimited":false},{"type":"whitespace","range":{"start":5,"end":6}},{"type":"pattern","range":{"start":6,"end":13},"kind":2,"value":"mosel","delimited":true}]}'
+            '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":5},"kind":1,"value":"pfalz","delimited":false},{"type":"whitespace","range":{"start":5,"end":6}},{"type":"pattern","range":{"start":6,"end":13},"kind":2,"value":"mosel","delimited":true,"delimiter":"/"}]}'
         )
     })
 })
@@ -230,32 +258,32 @@ thing`
 
 describe('scanSearchQuery() with predicate', () => {
     test('recognize predicate', () => {
-        expect(scanSearchQuery('repo:contains(file:README.md)')).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":29},"field":{"type":"literal","value":"repo","range":{"start":0,"end":4}},"value":{"type":"literal","value":"contains(file:README.md)","range":{"start":5,"end":29},"quoted":false},"negated":false}]}'
+        expect(scanSearchQuery('repo:contains.file(path:README.md)')).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":34},"field":{"type":"literal","value":"repo","range":{"start":0,"end":4}},"value":{"type":"literal","value":"contains.file(path:README.md)","range":{"start":5,"end":34},"quoted":false},"negated":false}]}'
         )
     })
 
     test('recognize multiple predicates over whitespace', () => {
-        expect(scanSearchQuery('repo:contains(file:README.md)\n\nrepo:contains.file(foo)')).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":29},"field":{"type":"literal","value":"repo","range":{"start":0,"end":4}},"value":{"type":"literal","value":"contains(file:README.md)","range":{"start":5,"end":29},"quoted":false},"negated":false},{"type":"whitespace","range":{"start":29,"end":31}},{"type":"filter","range":{"start":31,"end":54},"field":{"type":"literal","value":"repo","range":{"start":31,"end":35}},"value":{"type":"literal","value":"contains.file(foo)","range":{"start":36,"end":54},"quoted":false},"negated":false}]}'
+        expect(scanSearchQuery('repo:contains.file(path:README.md)\n\nrepo:contains.path(foo)')).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":34},"field":{"type":"literal","value":"repo","range":{"start":0,"end":4}},"value":{"type":"literal","value":"contains.file(path:README.md)","range":{"start":5,"end":34},"quoted":false},"negated":false},{"type":"whitespace","range":{"start":34,"end":36}},{"type":"filter","range":{"start":36,"end":59},"field":{"type":"literal","value":"repo","range":{"start":36,"end":40}},"value":{"type":"literal","value":"contains.path(foo)","range":{"start":41,"end":59},"quoted":false},"negated":false}]}'
         )
     })
 
     test('recognize parenthesized predicate', () => {
-        expect(scanSearchQuery('(repo:contains(file:bar))')).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"openingParen","range":{"start":0,"end":1}},{"type":"filter","range":{"start":1,"end":24},"field":{"type":"literal","value":"repo","range":{"start":1,"end":5}},"value":{"type":"literal","value":"contains(file:bar)","range":{"start":6,"end":24},"quoted":false},"negated":false},{"type":"closingParen","range":{"start":24,"end":25}}]}'
+        expect(scanSearchQuery('(repo:contains.file(path:bar))')).toMatchInlineSnapshot(
+            '{"type":"success","term":[{"type":"openingParen","range":{"start":0,"end":1}},{"type":"filter","range":{"start":1,"end":29},"field":{"type":"literal","value":"repo","range":{"start":1,"end":5}},"value":{"type":"literal","value":"contains.file(path:bar)","range":{"start":6,"end":29},"quoted":false},"negated":false},{"type":"closingParen","range":{"start":29,"end":30}}]}'
         )
     })
 
     test('recognize `not` and other keywords in literal search where unquoted terms might appear to be quoted', () => {
-        expect(scanSearchQuery("'email is not allowed'", false, SearchPatternType.literal)).toMatchInlineSnapshot(
+        expect(scanSearchQuery("'email is not allowed'", false, SearchPatternType.standard)).toMatchInlineSnapshot(
             '{"type":"success","term":[{"type":"pattern","range":{"start":0,"end":6},"kind":1,"value":"\'email","delimited":false},{"type":"whitespace","range":{"start":6,"end":7}},{"type":"pattern","range":{"start":7,"end":9},"kind":1,"value":"is","delimited":false},{"type":"whitespace","range":{"start":9,"end":10}},{"type":"keyword","value":"not","range":{"start":10,"end":13},"kind":"not"},{"type":"whitespace","range":{"start":13,"end":14}},{"type":"pattern","range":{"start":14,"end":22},"kind":1,"value":"allowed\'","delimited":false}]}'
         )
     })
 
     test('detect patterntype inside query', () => {
         expect(scanSearchQuery('patterntype:standard /test/')).toMatchInlineSnapshot(
-            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":20},"field":{"type":"literal","value":"patterntype","range":{"start":0,"end":11}},"value":{"type":"literal","value":"standard","range":{"start":12,"end":20},"quoted":false},"negated":false},{"type":"whitespace","range":{"start":20,"end":21}},{"type":"pattern","range":{"start":21,"end":27},"kind":2,"value":"test","delimited":true}]}'
+            '{"type":"success","term":[{"type":"filter","range":{"start":0,"end":20},"field":{"type":"literal","value":"patterntype","range":{"start":0,"end":11}},"value":{"type":"literal","value":"standard","range":{"start":12,"end":20},"quoted":false},"negated":false},{"type":"whitespace","range":{"start":20,"end":21}},{"type":"pattern","range":{"start":21,"end":27},"kind":2,"value":"test","delimited":true,"delimiter":"/"}]}'
         )
     })
 })

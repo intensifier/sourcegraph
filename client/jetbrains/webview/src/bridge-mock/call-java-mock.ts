@@ -1,14 +1,15 @@
 import { decode } from 'js-base64'
 
-import { SearchPatternType } from '@sourcegraph/search'
-
+import { SearchPatternType } from '../graphql-operations'
 import type { PreviewRequest, Request } from '../search/js-to-java-bridge'
 import type { Search, Theme } from '../search/types'
 
 import { dark } from './theme-snapshots/dark'
 import { light } from './theme-snapshots/light'
 
+/* Set these to connect to a different server */
 const instanceURL = 'https://sourcegraph.com/'
+const accessToken = null
 
 let isDarkTheme = false
 
@@ -22,6 +23,7 @@ let savedSearch: Search = savedSearchFromLocalStorage
           selectedSearchContextSpec: 'global',
       }
 
+const webviewOverlay = document.querySelector('#webview-overlay') as HTMLPreElement
 const codeDetailsNode = document.querySelector('#code-details') as HTMLPreElement
 
 let previewContent: PreviewRequest['arguments'] | null = null
@@ -35,7 +37,7 @@ export function callJava(request: Request): Promise<object> {
         const onFailureCallback = (errorCode: number, errorMessage: string): void => {
             reject(new Error(`${errorCode} - ${errorMessage}`))
         }
-        console.log(`Got this request: ${requestAsString}`)
+        console.log(`The mock Java backend just received this request: ${requestAsString}`)
         handleRequest(request, onSuccessCallback, onFailureCallback)
     })
 }
@@ -51,10 +53,10 @@ function handleRequest(
             onSuccessCallback(
                 JSON.stringify({
                     instanceURL,
-                    isGlobbingEnabled: true,
-                    accessToken: null,
-                    anonymousUserId: 'test',
+                    accessToken,
+                    customRequestHeadersAsString: '',
                     pluginVersion: '1.2.3',
+                    anonymousUserId: 'test',
                 })
             )
             break
@@ -66,13 +68,21 @@ function handleRequest(
             break
         }
 
+        case 'indicateSearchError': {
+            setOverlay(`Search error: ${request.arguments.errorMessage}`)
+            onSuccessCallback('null')
+            break
+        }
+
         case 'previewLoading': {
+            setOverlay(null)
             codeDetailsNode.innerHTML = 'Loading...'
             onSuccessCallback('null')
             break
         }
 
         case 'preview': {
+            setOverlay(null)
             previewContent = request.arguments
 
             const start =
@@ -105,6 +115,7 @@ function handleRequest(
         }
 
         case 'clearPreview': {
+            setOverlay(null)
             codeDetailsNode.textContent = ''
             onSuccessCallback('null')
             break
@@ -134,6 +145,7 @@ function handleRequest(
         }
 
         case 'indicateFinishedLoading': {
+            setOverlay(null)
             onSuccessCallback('null')
             break
         }
@@ -156,11 +168,16 @@ export function setDarkMode(value: boolean): void {
     isDarkTheme = value
 }
 
+function setOverlay(content: string | null): void {
+    webviewOverlay.style.visibility = content !== null ? 'visible' : 'hidden'
+    webviewOverlay.innerHTML = content || ''
+}
+
 function escapeHTML(unsafe: string): string {
-    return unsafe.replace(
+    return unsafe.replaceAll(
         // eslint-disable-next-line no-control-regex
         /[\u0000-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u00FF]/g,
-        // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
+
         char => '&#' + ('000' + char.charCodeAt(0)).slice(-4) + ';'
     )
 }

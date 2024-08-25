@@ -5,28 +5,36 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 
 	"github.com/sourcegraph/sourcegraph/internal/gqltestutil"
 	"github.com/sourcegraph/sourcegraph/schema"
 )
 
 const (
-	repoName   = "perforce/test-perms"
-	aliceEmail = "alice@perforce.sgdev.org"
+	perforceRepoName = "perforce/test-perms"
+	testPermsDepot   = "test-perms"
+	aliceEmail       = "alice@perforce.sgdev.org"
+	aliceUsername    = "alice"
 )
 
 func TestSubRepoPermissionsPerforce(t *testing.T) {
 	checkPerforceEnvironment(t)
 	enableSubRepoPermissions(t)
-	createPerforceExternalService(t)
-	userClient, repoName := createTestUserAndWaitForRepo(t)
+	cleanup := createPerforceExternalService(t, testPermsDepot)
+	t.Cleanup(cleanup)
+	userClient, repoName, err := createTestUserAndWaitForRepo(t)
+	if err != nil {
+		t.Fatalf("Failed to create user and wait for repo: %v", err)
+	}
 
 	// Test cases
 
 	t.Run("can read README.md", func(t *testing.T) {
-		blob, err := userClient.GitBlob(repoName, "master", "README.md")
+		blob, err := userClient.GitBlob(repoName, "main", "README.md")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -39,7 +47,7 @@ func TestSubRepoPermissionsPerforce(t *testing.T) {
 
 	t.Run("cannot read hack.sh", func(t *testing.T) {
 		// Should not be able to read hack.sh
-		blob, err := userClient.GitBlob(repoName, "master", "Security/hack.sh")
+		blob, err := userClient.GitBlob(repoName, "main", "Security/hack.sh")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,8 +61,9 @@ func TestSubRepoPermissionsPerforce(t *testing.T) {
 		}
 	})
 
+	// flaky test
 	t.Run("file list excludes excluded files", func(t *testing.T) {
-		files, err := userClient.GitListFilenames(repoName, "master")
+		files, err := userClient.GitListFilenames(repoName, "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,13 +81,56 @@ func TestSubRepoPermissionsPerforce(t *testing.T) {
 	})
 }
 
+func TestSubRepoPermissionsSymbols(t *testing.T) {
+	checkPerforceEnvironment(t)
+	enableSubRepoPermissions(t)
+	cleanup := createPerforceExternalService(t, testPermsDepot)
+	t.Cleanup(cleanup)
+	userClient, repoName, err := createTestUserAndWaitForRepo(t)
+	if err != nil {
+		t.Fatalf("Failed to create user and wait for repo: %v", err)
+	}
+
+	err = client.WaitForRepoToBeIndexed(perforceRepoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("can read main.go and app.ts, but not hack.sh symbols", func(t *testing.T) {
+		// Symbols are lazily indexed, that's why we need an initial request to search
+		// for the revision, after which symbols of this revision are indexed. The search
+		// is repeated 10 times and the test runs for ~50 seconds in total to increase
+		// the probability of symbols being indexed.
+		for range 10 {
+			symbols, err := userClient.GitGetCommitSymbols(repoName, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Should not be able to read hack.sh
+			for _, symbol := range symbols {
+				fileName := symbol.Location.Resource.Path
+				if fileName == "Security/hack.sh" {
+					t.Fatal("Shouldn't be able to read symbols of hack.sh")
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+	})
+}
+
 func TestSubRepoPermissionsSearch(t *testing.T) {
 	checkPerforceEnvironment(t)
 	enableSubRepoPermissions(t)
-	createPerforceExternalService(t)
-	userClient, _ := createTestUserAndWaitForRepo(t)
+	enableStructuralSearch(t)
+	cleanup := createPerforceExternalService(t, testPermsDepot)
+	t.Cleanup(cleanup)
+	userClient, _, err := createTestUserAndWaitForRepo(t)
+	if err != nil {
+		t.Fatalf("Failed to create user and wait for repo: %v", err)
+	}
 
-	err := client.WaitForReposToBeIndexed(repoName)
+	t.Log("Wait for repo to be indexed")
+	err = client.WaitForRepoToBeIndexed(perforceRepoName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,16 +245,29 @@ func TestSubRepoPermissionsSearch(t *testing.T) {
 		})
 	}
 
+	t.Run("commit search admin", func(t *testing.T) {
+		results, err := client.SearchCommits(`repo:^perforce/test-perms$ type:commit`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Admin should have access to ALL commits: there are 6 total
+		commitsNumber := len(results.Results)
+		expectedCommitsNumber := 6
+		if commitsNumber != expectedCommitsNumber {
+			t.Fatalf("Should have access to %d commits but got %d", expectedCommitsNumber, commitsNumber)
+		}
+	})
+
 	t.Run("commit search", func(t *testing.T) {
 		results, err := userClient.SearchCommits(`repo:^perforce/test-perms$ type:commit`)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Alice should have access to only 1 commit at the moment (other 2 commits modify hack.sh which is
-		// inaccessible for Alice)
+		// Alice should have access to only 3 commits at the moment
 		commitsNumber := len(results.Results)
-		if commitsNumber != 1 {
-			t.Fatalf("Should have access to 1 commit but got %d", commitsNumber)
+		expectedCommitsNumber := 3
+		if commitsNumber != expectedCommitsNumber {
+			t.Fatalf("Should have access to %d commits but got %d", expectedCommitsNumber, commitsNumber)
 		}
 	})
 
@@ -213,22 +278,19 @@ func TestSubRepoPermissionsSearch(t *testing.T) {
 	}{
 		{
 			name:     "direct access to inaccessible commit",
-			revision: "87440329a7bae580b90280aaaafdc14ee7c1f8ef",
+			revision: "ce09ed9ea31ffa71c8de2d6029b93d4bd9568af8",
 		},
 		{
 			name:      "direct access to accessible commit",
-			revision:  "36d7eda16b9a881ef153126a4036efc4f6afb0c1",
+			revision:  "de3fac9e20a01dbda7f354c82bd6ed77f16a778c",
 			hasAccess: true,
-		},
-		{
-			name:     "direct access to inaccessible commit-2",
-			revision: "d9d835aa4b08e1dcb06a21a6dffe6e44f0a141d1",
 		},
 	}
 
 	for _, test := range commitAccessTests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := userClient.GitGetCommitMessage(repoName, test.revision)
+			t.Skip("Skipping until we have stable commit hashes")
+			_, err := userClient.GitGetCommitMessage(perforceRepoName, test.revision)
 			if err != nil {
 				if test.hasAccess {
 					t.Fatal(err)
@@ -242,7 +304,7 @@ func TestSubRepoPermissionsSearch(t *testing.T) {
 	}
 
 	t.Run("archive repo", func(t *testing.T) {
-		url := fmt.Sprintf("%s/%s/-/raw/", *baseURL, repoName)
+		url := fmt.Sprintf("%s/%s/-/raw/", *baseURL, perforceRepoName)
 		response, err := userClient.GetWithHeaders(url, map[string][]string{"Accept": {"application/zip"}})
 		if err != nil {
 			t.Fatal(err)
@@ -253,7 +315,8 @@ func TestSubRepoPermissionsSearch(t *testing.T) {
 	})
 
 	t.Run("code intel search", func(t *testing.T) {
-		result, err := userClient.SearchFiles("context:global \\bhack1337\\b type:file patternType:regexp count:500 case:yes file:\\.(go)$ repo:^perforce/test-perms$@8574314b8de445ec652cab87cbaa1a8dbe6ba6c4")
+		t.Skip("Skipping until we have stable commit hashes")
+		result, err := userClient.SearchFiles("context:global \\bhack1337\\b type:file patternType:regexp count:500 case:yes file:\\.(go)$ repo:^perforce/test-perms$@2a30922ef9f214d44de60e719a64473e17321684")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -265,7 +328,7 @@ func TestSubRepoPermissionsSearch(t *testing.T) {
 	})
 }
 
-func createTestUserAndWaitForRepo(t *testing.T) (*gqltestutil.Client, string) {
+func createTestUserAndWaitForRepo(t *testing.T) (*gqltestutil.Client, string, error) {
 	t.Helper()
 
 	// We need to create the `alice` user with a specific e-mail address. This user is
@@ -275,53 +338,108 @@ func createTestUserAndWaitForRepo(t *testing.T) (*gqltestutil.Client, string) {
 	// Alice doesn't have access to Security directory. (there is a .sh file)
 	alicePassword := "alicessupersecurepassword"
 	t.Log("Creating Alice")
-	userClient, err := gqltestutil.SignUp(*baseURL, aliceEmail, "alice", alicePassword)
-	if err != nil {
-		t.Fatal(err)
-	}
+	userClient, err := gqltestutil.NewClient(*baseURL)
+	require.NoError(t, err)
+	require.NoError(t, userClient.SignUp(aliceEmail, aliceUsername, alicePassword))
 
 	aliceID := userClient.AuthenticatedUserID()
-	t.Cleanup(func() {
-		if err := client.DeleteUser(aliceID, true); err != nil {
-			t.Fatal(err)
-		}
-	})
+	removeTestUserAfterTest(t, aliceID)
 
 	if err := client.SetUserEmailVerified(aliceID, aliceEmail, true); err != nil {
 		t.Fatal(err)
 	}
 
-	err = userClient.WaitForReposToBeCloned(repoName)
+	t.Log("Wait for repo to be cloned")
+	err = userClient.WaitForReposToBeClonedWithin(120*time.Second, perforceRepoName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	syncUserPerms(t, aliceID, aliceUsername)
+	return userClient, perforceRepoName, nil
+}
+
+func syncUserPerms(t *testing.T, userID, userName string) {
+	t.Helper()
+
+	t.Log("Schedule permissions sync")
+	err := client.ScheduleUserPermissionsSync(userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return userClient, repoName
+
+	t.Log("Wait for permissions to sync")
+	// Wait up to 30 seconds for the user to have permissions synced
+	// from the code host at least once.
+	err = gqltestutil.Retry(30*time.Second, func() error {
+		userPermsInfo, err := client.UserPermissionsInfo(userName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if userPermsInfo != nil && !userPermsInfo.UpdatedAt.IsZero() {
+			return nil
+		}
+		return gqltestutil.ErrContinueRetry
+	})
+	// Try a second time if the first attempt failed.
+	if err != nil {
+		t.Log("First permissions sync failed. Trying a second time")
+		err = client.ScheduleUserPermissionsSync(userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait up to 30 seconds for the user to have permissions synced
+		// from the code host at least once.
+		err = gqltestutil.Retry(30*time.Second, func() error {
+			userPermsInfo, err := client.UserPermissionsInfo(userName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if userPermsInfo != nil && !userPermsInfo.UpdatedAt.IsZero() {
+				return nil
+			}
+			return gqltestutil.ErrContinueRetry
+		})
+		if err != nil {
+			t.Fatal("Waiting for user permissions to be synced:", err)
+		}
+	}
 }
 
 func enableSubRepoPermissions(t *testing.T) {
 	t.Helper()
+	t.Log("Enabling sub-repo permissions")
 
-	siteConfig, err := client.SiteConfiguration()
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldSiteConfig := new(schema.SiteConfiguration)
-	*oldSiteConfig = *siteConfig
-	t.Cleanup(func() {
-		err = client.UpdateSiteConfiguration(oldSiteConfig)
-		if err != nil {
-			t.Fatal(err)
+	reset, err := client.ModifySiteConfiguration(func(siteConfig *schema.SiteConfiguration) {
+		if siteConfig.ExperimentalFeatures == nil {
+			siteConfig.ExperimentalFeatures = &schema.ExperimentalFeatures{}
 		}
+		siteConfig.ExperimentalFeatures.Perforce = "enabled"
+		siteConfig.ExperimentalFeatures.SubRepoPermissions = &schema.SubRepoPermissions{Enabled: true}
 	})
-
-	siteConfig.ExperimentalFeatures = &schema.ExperimentalFeatures{
-		Perforce: "enabled",
-		SubRepoPermissions: &schema.SubRepoPermissions{
-			Enabled: true,
-		},
+	require.NoError(t, err)
+	if reset != nil {
+		t.Cleanup(func() {
+			require.NoError(t, reset())
+		})
 	}
-	err = client.UpdateSiteConfiguration(siteConfig)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func enableStructuralSearch(t *testing.T) {
+	t.Helper()
+	t.Log("Enabling structural search")
+
+	reset, err := client.ModifySiteConfiguration(func(siteConfig *schema.SiteConfiguration) {
+		if siteConfig.ExperimentalFeatures == nil {
+			siteConfig.ExperimentalFeatures = &schema.ExperimentalFeatures{}
+		}
+		siteConfig.ExperimentalFeatures.StructuralSearch = "enabled"
+	})
+	require.NoError(t, err)
+	if reset != nil {
+		t.Cleanup(func() {
+			require.NoError(t, reset())
+		})
 	}
 }

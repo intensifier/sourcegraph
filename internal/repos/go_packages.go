@@ -1,6 +1,8 @@
 package repos
 
 import (
+	"context"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/codeintel/dependencies"
 	"github.com/sourcegraph/sourcegraph/internal/conf/reposource"
@@ -13,15 +15,14 @@ import (
 )
 
 // NewGoPackagesSource returns a new GoModulesSource from the given external service.
-func NewGoPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
-	var c schema.GoModulesConnection
-	if err := jsonc.Unmarshal(svc.Config, &c); err != nil {
+func NewGoPackagesSource(ctx context.Context, svc *types.ExternalService, cf *httpcli.Factory) (*PackagesSource, error) {
+	rawConfig, err := svc.Config.Decrypt(ctx)
+	if err != nil {
 		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
 	}
-
-	cli, err := cf.Doer()
-	if err != nil {
-		return nil, err
+	var c schema.GoModulesConnection
+	if err := jsonc.Unmarshal(rawConfig, &c); err != nil {
+		return nil, errors.Errorf("external service id=%d config error: %s", svc.ID, err)
 	}
 
 	return &PackagesSource{
@@ -29,7 +30,7 @@ func NewGoPackagesSource(svc *types.ExternalService, cf *httpcli.Factory) (*Pack
 		configDeps: c.Dependencies,
 		scheme:     dependencies.GoPackagesScheme,
 		src: &goPackagesSource{
-			client: gomodproxy.NewClient(svc.URN(), c.Urls, cli),
+			client: gomodproxy.NewClient(svc.URN(), c.Urls, cf),
 		},
 	}, nil
 }

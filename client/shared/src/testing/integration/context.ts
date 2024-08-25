@@ -1,30 +1,27 @@
 import * as path from 'path'
 import * as util from 'util'
 
-import { MODE, Polly, PollyServer } from '@pollyjs/core'
+import { type MODE, Polly, type PollyServer } from '@pollyjs/core'
 import FSPersister from '@pollyjs/persister-fs'
-import { GraphQLError } from 'graphql'
+import type { GraphQLError } from 'graphql'
 import { snakeCase } from 'lodash'
 import * as mime from 'mime-types'
-import { Test } from 'mocha'
+import type { Test } from 'mocha'
 import { readFile, mkdir } from 'mz/fs'
 import pTimeout from 'p-timeout'
 import * as prettier from 'prettier'
-import { Subject, Subscription, throwError } from 'rxjs'
-import { first, timeoutWith } from 'rxjs/operators'
+import { Subject, Subscription, lastValueFrom, throwError } from 'rxjs'
+import { first, timeout } from 'rxjs/operators'
 
 import { STATIC_ASSETS_PATH } from '@sourcegraph/build-config'
-import { asError, keyExistsIn } from '@sourcegraph/common'
-import { ErrorGraphQLResult, SuccessGraphQLResult } from '@sourcegraph/http-client'
-// eslint-disable-next-line no-restricted-imports
-import { SourcegraphContext } from '@sourcegraph/web/src/jscontext'
+import { logger, asError, keyExistsIn } from '@sourcegraph/common'
+import type { ErrorGraphQLResult, GraphQLResult } from '@sourcegraph/http-client'
 
 import { getConfig } from '../config'
-import { recordCoverage } from '../coverage'
-import { Driver } from '../driver'
+import type { Driver } from '../driver'
 import { readEnvironmentString } from '../utils'
 
-import { CdpAdapter, CdpAdapterOptions } from './polly/CdpAdapter'
+import { CdpAdapter, type CdpAdapterOptions } from './polly/CdpAdapter'
 
 // Reduce log verbosity
 util.inspect.defaultOptions.depth = 0
@@ -98,8 +95,12 @@ export interface IntegrationTestOptions {
     /**
      * Test specific JS context object override. It's used in order to override
      * standard JSContext object for some particulars test.
+     *
+     * The `SourcegraphContext` type from `client/web/src/jscontext` should be used here
+     * but it creates a circular dependency between packages. So until it's resolved the
+     * generic `object` type is used here.
      */
-    customContext?: Partial<SourcegraphContext>
+    customContext?: object
 }
 
 const DISPOSE_ACTION_TIMEOUT = 5 * 1000
@@ -156,7 +157,7 @@ export const createSharedIntegrationTestContext = async <
 
     // Fail the test in the case a request handler threw an error,
     // e.g. because a request had no mock defined.
-    const cdpAdapter = polly.adapters.get(CdpAdapter.id) as CdpAdapter
+    const cdpAdapter = polly.adapters.get(CdpAdapter.id) as unknown as CdpAdapter
     subscriptions.add(
         cdpAdapter.errors.subscribe(error => {
             /**
@@ -208,7 +209,7 @@ export const createSharedIntegrationTestContext = async <
                 if ((asError(error) as NodeJS.ErrnoException).code === 'ENOENT') {
                     response.sendStatus(404)
                 } else {
-                    console.error(error)
+                    logger.error(error)
                     response.status(500).send(asError(error).message)
                 }
             }
@@ -249,8 +250,8 @@ export const createSharedIntegrationTestContext = async <
         }
 
         try {
-            const result = handler(variables as any)
-            const graphQlResult: SuccessGraphQLResult<any> = { data: result, errors: undefined }
+            const { errors, ...data } = handler(variables as any)
+            const graphQlResult: GraphQLResult<any> = { data, errors }
             response.json(graphQlResult)
         } catch (error) {
             if (!(error instanceof IntegrationTestGraphQlError)) {
@@ -287,15 +288,19 @@ export const createSharedIntegrationTestContext = async <
             triggerRequest: () => Promise<void> | void,
             operationName: O
         ): Promise<Parameters<TGraphQlOperations[O]>[0]> => {
-            const requestPromise = graphQlRequests
-                .pipe(
+            const requestPromise = lastValueFrom(
+                graphQlRequests.pipe(
                     first(
                         (request: GraphQLRequestEvent<TGraphQlOperationNames>): request is GraphQLRequestEvent<O> =>
                             request.operationName === operationName
                     ),
-                    timeoutWith(4000, throwError(new Error(`Timeout waiting for GraphQL request "${operationName}"`)))
+                    timeout({
+                        first: 4000,
+                        with: () =>
+                            throwError(() => new Error(`Timeout waiting for GraphQL request "${operationName}"`)),
+                    })
                 )
-                .toPromise()
+            )
             await triggerRequest()
             const { variables } = await requestPromise
             return variables
@@ -306,11 +311,6 @@ export const createSharedIntegrationTestContext = async <
             }
 
             subscriptions.unsubscribe()
-            await pTimeout(
-                recordCoverage(driver.browser),
-                DISPOSE_ACTION_TIMEOUT,
-                new Error('Recording coverage timed out')
-            )
 
             if (driver.page.url() !== 'about:blank') {
                 await pTimeout(
@@ -318,15 +318,26 @@ export const createSharedIntegrationTestContext = async <
                         try {
                             localStorage.clear()
                         } catch (error) {
-                            console.error('Failed to clear localStorage!', error)
+                            logger.error('Failed to clear localStorage!', error)
                         }
                     }),
                     DISPOSE_ACTION_TIMEOUT,
-                    () => console.warn('Failed to clear localStorage!')
+                    () => logger.warn('Failed to clear localStorage!')
                 )
             }
 
-            await pTimeout(driver.page.close(), DISPOSE_ACTION_TIMEOUT, new Error('Closing Puppeteer page timed out'))
+            /**
+             * We close the browser instance on every test completion via `after(() => driver?.close())`
+             * See the implementation details here: `client/shared/src/testing/driver.ts`.
+             *
+             * So it's OK to continue running tests even if `page.close()` times out.
+             * The issue of `page.close()` timing out is tracked here without a resolution:
+             * 1. https://github.com/puppeteer/puppeteer/issues/4882
+             * 2. https://github.com/puppeteer/puppeteer/issues/4104
+             */
+            await pTimeout(driver.page.close(), DISPOSE_ACTION_TIMEOUT, () =>
+                logger.warn('Closing Puppeteer page timed out')
+            )
             await pTimeout(polly.stop(), DISPOSE_ACTION_TIMEOUT, new Error('Stopping Polly timed out'))
         },
     }

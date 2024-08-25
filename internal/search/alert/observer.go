@@ -7,28 +7,33 @@ import (
 	"sync"
 
 	"github.com/sourcegraph/log"
+	"github.com/sourcegraph/zoekt"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
+	"github.com/sourcegraph/sourcegraph/internal/auth"
 	"github.com/sourcegraph/sourcegraph/internal/authz"
 	"github.com/sourcegraph/sourcegraph/internal/comby"
 	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/extsvc"
+	"github.com/sourcegraph/sourcegraph/internal/dotcom"
+	"github.com/sourcegraph/sourcegraph/internal/endpoint"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
+	"github.com/sourcegraph/sourcegraph/internal/grpc/defaults"
 	"github.com/sourcegraph/sourcegraph/internal/search"
 	"github.com/sourcegraph/sourcegraph/internal/search/query"
 	searchrepos "github.com/sourcegraph/sourcegraph/internal/search/repos"
-	"github.com/sourcegraph/sourcegraph/internal/search/run"
 	"github.com/sourcegraph/sourcegraph/internal/search/searchcontexts"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
 type Observer struct {
-	Logger log.Logger
-	Db     database.DB
+	Logger                      log.Logger
+	Db                          database.DB
+	Zoekt                       zoekt.Streamer
+	Searcher                    *endpoint.Map
+	SearcherGRPCConnectionCache *defaults.ConnectionCache
 
 	// Inputs are used to generate alert messages based on the query.
-	*run.SearchInputs
+	*search.Inputs
 
 	// Update state.
 	HasResults bool
@@ -44,15 +49,22 @@ type Observer struct {
 // raising NoResolvedRepos alerts with suggestions when we know the original
 // query does not contain any repos to search.
 func (o *Observer) reposExist(ctx context.Context, options search.RepoOptions) bool {
-	repositoryResolver := searchrepos.NewResolver(o.Db)
-	resolved, err := repositoryResolver.Resolve(ctx, options)
-	return err == nil && len(resolved.RepoRevs) > 0
+	repositoryResolver := searchrepos.NewResolver(o.Logger, o.Db, gitserver.NewClient("search.alertobserver"), o.Searcher, o.SearcherGRPCConnectionCache, o.Zoekt)
+	it := repositoryResolver.Iterator(ctx, options)
+	for it.Next() {
+		resolved := it.Current()
+		// Due to filtering (eg hasCommitAfter) this page of results may be
+		// empty, so we only return early if we find a repo that exists.
+		if len(resolved.RepoRevs) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Observer) alertForNoResolvedRepos(ctx context.Context, q query.Q) *search.Alert {
 	repoFilters, minusRepoFilters := q.Repositories()
 	contextFilters, _ := q.StringValues(query.FieldContext)
-	dependencies := q.Dependencies()
 	onlyForks, noForks, forksNotSet := false, false, true
 	if fork := q.Fork(); fork != nil {
 		onlyForks = *fork == query.Only
@@ -64,7 +76,7 @@ func (o *Observer) alertForNoResolvedRepos(ctx context.Context, q query.Q) *sear
 
 	if len(contextFilters) == 1 && !searchcontexts.IsGlobalSearchContextSpec(contextFilters[0]) && len(repoFilters) > 0 {
 		withoutContextFilter := query.OmitField(q, query.FieldContext)
-		proposedQueries := []*search.ProposedQuery{
+		proposedQueries := []*search.QueryDescription{
 			{
 				Description: "search in the global context",
 				Query:       fmt.Sprintf("context:%s %s", searchcontexts.GlobalSearchContextName, withoutContextFilter),
@@ -79,25 +91,8 @@ func (o *Observer) alertForNoResolvedRepos(ctx context.Context, q query.Q) *sear
 		}
 	}
 
-	isSiteAdmin := backend.CheckCurrentUserIsSiteAdmin(ctx, o.Db) == nil
-	if !envvar.SourcegraphDotComMode() {
-		if len(dependencies) > 0 {
-			needsPackageHostConfig, err := needsPackageHostConfiguration(ctx, o.Db)
-			if err == nil && needsPackageHostConfig {
-				if isSiteAdmin {
-					return &search.Alert{
-						Title:       "No package hosts configured",
-						Description: "To start searching your dependencies, first go to site admin to configure package hosts.",
-					}
-				} else {
-					return &search.Alert{
-						Title:       "No package hosts configured",
-						Description: "To start searching your dependencies, ask the site admin to configure package hosts.",
-					}
-				}
-			}
-		}
-
+	isSiteAdmin := auth.CheckCurrentUserIsSiteAdmin(ctx, o.Db) == nil
+	if !dotcom.SourcegraphDotComMode() {
 		if needsRepoConfig, err := needsRepositoryConfiguration(ctx, o.Db); err == nil && needsRepoConfig {
 			if isSiteAdmin {
 				return &search.Alert{
@@ -113,14 +108,7 @@ func (o *Observer) alertForNoResolvedRepos(ctx context.Context, q query.Q) *sear
 		}
 	}
 
-	if len(dependencies) > 0 {
-		return &search.Alert{
-			Title:       "No dependency repositories found",
-			Description: "Dependency repos are cloned on-demand when first searched. Try again in a few seconds if you know the given repositories have dependencies.\n\nRead more about dependencies search [here](https://docs.sourcegraph.com/code_search/how-to/dependencies_search).",
-		}
-	}
-
-	var proposedQueries []*search.ProposedQuery
+	var proposedQueries []*search.QueryDescription
 	if forksNotSet {
 		tryIncludeForks := search.RepoOptions{
 			RepoFilters:      repoFilters,
@@ -129,7 +117,7 @@ func (o *Observer) alertForNoResolvedRepos(ctx context.Context, q query.Q) *sear
 		}
 		if o.reposExist(ctx, tryIncludeForks) {
 			proposedQueries = append(proposedQueries,
-				&search.ProposedQuery{
+				&search.QueryDescription{
 					Description: "include forked repositories in your query.",
 					Query:       o.OriginalQuery + " fork:yes",
 					PatternType: o.PatternType,
@@ -148,7 +136,7 @@ func (o *Observer) alertForNoResolvedRepos(ctx context.Context, q query.Q) *sear
 		}
 		if o.reposExist(ctx, tryIncludeArchived) {
 			proposedQueries = append(proposedQueries,
-				&search.ProposedQuery{
+				&search.QueryDescription{
 					Description: "include archived repositories in your query.",
 					Query:       o.OriginalQuery + " archived:yes",
 					PatternType: o.PatternType,
@@ -230,10 +218,6 @@ func (o *Observer) Done() (*search.Alert, error) {
 	return o.alert, o.err
 }
 
-type alertKind string
-
-const luckySearchQueries alertKind = "lucky-search-queries"
-
 func (o *Observer) errorToAlert(ctx context.Context, err error) (*search.Alert, error) {
 	if err == nil {
 		return nil, nil
@@ -247,15 +231,14 @@ func (o *Observer) errorToAlert(ctx context.Context, err error) (*search.Alert, 
 	var (
 		mErr *searchrepos.MissingRepoRevsError
 		oErr *errOverRepoLimit
-		lErr *ErrLuckyQueries
 	)
 
-	if errors.HasType(err, authz.ErrStalePermissions{}) {
+	if errors.HasType[authz.ErrStalePermissions](err) {
 		return search.AlertForStalePermissions(), nil
 	}
 
 	{
-		var e gitdomain.BadCommitError
+		var e *gitdomain.BadCommitError
 		if errors.As(err, &e) {
 			return search.AlertForInvalidRevision(e.Spec), nil
 		}
@@ -275,33 +258,9 @@ func (o *Observer) errorToAlert(ctx context.Context, err error) (*search.Alert, 
 	}
 
 	if errors.As(err, &mErr) {
-		var a *search.Alert
-		dependencies := o.Query.Dependencies()
-		if len(dependencies) == 0 {
-			a = AlertForMissingRepoRevs(mErr.Missing)
-		} else {
-			a = AlertForMissingDependencyRepoRevs(mErr.Missing)
-		}
+		a := AlertForMissingRepoRevs(mErr.Missing)
 		a.Priority = 6
 		return a, nil
-	}
-
-	var unindexedLockfile *searchrepos.MissingLockfileIndexing
-	if errors.As(err, &unindexedLockfile) {
-		repo := unindexedLockfile.RepoName()
-		revs := unindexedLockfile.RevNames()
-
-		return search.AlertForUnindexedLockfile(repo, revs), nil
-	}
-
-	if errors.As(err, &lErr) {
-		return &search.Alert{
-			PrometheusType:  "lucky_search_notice",
-			Title:           "Showing additional results for similar queries",
-			Kind:            string(luckySearchQueries),
-			Description:     "We returned all the results for your query. We also added results you might be interested in for similar queries. Below are similar queries we ran.",
-			ProposedQueries: lErr.ProposedQueries,
-		}, nil
 	}
 
 	if strings.Contains(err.Error(), "Worker_oomed") || strings.Contains(err.Error(), "Worker_exited_abnormally") {
@@ -357,34 +316,13 @@ func needsRepositoryConfiguration(ctx context.Context, db database.DB) (bool, er
 	return count == 0, nil
 }
 
-func needsPackageHostConfiguration(ctx context.Context, db database.DB) (bool, error) {
-	count, err := db.ExternalServices().Count(ctx, database.ExternalServicesListOptions{
-		Kinds: []string{
-			extsvc.KindNpmPackages,
-			extsvc.KindGoPackages,
-		},
-	})
-	if err != nil {
-		return false, err
-	}
-	return count == 0, nil
-}
-
 type errOverRepoLimit struct {
-	ProposedQueries []*search.ProposedQuery
+	ProposedQueries []*search.QueryDescription
 	Description     string
 }
 
 func (e *errOverRepoLimit) Error() string {
 	return "Too many matching repositories"
-}
-
-type ErrLuckyQueries struct {
-	ProposedQueries []*search.ProposedQuery
-}
-
-func (e *ErrLuckyQueries) Error() string {
-	return "We were able to find more results by slightly modifying your query"
 }
 
 // isContextError returns true if ctx.Err() is not nil or if err
@@ -424,39 +362,5 @@ func AlertForMissingRepoRevs(missingRepoRevs []searchrepos.RepoRevSpecs) *search
 		PrometheusType: "missing_repo_revs",
 		Title:          "Some repositories could not be searched",
 		Description:    description,
-	}
-}
-
-func AlertForMissingDependencyRepoRevs(missingRepoRevs []searchrepos.RepoRevSpecs) *search.Alert {
-	var description string
-	if len(missingRepoRevs) == 1 {
-		if len(missingRepoRevs[0].RevSpecs()) == 1 {
-			description = fmt.Sprintf("The dependency %s matched by your repo:deps(...) predicate could not be searched because it does not yet contain the revision %q.", missingRepoRevs[0].Repo.Name, missingRepoRevs[0].RevSpecs()[0])
-		} else {
-			description = fmt.Sprintf("The dependency %s matched by your repo:deps(...) predicate could not be searched because it has multiple missing revisions: @%s.", missingRepoRevs[0].Repo.Name, strings.Join(missingRepoRevs[0].RevSpecs(), ","))
-		}
-	} else {
-		sampleSize := 10
-		if sampleSize > len(missingRepoRevs) {
-			sampleSize = len(missingRepoRevs)
-		}
-		repoRevs := make([]string, 0, sampleSize)
-		for _, r := range missingRepoRevs[:sampleSize] {
-			repoRevs = append(repoRevs, string(r.Repo.Name)+"@"+strings.Join(r.RevSpecs(), ","))
-		}
-		b := strings.Builder{}
-		_, _ = fmt.Fprintf(&b, "%d dependencies matched by your repo:deps(...) predicate could not be searched because the following revisions either don't exist or aren't yet cloned:", len(missingRepoRevs))
-		for _, rr := range repoRevs {
-			_, _ = fmt.Fprintf(&b, "\n* %s", rr)
-		}
-		if sampleSize < len(missingRepoRevs) {
-			b.WriteString("\n* ...")
-		}
-		description = b.String()
-	}
-	return &search.Alert{
-		PrometheusType: "missing_dependency_repo_revs",
-		Title:          "Some dependencies could not be searched",
-		Description:    description + "\n\nDependency repository revisions are cloned on demand. Try again in a few seconds.",
 	}
 }

@@ -8,17 +8,23 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver"
-	"github.com/inconshreveable/log15"
+	"github.com/gomodule/redigo/redis"
+	"github.com/inconshreveable/log15" //nolint:logging // TODO move all logging to sourcegraph/log
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/updatecheck"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/conf/validation"
 	"github.com/sourcegraph/sourcegraph/internal/actor"
+	"github.com/sourcegraph/sourcegraph/internal/auth"
+	"github.com/sourcegraph/sourcegraph/internal/codygateway"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/conf/conftypes"
 	"github.com/sourcegraph/sourcegraph/internal/conf/deploy"
+	"github.com/sourcegraph/sourcegraph/internal/database"
 	"github.com/sourcegraph/sourcegraph/internal/env"
+	"github.com/sourcegraph/sourcegraph/internal/extsvc"
+	"github.com/sourcegraph/sourcegraph/internal/extsvc/versions"
+	"github.com/sourcegraph/sourcegraph/internal/redispool"
+	"github.com/sourcegraph/sourcegraph/internal/settings"
 	srcprometheus "github.com/sourcegraph/sourcegraph/internal/src-prometheus"
+	"github.com/sourcegraph/sourcegraph/internal/updatecheck"
 	"github.com/sourcegraph/sourcegraph/internal/version"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 	"github.com/sourcegraph/sourcegraph/schema"
@@ -60,18 +66,20 @@ type AlertFuncArgs struct {
 	IsAuthenticated     bool             // whether the viewer is authenticated
 	IsSiteAdmin         bool             // whether the viewer is a site admin
 	ViewerFinalSettings *schema.Settings // the viewer's final user/org/global settings
+	DB                  database.DB
 }
 
 func (r *siteResolver) Alerts(ctx context.Context) ([]*Alert, error) {
-	settings, err := DecodedViewerFinalSettings(ctx, r.db)
+	settings, err := settings.CurrentUserFinal(ctx, r.db)
 	if err != nil {
 		return nil, err
 	}
 
 	args := AlertFuncArgs{
 		IsAuthenticated:     actor.FromContext(ctx).IsAuthenticated(),
-		IsSiteAdmin:         backend.CheckCurrentUserIsSiteAdmin(ctx, r.db) == nil,
+		IsSiteAdmin:         auth.CheckCurrentUserIsSiteAdmin(ctx, r.db) == nil,
 		ViewerFinalSettings: settings,
+		DB:                  r.db,
 	}
 
 	var alerts []*Alert
@@ -87,16 +95,6 @@ func (r *siteResolver) Alerts(ctx context.Context) ([]*Alert, error) {
 var disableSecurity, _ = strconv.ParseBool(env.Get("DISABLE_SECURITY", "false", "disables security upgrade notices"))
 
 func init() {
-	conf.ContributeWarning(func(c conftypes.SiteConfigQuerier) (problems conf.Problems) {
-		if c.SiteConfig().ExternalURL == "" {
-			problems = append(problems, conf.NewSiteProblem("`externalURL` is required to be set for many features of Sourcegraph to work correctly."))
-		} else if deploy.Type() != deploy.Dev && strings.HasPrefix(c.SiteConfig().ExternalURL, "http://") {
-			problems = append(problems, conf.NewSiteProblem("Your connection is not private. We recommend [configuring Sourcegraph to use HTTPS/SSL](https://docs.sourcegraph.com/admin/nginx)"))
-		}
-
-		return problems
-	})
-
 	// Warn if email sending is not configured.
 	AlertFuncs = append(AlertFuncs, emailSendingNotConfiguredAlert)
 
@@ -118,6 +116,18 @@ func init() {
 		log15.Warn("WARNING: possibly misconfigured Prometheus", "error", err)
 	}
 
+	AlertFuncs = append(AlertFuncs, func(args AlertFuncArgs) []*Alert {
+		var alerts []*Alert
+		for _, notification := range conf.Get().Notifications {
+			alerts = append(alerts, &Alert{
+				TypeValue:                 AlertTypeInfo,
+				MessageValue:              notification.Message,
+				IsDismissibleWithKeyValue: notification.Key,
+			})
+		}
+		return alerts
+	})
+
 	// Warn about invalid site configuration.
 	AlertFuncs = append(AlertFuncs, func(args AlertFuncArgs) []*Alert {
 		// 🚨 SECURITY: Only the site admin should care about the site configuration being invalid, as they
@@ -127,7 +137,7 @@ func init() {
 			return nil
 		}
 
-		problems, err := conf.Validate(globals.ConfigurationServerFrontendOnly.Raw())
+		problems, err := conf.Validate(conf.Raw())
 		if err != nil {
 			return []*Alert{
 				{
@@ -137,7 +147,7 @@ func init() {
 			}
 		}
 
-		warnings, err := conf.GetWarnings()
+		warnings, err := validation.GetWarnings(args.DB)
 		if err != nil {
 			return []*Alert{
 				{
@@ -172,6 +182,11 @@ func init() {
 		}
 		return alerts
 	})
+
+	// Warn if customer is using GitLab on a version < 12.0.
+	AlertFuncs = append(AlertFuncs, gitlabVersionAlert)
+
+	AlertFuncs = append(AlertFuncs, codyGatewayUsageAlert)
 }
 
 func updateAvailableAlert(args AlertFuncArgs) []*Alert {
@@ -189,7 +204,11 @@ func updateAvailableAlert(args AlertFuncArgs) []*Alert {
 	if !args.ViewerFinalSettings.AlertsShowPatchUpdates && !isMinorUpdateAvailable(version.Version(), globalUpdateStatus.UpdateVersion) {
 		return nil
 	}
-	message := fmt.Sprintf("An update is available: [Sourcegraph v%s](https://about.sourcegraph.com/blog) - [changelog](https://about.sourcegraph.com/changelog)", globalUpdateStatus.UpdateVersion)
+	// for major/minor updates, ensure banner is hidden if they have opted out
+	if !args.ViewerFinalSettings.AlertsShowMajorMinorUpdates && isMinorUpdateAvailable(version.Version(), globalUpdateStatus.UpdateVersion) {
+		return nil
+	}
+	message := fmt.Sprintf("An update is available: [Sourcegraph v%s](https://sourcegraph.com/blog) - [changelog](https://sourcegraph.com/changelog)", globalUpdateStatus.UpdateVersion)
 
 	// dismission key includes the version so after it is dismissed the alert comes back for the next update.
 	key := "update-available-" + globalUpdateStatus.UpdateVersion
@@ -214,7 +233,7 @@ func isMinorUpdateAvailable(currentVersion, updateVersion string) bool {
 }
 
 func emailSendingNotConfiguredAlert(args AlertFuncArgs) []*Alert {
-	if !args.IsSiteAdmin {
+	if !args.IsSiteAdmin || deploy.IsDeployTypeSingleDockerContainer(deploy.Type()) {
 		return nil
 	}
 	if conf.Get().EmailSmtp == nil || conf.Get().EmailSmtp.Host == "" {
@@ -266,19 +285,19 @@ func determineOutOfDateAlert(isAdmin bool, months int, offline bool) *Alert {
 		key := fmt.Sprintf("months-out-of-date-%d", months)
 		switch {
 		case months < 3:
-			message := fmt.Sprintf("Sourcegraph is %d+ months out of date, for the latest features and bug fixes please upgrade ([changelog](http://about.sourcegraph.com/changelog))", months)
+			message := fmt.Sprintf("Sourcegraph is %d+ months out of date, for the latest features and bug fixes please upgrade ([changelog](http://sourcegraph.com/changelog))", months)
 			return &Alert{TypeValue: AlertTypeInfo, MessageValue: message, IsDismissibleWithKeyValue: key}
 		case months == 3:
-			message := "Sourcegraph is 3+ months out of date, you may be missing important security or bug fixes. Users will be notified at 4+ months. ([changelog](http://about.sourcegraph.com/changelog))"
+			message := "Sourcegraph is 3+ months out of date, you may be missing important security or bug fixes. Users will be notified at 4+ months. ([changelog](http://sourcegraph.com/changelog))"
 			return &Alert{TypeValue: AlertTypeWarning, MessageValue: message}
 		case months == 4:
-			message := "Sourcegraph is 4+ months out of date, you may be missing important security or bug fixes. A notice is shown to users. ([changelog](http://about.sourcegraph.com/changelog))"
+			message := "Sourcegraph is 4+ months out of date, you may be missing important security or bug fixes. A notice is shown to users. ([changelog](http://sourcegraph.com/changelog))"
 			return &Alert{TypeValue: AlertTypeWarning, MessageValue: message}
 		case months == 5:
-			message := "Sourcegraph is 5+ months out of date, you may be missing important security or bug fixes. A notice is shown to users. ([changelog](http://about.sourcegraph.com/changelog))"
+			message := "Sourcegraph is 5+ months out of date, you may be missing important security or bug fixes. A notice is shown to users. ([changelog](http://sourcegraph.com/changelog))"
 			return &Alert{TypeValue: AlertTypeError, MessageValue: message}
 		default:
-			message := fmt.Sprintf("Sourcegraph is %d+ months out of date, you may be missing important security or bug fixes. A notice is shown to users. ([changelog](http://about.sourcegraph.com/changelog))", months)
+			message := fmt.Sprintf("Sourcegraph is %d+ months out of date, you may be missing important security or bug fixes. A notice is shown to users. ([changelog](http://sourcegraph.com/changelog))", months)
 			return &Alert{TypeValue: AlertTypeError, MessageValue: message}
 		}
 	}
@@ -288,14 +307,14 @@ func determineOutOfDateAlert(isAdmin bool, months int, offline bool) *Alert {
 	case 0, 1, 2, 3:
 		return nil
 	case 4, 5:
-		message := fmt.Sprintf("Sourcegraph is %d+ months out of date, ask your site administrator to upgrade for the latest features and bug fixes. ([changelog](http://about.sourcegraph.com/changelog))", months)
+		message := fmt.Sprintf("Sourcegraph is %d+ months out of date, ask your site administrator to upgrade for the latest features and bug fixes. ([changelog](http://sourcegraph.com/changelog))", months)
 		return &Alert{TypeValue: AlertTypeWarning, MessageValue: message, IsDismissibleWithKeyValue: key}
 	default:
 		alertType := AlertTypeWarning
 		if months > 12 {
 			alertType = AlertTypeError
 		}
-		message := fmt.Sprintf("Sourcegraph is %d+ months out of date, you may be missing important security or bug fixes. Ask your site administrator to upgrade. ([changelog](http://about.sourcegraph.com/changelog))", months)
+		message := fmt.Sprintf("Sourcegraph is %d+ months out of date, you may be missing important security or bug fixes. Ask your site administrator to upgrade. ([changelog](http://sourcegraph.com/changelog))", months)
 		return &Alert{TypeValue: alertType, MessageValue: message, IsDismissibleWithKeyValue: key}
 	}
 }
@@ -331,6 +350,89 @@ func observabilityActiveAlertsAlert(prom srcprometheus.Client) func(AlertFuncArg
 			pluralize(status.ServicesCritical, "service", "services"))
 		return []*Alert{{TypeValue: AlertTypeError, MessageValue: msg}}
 	}
+}
+
+func gitlabVersionAlert(args AlertFuncArgs) []*Alert {
+	// We only show this alert to site admins.
+	if !args.IsSiteAdmin {
+		return nil
+	}
+
+	chvs, err := versions.GetVersions()
+	if err != nil {
+		log15.Warn("Failed to get code host versions for GitLab minimum version alert", "error", err)
+		return nil
+	}
+
+	// NOTE: It's necessary to include a "-0" prerelease suffix on each constraint so that
+	// prereleases of future versions are still considered to satisfy the constraint. See
+	// https://github.com/Masterminds/semver#working-with-prerelease-versions for more.
+	mv, err := semver.NewConstraint(">=12.0.0-0")
+	if err != nil {
+		log15.Warn("Failed to create minimum version constraint for GitLab minimum version alert", "error", err)
+	}
+
+	for _, chv := range chvs {
+		if chv.ExternalServiceKind != extsvc.KindGitLab {
+			continue
+		}
+
+		cv, err := semver.NewVersion(chv.Version)
+		if err != nil {
+			log15.Warn("Failed to parse code host version for GitLab minimum version alert", "error", err, "external_service_kind", chv.ExternalServiceKind)
+			continue
+		}
+
+		if !mv.Check(cv) {
+			log15.Debug("Detected GitLab instance running a version below 12.0.0", "version", chv.Version)
+
+			return []*Alert{{
+				TypeValue:    AlertTypeError,
+				MessageValue: "One or more of your code hosts is running a version of GitLab below 12.0, which is not supported by Sourcegraph. Please upgrade your GitLab instance(s) to prevent disruption.",
+			}}
+		}
+	}
+
+	return nil
+}
+
+func codyGatewayUsageAlert(args AlertFuncArgs) []*Alert {
+	// We only show this alert to site admins.
+	if !args.IsSiteAdmin {
+		return nil
+	}
+
+	var alerts []*Alert
+
+	for _, feat := range codygateway.AllFeatures {
+		val := redispool.Store.Get(fmt.Sprintf("%s:%s", codygateway.CodyGatewayUsageRedisKeyPrefix, string(feat)))
+		usage, err := val.Int()
+		if err != nil {
+			if err == redis.ErrNil {
+				continue
+			}
+			log15.Warn("Failed to read Cody Gateway usage for feature", "feature", feat)
+			continue
+		}
+		if usage > 99 {
+			alerts = append(alerts, &Alert{
+				TypeValue:    AlertTypeError,
+				MessageValue: fmt.Sprintf("The Cody limit for %s has been reached. If you run into this regularly, please contact Sourcegraph.", feat.DisplayName()),
+			})
+		} else if usage >= 90 {
+			alerts = append(alerts, &Alert{
+				TypeValue:    AlertTypeWarning,
+				MessageValue: fmt.Sprintf("The Cody limit for %s is 90%% used. If you run into this regularly, please contact Sourcegraph.", feat.DisplayName()),
+			})
+		} else if usage >= 75 {
+			alerts = append(alerts, &Alert{
+				TypeValue:    AlertTypeInfo,
+				MessageValue: fmt.Sprintf("The Cody limit for %s is 75%% used. If you run into this regularly, please contact Sourcegraph.", feat.DisplayName()),
+			})
+		}
+	}
+
+	return alerts
 }
 
 func pluralize(v int, singular, plural string) string {

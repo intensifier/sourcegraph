@@ -1,19 +1,23 @@
-import { Remote } from 'comlink'
-import { BehaviorSubject, combineLatest, from, Observable, Subscription } from 'rxjs'
+import type { Remote } from 'comlink'
+import { BehaviorSubject, combineLatest, from, type Observable, of, Subscription } from 'rxjs'
 import { catchError, concatMap, distinctUntilChanged, first, map, switchMap, tap } from 'rxjs/operators'
-import sourcegraph from 'sourcegraph'
+import type sourcegraph from 'sourcegraph'
 
-import { Contributions } from '@sourcegraph/client-api'
-import { asError, ErrorLike, isErrorLike, hashCode, memoizeObservable } from '@sourcegraph/common'
+import type { Contributions } from '@sourcegraph/client-api'
+import { asError, isErrorLike, hashCode, logger } from '@sourcegraph/common'
 
-import { ConfiguredExtension, getScriptURLFromExtensionManifest, splitExtensionID } from '../../extensions/extension'
+import {
+    type ConfiguredExtension,
+    getScriptURLFromExtensionManifest,
+    splitExtensionID,
+} from '../../extensions/extension'
 import { areExtensionsSame, getEnabledExtensionsForSubject } from '../../extensions/extensions'
 import { wrapRemoteObservable } from '../client/api/common'
-import { MainThreadAPI } from '../contract'
+import type { MainThreadAPI } from '../contract'
 import { tryCatchPromise } from '../util'
 
 import { parseContributionExpressions } from './api/contribution'
-import { ExtensionHostState } from './extensionHostState'
+import type { ExtensionHostState } from './extensionHostState'
 
 export function observeActiveExtensions(
     mainAPI: Remote<MainThreadAPI>,
@@ -62,7 +66,7 @@ const DEPRECATED_EXTENSION_IDS = new Set(['sourcegraph/code-stats-insights', 'so
 
 export function activateExtensions(
     state: Pick<ExtensionHostState, 'activeExtensions' | 'contributions' | 'haveInitialExtensionsLoaded' | 'settings'>,
-    mainAPI: Remote<Pick<MainThreadAPI, 'getScriptURLForExtension' | 'logEvent'>>,
+    mainAPI: Remote<Pick<MainThreadAPI, 'logEvent' | 'getTelemetryRecorder'>>,
     createExtensionAPI: (extensionID: string) => typeof sourcegraph,
     mainThreadAPIInitializations: Observable<boolean>,
     /**
@@ -76,31 +80,12 @@ export function activateExtensions(
      * */
     deactivate = deactivateExtension
 ): Subscription {
-    const getScriptURLs = memoizeObservable(
-        () =>
-            mainThreadAPIInitializations.pipe(
-                first(initialized => initialized),
-                switchMap(() =>
-                    from(mainAPI.getScriptURLForExtension()).pipe(
-                        map(getScriptURL => {
-                            function getBundleURLs(urls: string[]): Promise<(string | ErrorLike)[]> {
-                                return getScriptURL ? getScriptURL(urls) : Promise.resolve(urls)
-                            }
-
-                            return getBundleURLs
-                        })
-                    )
-                )
-            ),
-        () => 'getScriptURL'
-    )
-
     const previouslyActivatedExtensions = new Set<string>()
     const extensionContributions = new Map<string, Contributions>()
     const contributionsToAdd = new Map<string, Contributions>()
-    const extensionsSubscription = combineLatest([state.activeExtensions, getScriptURLs(null)])
+    const extensionsSubscription = combineLatest([state.activeExtensions])
         .pipe(
-            concatMap(([activeExtensions, getScriptURLs]) => {
+            concatMap(([activeExtensions]) => {
                 const toDeactivate = new Set<string>()
                 const toActivate = new Map<string, ConfiguredExtension | ExecutableExtension>()
                 const activeExtensionIDs = new Set<string>()
@@ -126,32 +111,24 @@ export function activateExtensions(
                     }
                 }
 
-                return from(
-                    getScriptURLs(
-                        [...toActivate.values()].map(extension => {
-                            if ('scriptURL' in extension) {
-                                // This is already an executable extension (inline extension)
-                                return extension.scriptURL
-                            }
+                const scriptURLs = [...toActivate.values()].map(extension => {
+                    if ('scriptURL' in extension) {
+                        // This is already an executable extension (inline extension)
+                        return extension.scriptURL
+                    }
 
-                            return getScriptURLFromExtensionManifest(extension)
-                        })
-                    ).then(scriptURLs => {
-                        // TODO: (not urgent) add scriptURL cache
+                    return getScriptURLFromExtensionManifest(extension)
+                })
 
-                        const executableExtensionsToActivate: ExecutableExtension[] = [...toActivate.values()]
-                            .map((extension, index) => ({
-                                id: extension.id,
-                                manifest: extension.manifest,
-                                scriptURL: scriptURLs[index],
-                            }))
-                            .filter(
-                                (extension): extension is ExecutableExtension => typeof extension.scriptURL === 'string'
-                            )
+                const executableExtensionsToActivate: ExecutableExtension[] = [...toActivate.values()]
+                    .map((extension, index) => ({
+                        id: extension.id,
+                        manifest: extension.manifest,
+                        scriptURL: scriptURLs[index],
+                    }))
+                    .filter((extension): extension is ExecutableExtension => typeof extension.scriptURL === 'string')
 
-                        return { toActivate: executableExtensionsToActivate, toDeactivate }
-                    })
-                ).pipe(
+                return of({ toActivate: executableExtensionsToActivate, toDeactivate }).pipe(
                     tap(({ toActivate }) => {
                         for (const extension of toActivate) {
                             if (
@@ -191,21 +168,25 @@ export function activateExtensions(
                                                 .catch(() => {
                                                     // noop
                                                 })
+                                            const telemetryRecorder = await mainAPI.getTelemetryRecorder()
+                                            telemetryRecorder.recordEvent('blob.extension', 'activate', {
+                                                privateMetadata: { extensionID: telemetryExtensionID },
+                                            })
                                         } catch (error) {
-                                            console.error(
+                                            logger.error(
                                                 `Fail to log ExtensionActivation event for extension ${id}:`,
                                                 asError(error)
                                             )
                                         }
                                     }
-                                    console.log(`Activating Sourcegraph extension: ${id}`)
+                                    logger.log(`Activating Sourcegraph extension: ${id}`)
                                     return activate(id, scriptURL, createExtensionAPI).catch(error =>
-                                        console.error(`Error activating extension ${id}:`, asError(error))
+                                        logger.error(`Error activating extension ${id}:`, asError(error))
                                     )
                                 }),
                                 [...toDeactivate].map(id =>
                                     deactivate(id).catch(error =>
-                                        console.error(`Error deactivating extension ${id}:`, asError(error))
+                                        logger.error(`Error deactivating extension ${id}:`, asError(error))
                                     )
                                 ),
                             ])
@@ -213,7 +194,7 @@ export function activateExtensions(
                     }),
                     map(() => ({ activated: toActivate, deactivated: toDeactivate })),
                     catchError(error => {
-                        console.error('Uncaught error during extension activation', error)
+                        logger.error('Uncaught error during extension activation', error)
                         return []
                     })
                 )
@@ -343,29 +324,29 @@ export function extensionsWithMatchedActivationEvent<Extension extends Configure
             if (!extension.manifest) {
                 const match = /^sourcegraph\/lang-(.*)$/.exec(extension.id)
                 if (match) {
-                    console.warn(
+                    logger.warn(
                         `Extension ${extension.id} has been renamed to sourcegraph/${match[1]}. It's safe to remove ${extension.id} from your settings.`
                     )
                 } else {
-                    console.warn(
+                    logger.warn(
                         `Extension ${extension.id} was not found. Remove it from settings to suppress this warning.`
                     )
                 }
                 return false
             }
             if (isErrorLike(extension.manifest)) {
-                console.warn(extension.manifest)
+                logger.warn(extension.manifest)
                 return false
             }
             if (!extension.manifest.activationEvents) {
-                console.warn(`Extension ${extension.id} has no activation events, so it will never be activated.`)
+                logger.warn(`Extension ${extension.id} has no activation events, so it will never be activated.`)
                 return false
             }
             return extension.manifest.activationEvents.some(
                 event => event === '*' || languageActivationEvents.has(event)
             )
         } catch (error) {
-            console.error(error)
+            logger.error(error)
         }
         return false
     })

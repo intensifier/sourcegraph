@@ -172,6 +172,7 @@ const configFields: ConfigFields = {
         parser: parseBool,
         description:
             "If true, regression tests will not clean up users, external services, or other resources they create. Set this to true if running against a dev instance (as it'll make test runs faster). Set to false if running against production.",
+        defaultValue: false,
     },
     keepBrowser: {
         envVar: 'KEEP_BROWSER',
@@ -190,6 +191,7 @@ const configFields: ConfigFields = {
         parser: parseBool,
         description:
             'If true, logs status messages to console. This does not log the browser console (use LOG_BROWSER_CONSOLE for that).',
+        defaultValue: true,
     },
     slowMo: {
         envVar: 'SLOWMO',
@@ -237,7 +239,7 @@ const configFields: ConfigFields = {
 /**
  * Reads e2e config from environment variables. The caller should specify the config fields that it
  * depends on. This should NOT be called from helper packages. Instead, call it near the start of
- * "test main" function (i.e., Jest `test` blocks). Doing this ensures that all the necessary
+ * "test main" function (i.e., vitest `test` blocks). Doing this ensures that all the necessary
  * environment variables necessary for a test are presented to the user in one go.
  */
 export function getConfig<T extends keyof Config>(...required: T[]): Partial<Config> & Pick<Config, T> {

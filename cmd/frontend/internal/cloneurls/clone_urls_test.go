@@ -7,7 +7,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbmocks"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc"
 	"github.com/sourcegraph/sourcegraph/internal/types"
 )
@@ -15,20 +15,28 @@ import (
 func TestReposourceCloneURLToRepoName(t *testing.T) {
 	ctx := context.Background()
 
-	externalServices := database.NewMockExternalServiceStore()
+	externalServices := dbmocks.NewMockExternalServiceStore()
 	externalServices.ListFunc.SetDefaultReturn(
-		[]*types.ExternalService{{
-			ID:          1,
-			Kind:        extsvc.KindGitHub,
-			DisplayName: "GITHUB #1",
-			Config:      `{"url": "https://github.example.com", "repositoryQuery": ["none"], "token": "abc"}`,
-		}},
+		[]*types.ExternalService{
+			{
+				ID:          1,
+				Kind:        extsvc.KindGitHub,
+				DisplayName: "GITHUB #1",
+				Config:      extsvc.NewUnencryptedConfig(`{"url": "https://github.example.com", "repositoryQuery": ["none"], "token": "abc"}`),
+			},
+			{
+				ID:          2,
+				Kind:        extsvc.KindGerrit,
+				DisplayName: "GERRIT #1",
+				Config:      extsvc.NewUnencryptedConfig(`{"url": "https://gerrit.example.com"}`),
+			},
+		},
 		nil,
 	)
 
-	db := database.NewMockDB()
+	db := dbmocks.NewMockDB()
 	db.ExternalServicesFunc.SetDefaultReturn(externalServices)
-	db.ReposFunc.SetDefaultReturn(database.NewMockRepoStore())
+	db.ReposFunc.SetDefaultReturn(dbmocks.NewMockRepoStore())
 
 	tests := []struct {
 		name         string
@@ -54,10 +62,15 @@ func TestReposourceCloneURLToRepoName(t *testing.T) {
 			cloneURL:     "../../a/b/c.git",
 			wantRepoName: api.RepoName("github.example.com/a/b/c"),
 		},
+		{
+			name:         "gerrit",
+			cloneURL:     "https://gerrit.example.com/a/repo.git",
+			wantRepoName: api.RepoName("gerrit.example.com/repo"),
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			repoName, err := ReposourceCloneURLToRepoName(ctx, db, test.cloneURL)
+			repoName, err := RepoSourceCloneURLToRepoName(ctx, db, test.cloneURL)
 			if err != nil {
 				t.Fatal(err)
 			}

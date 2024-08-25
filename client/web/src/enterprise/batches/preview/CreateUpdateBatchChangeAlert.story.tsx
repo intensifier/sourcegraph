@@ -1,26 +1,31 @@
-import { boolean } from '@storybook/addon-knobs'
-import { DecoratorFn, Story, Meta } from '@storybook/react'
+import type { Decorator, StoryFn, Meta } from '@storybook/react'
+
+import { noOpTelemetryRecorder } from '@sourcegraph/shared/src/telemetry'
 
 import { WebStory } from '../../../components/WebStory'
 import { MultiSelectContextProvider } from '../MultiSelectContext'
 
 import { CreateUpdateBatchChangeAlert } from './CreateUpdateBatchChangeAlert'
 
-const decorator: DecoratorFn = story => <div className="p-3 container">{story()}</div>
+const decorator: Decorator = story => <div className="p-3 container">{story()}</div>
 
 const config: Meta = {
     title: 'web/batches/preview/CreateUpdateBatchChangeAlert',
     decorators: [decorator],
-    parameters: {
-        chromatic: {
-            viewports: [320, 576, 978, 1440],
+    parameters: {},
+    argTypes: {
+        viewerCanAdminister: {
+            control: { type: 'boolean' },
         },
+    },
+    args: {
+        viewerCanAdminister: true,
     },
 }
 
 export default config
 
-export const Create: Story = () => (
+export const Create: StoryFn = args => (
     <WebStory>
         {props => (
             <CreateUpdateBatchChangeAlert
@@ -28,13 +33,14 @@ export const Create: Story = () => (
                 specID="123"
                 toBeArchived={18}
                 batchChange={null}
-                viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                viewerCanAdminister={args.viewerCanAdminister}
+                telemetryRecorder={noOpTelemetryRecorder}
             />
         )}
     </WebStory>
 )
 
-export const Update: Story = () => (
+export const Update: StoryFn = args => (
     <WebStory>
         {props => (
             <CreateUpdateBatchChangeAlert
@@ -42,13 +48,14 @@ export const Update: Story = () => (
                 specID="123"
                 toBeArchived={199}
                 batchChange={{ id: '123', name: 'awesome-batch-change', url: 'http://test.test/awesome' }}
-                viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                viewerCanAdminister={args.viewerCanAdminister}
+                telemetryRecorder={noOpTelemetryRecorder}
             />
         )}
     </WebStory>
 )
 
-export const Disabled: Story = () => (
+export const Disabled: StoryFn = args => (
     <WebStory>
         {props => (
             <MultiSelectContextProvider initialSelected={['id1', 'id2']}>
@@ -57,7 +64,8 @@ export const Disabled: Story = () => (
                     specID="123"
                     toBeArchived={199}
                     batchChange={{ id: '123', name: 'awesome-batch-change', url: 'http://test.test/awesome' }}
-                    viewerCanAdminister={boolean('viewerCanAdminister', true)}
+                    viewerCanAdminister={args.viewerCanAdminister}
+                    telemetryRecorder={noOpTelemetryRecorder}
                 />
             </MultiSelectContextProvider>
         )}

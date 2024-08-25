@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/stretchr/testify/require"
 
 	"github.com/sourcegraph/sourcegraph/internal/gqltestutil"
 	"github.com/sourcegraph/sourcegraph/schema"
@@ -61,11 +62,11 @@ func TestOrganization(t *testing.T) {
 			}
 		}
 		// Removing all members from an organization is not allowed - add a new user to the organization to verify cascading settings below
-		cleanup, err := createOrganizationUser(orgID)
+		testUserID, err := createOrganizationUser(orgID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer cleanup(t)
+		removeTestUserAfterTest(t, testUserID)
 		// Remove authenticate user (gqltest-admin) from organization (gqltest-org) should
 		// no longer get cascaded settings from this organization.
 		err = client.RemoveUserFromOrganization(client.AuthenticatedUserID(), orgID)
@@ -93,7 +94,7 @@ func TestOrganization(t *testing.T) {
 		}
 	})
 
-	// Docs: https://docs.sourcegraph.com/user/organizations
+	// Docs: https://sourcegraph.com/docs/user/organizations
 	t.Run("auth.userOrgMap", func(t *testing.T) {
 		// Create a test user (gqltest-org-user-1) without settings "auth.userOrgMap",
 		// the user should not be added to the organization (gqltest-org) automatically.
@@ -102,12 +103,7 @@ func TestOrganization(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			err := client.DeleteUser(testUserID1, true)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}()
+		removeTestUserAfterTest(t, testUserID1)
 
 		orgs, err := client.UserOrganizations(testUsername1)
 		if err != nil {
@@ -120,23 +116,14 @@ func TestOrganization(t *testing.T) {
 
 		// Update site configuration to set "auth.userOrgMap" which makes the new user join
 		// the organization (gqltest-org) automatically.
-		siteConfig, err := client.SiteConfiguration()
-		if err != nil {
-			t.Fatal(err)
-		}
-		oldSiteConfig := new(schema.SiteConfiguration)
-		*oldSiteConfig = *siteConfig
-		defer func() {
-			err = client.UpdateSiteConfiguration(oldSiteConfig)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}()
-
-		siteConfig.AuthUserOrgMap = map[string][]string{"*": {testOrgName}}
-		err = client.UpdateSiteConfiguration(siteConfig)
-		if err != nil {
-			t.Fatal(err)
+		reset, err := client.ModifySiteConfiguration(func(siteConfig *schema.SiteConfiguration) {
+			siteConfig.AuthUserOrgMap = map[string][]string{"*": {testOrgName}}
+		})
+		require.NoError(t, err)
+		if reset != nil {
+			t.Cleanup(func() {
+				require.NoError(t, reset())
+			})
 		}
 
 		var lastOrgs []string
@@ -149,12 +136,7 @@ func TestOrganization(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() {
-				err := client.DeleteUser(testUserID2, true)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}()
+			removeTestUserAfterTest(t, testUserID2)
 
 			orgs, err = client.UserOrganizations(testUsername2)
 			if err != nil {
@@ -174,18 +156,13 @@ func TestOrganization(t *testing.T) {
 	})
 }
 
-func createOrganizationUser(orgID string) (func(*testing.T), error) {
+func createOrganizationUser(orgID string) (string, error) {
 	const tmpUserName = "gqltest-org-user-tmp"
 	tmpUserID, err := client.CreateUser(tmpUserName, tmpUserName+"@sourcegraph.com")
 	if err != nil {
-		return nil, err
+		return tmpUserID, err
 	}
 
 	err = client.AddUserToOrganization(orgID, tmpUserName)
-	return func(t *testing.T) {
-		err := client.DeleteUser(tmpUserID, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}, err
+	return tmpUserID, err
 }

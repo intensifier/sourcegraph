@@ -29,16 +29,16 @@ func (e *eventWriter) MatchesJSON(data []byte) error {
 	return e.inner.EventBytes("matches", data)
 }
 
-func (e *eventWriter) Filters(fs []*streaming.Filter) error {
+func (e *eventWriter) Filters(fs []*streaming.Filter, exhaustive bool) error {
 	if len(fs) > 0 {
 		buf := make([]streamhttp.EventFilter, 0, len(fs))
 		for _, f := range fs {
 			buf = append(buf, streamhttp.EventFilter{
-				Value:    f.Value,
-				Label:    f.Label,
-				Count:    f.Count,
-				LimitHit: f.IsLimitHit,
-				Kind:     f.Kind,
+				Value:      f.Value,
+				Label:      f.Label,
+				Count:      f.Count,
+				Kind:       string(f.Kind),
+				Exhaustive: exhaustive,
 			})
 		}
 
@@ -52,11 +52,17 @@ func (e *eventWriter) Error(err error) error {
 }
 
 func (e *eventWriter) Alert(alert *search.Alert) error {
-	var pqs []streamhttp.ProposedQuery
+	var pqs []streamhttp.QueryDescription
 	for _, pq := range alert.ProposedQueries {
-		pqs = append(pqs, streamhttp.ProposedQuery{
+		annotations := make([]streamhttp.Annotation, 0, len(pq.Annotations))
+		for name, value := range pq.Annotations {
+			annotations = append(annotations, streamhttp.Annotation{Name: string(name), Value: value})
+		}
+
+		pqs = append(pqs, streamhttp.QueryDescription{
 			Description: pq.Description,
 			Query:       pq.QueryString(),
+			Annotations: annotations,
 		})
 	}
 	return e.inner.Event("alert", streamhttp.EventAlert{

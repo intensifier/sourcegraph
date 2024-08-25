@@ -1,11 +1,11 @@
-import React, { AriaRole, ComponentType, ElementType, SVGProps } from 'react'
+import React, { type AriaRole, type ComponentType, type ElementType, type SVGProps } from 'react'
 
 import classNames from 'classnames'
-import { MdiReactIconProps } from 'mdi-react'
+import type { MdiReactIconProps } from 'mdi-react'
 
-import { ForwardReferenceComponent } from '../..'
+import type { ForwardReferenceComponent } from '../..'
 
-import { ICON_SIZES } from './constants'
+import type { ICON_SIZES } from './constants'
 
 import styles from './Icon.module.scss'
 
@@ -43,9 +43,24 @@ interface HiddenIconProps extends BaseIconProps {
 
 export type IconProps = HiddenIconProps | ScreenReaderIconProps
 
-// eslint-disable-next-line react/display-name
+/**
+ * Renders an Icon.
+ *
+ * We have two types of icons:
+ * - [Material design icons](https://materialdesignicons.com): These should be imported from `@mdi/js` and used as the `svgPath` prop.
+ * Example: `<Icon svgPath={mdiIcon} />`
+ *
+ * - Custom icons: We can use this directly by passing the icon component as the `as` prop.
+ * Example: `<Icon as={SourcegraphLogo} />`
+ *
+ * Note: In order to be accessible, we enforce that either an `aria-label` OR an `aria-hidden` prop is provided.
+ * If the icon is not decorative, and adds value to the users journey, we should use a descriptive `aria-label`.
+ */
 export const Icon = React.memo(
-    React.forwardRef(function Icon({ children, className, size, role = 'img', inline = true, ...props }, reference) {
+    React.forwardRef(function Icon(
+        { children, className, size, role = 'img', inline = true, svgPath, ...props },
+        reference
+    ) {
         const iconStyle = classNames(
             'mdi-icon',
             inline && styles.iconInline,
@@ -53,15 +68,8 @@ export const Icon = React.memo(
             className
         )
 
-        if (props.svgPath) {
-            const {
-                svgPath,
-                height = 24,
-                width = 24,
-                viewBox = '0 0 24 24',
-                fill = 'currentColor',
-                ...attributes
-            } = props
+        if (svgPath) {
+            const { height = 24, width = 24, viewBox = '0 0 24 24', fill = 'currentColor', ...attributes } = props
 
             return (
                 <svg

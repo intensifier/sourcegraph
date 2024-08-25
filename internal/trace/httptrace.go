@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -12,18 +12,13 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/felixge/httpsnoop"
 	"github.com/gorilla/mux"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/sourcegraph/log"
 
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/conf/conftypes"
 	"github.com/sourcegraph/sourcegraph/internal/env"
-	"github.com/sourcegraph/sourcegraph/internal/repotrackutil"
-	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
+	"github.com/sourcegraph/sourcegraph/internal/trace/policy"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
@@ -39,17 +34,11 @@ const (
 	GraphQLQueryKey
 )
 
-// trackOrigin specifies a URL value. When an incoming request has the request header "Origin" set
-// and the header value equals the `trackOrigin` value then the `requestDuration` metric (and other metrics downstream)
-// gets labeled with this value for the "origin" label  (otherwise the metric is labeled with "unknown").
-// The tracked value can be changed with the METRICS_TRACK_ORIGIN environmental variable.
-var trackOrigin = "https://gitlab.com"
-
 var (
-	metricLabels    = []string{"route", "method", "code", "repo", "origin"}
+	metricLabels    = []string{"route", "method", "code"}
 	requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "src_http_request_duration_seconds",
-		Help:    "The HTTP request latencies in seconds.",
+		Help:    "The HTTP request latencies in seconds. Use src_graphql_field_seconds for GraphQL requests.",
 		Buckets: UserLatencyBuckets,
 	}, metricLabels)
 )
@@ -58,12 +47,6 @@ var requestHeartbeat = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "src_http_requests_last_timestamp_unixtime",
 	Help: "Last time a request finished for a http endpoint.",
 }, metricLabels)
-
-func Init() {
-	if origin := os.Getenv("METRICS_TRACK_ORIGIN"); origin != "" {
-		trackOrigin = origin
-	}
-}
 
 // GraphQLRequestName returns the GraphQL request name for a request context. For example,
 // a request to /.api/graphql?Foobar would have the name `Foobar`. If the request had no
@@ -79,21 +62,6 @@ func GraphQLRequestName(ctx context.Context) string {
 // WithGraphQLRequestName sets the GraphQL request name in the context.
 func WithGraphQLRequestName(ctx context.Context, name string) context.Context {
 	return context.WithValue(ctx, graphQLRequestNameKey, name)
-}
-
-// RequestOrigin returns the request origin (the value of the request header "Origin") for a request context.
-// If the request didn't have this header set "unknown" is returned.
-func RequestOrigin(ctx context.Context) string {
-	v := ctx.Value(originKey)
-	if v == nil {
-		return "unknown"
-	}
-	return v.(string)
-}
-
-// WithRequestOrigin sets the request origin in the context.
-func WithRequestOrigin(ctx context.Context, name string) context.Context {
-	return context.WithValue(ctx, originKey, name)
 }
 
 // SourceType indicates the type of source that likely created the request.
@@ -125,7 +93,9 @@ func RequestSource(ctx context.Context) SourceType {
 // which we only want to log a message if the duration is slower than the
 // threshold here.
 var slowPaths = map[string]time.Duration{
-	"/repo-update": 5 * time.Second,
+	// this blocks on running git fetch which depending on repo size can take
+	// a long time. As such we use a very high duration to avoid log spam.
+	"/repo-update": 10 * time.Minute,
 }
 
 var (
@@ -137,43 +107,27 @@ var (
 //
 // 🚨 SECURITY: This handler is served to all clients, even on private servers to clients who have
 // not authenticated. It must not reveal any sensitive information.
-func HTTPMiddleware(logger log.Logger, next http.Handler, siteConfig conftypes.SiteConfigQuerier) http.Handler {
-	logger = logger.Scoped("http", "http tracing middleware")
-	return loggingRecoverer(logger, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+func HTTPMiddleware(l log.Logger, next http.Handler) http.Handler {
+	l = l.Scoped("http")
+	return loggingRecoverer(l, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		// extract propagated span
-		wireContext, err := ot.GetTracer(ctx).Extract(
-			opentracing.HTTPHeaders,
-			opentracing.HTTPHeadersCarrier(r.Header))
-		if err != nil && err != opentracing.ErrSpanContextNotFound {
-			logger.Warn("extracting parent span failed", log.Error(err))
-		}
+		// logger is a copy of l. Add fields to this logger and what not, instead of l.
+		// This ensures each request is handled with a copy of the original logger instead
+		// of the previous one.
+		logger := l
 
-		// start new span
-		span, ctx := ot.StartSpanFromContext(ctx, "", ext.RPCServerOption(wireContext))
-		ext.HTTPUrl.Set(span, r.URL.String())
-		ext.HTTPMethod.Set(span, r.Method)
-		span.SetTag("http.referer", r.Header.Get("referer"))
-		defer span.Finish()
-
-		// get trace ID
+		// get trace ID and attach it to the request logger
 		trace := Context(ctx)
 		var traceURL string
-		if trace != nil && trace.TraceID != "" {
-			var traceType string
-			if ob := siteConfig.SiteConfig().ObservabilityTracing; ob == nil {
-				traceType = ""
-			} else {
-				traceType = ob.Type
-			}
-
-			traceURL = URL(trace.TraceID, siteConfig.SiteConfig().ExternalURL, traceType)
-			rw.Header().Set("X-Trace", traceURL)
-			logger = logger.WithTrace(*trace)
+		if trace.TraceID != "" {
+			// We set X-Trace-URL to a configured URL template for traces.
+			// X-Trace for the trace ID is set in instrumentation.HTTPMiddleware,
+			// which is a more bare-bones OpenTelemetry handler.
+			traceURL = URL(trace.TraceID)
+			rw.Header().Set("X-Trace-URL", traceURL)
+			logger = logger.WithTrace(trace)
 		}
-
-		ctx = opentracing.ContextWithSpan(ctx, span)
 
 		// route name is only known after the request has been handled
 		routeName := "unknown"
@@ -185,47 +139,32 @@ func HTTPMiddleware(logger log.Logger, next http.Handler, siteConfig conftypes.S
 		var requestErrorCause error
 		ctx = context.WithValue(ctx, requestErrorCauseKey, &requestErrorCause)
 
-		origin := "unknown"
-		if r.Header.Get("Origin") == trackOrigin {
-			origin = trackOrigin
-		}
-		ctx = WithRequestOrigin(ctx, origin)
-
 		// handle request
 		m := httpsnoop.CaptureMetrics(next, rw, r.WithContext(ctx))
 
-		// get route name, which is set after request is handled
+		// get route name, which is set after request is handled, to set as the trace
+		// title. We allow graphql requests to all be grouped under the route "graphql"
+		// to avoid making src_http_request_duration_seconds not be super high-cardinality.
+		//
+		// If you wish to see the performance of GraphQL endpoints, please use the
+		// src_graphql_field_seconds metric instead.
+		fullRouteTitle := routeName
 		if routeName == "graphql" {
 			// We use the query to denote the type of a GraphQL request, e.g. /.api/graphql?Repositories
 			if r.URL.RawQuery != "" {
-				routeName = "graphql: " + r.URL.RawQuery
+				fullRouteTitle = "graphql: " + r.URL.RawQuery
 			} else {
-				routeName = "graphql: unknown"
+				fullRouteTitle = "graphql: unknown"
 			}
 		}
-		span.SetOperationName("Serve: " + routeName)
-		span.SetTag("Route", routeName)
-
-		ext.HTTPStatusCode.Set(span, uint16(m.Code))
 
 		labels := prometheus.Labels{
-			"route":  routeName,
+			"route":  routeName, // do not use full route title to reduce cardinality
 			"method": strings.ToLower(r.Method),
 			"code":   strconv.Itoa(m.Code),
-			"repo":   repotrackutil.GetTrackedRepo(api.RepoName(r.URL.Path)),
-			"origin": origin,
 		}
 		requestDuration.With(labels).Observe(m.Duration.Seconds())
 		requestHeartbeat.With(labels).Set(float64(time.Now().Unix()))
-
-		// if it's not a graphql request, then this includes graphql_error=false in the log entry
-		gqlErr := false
-		span.Context().ForeachBaggageItem(func(k, v string) bool {
-			if k == "graphql.error" {
-				gqlErr = true
-			}
-			return !gqlErr
-		})
 
 		if customDuration, ok := slowPaths[r.URL.Path]; ok {
 			minDuration = customDuration
@@ -233,12 +172,20 @@ func HTTPMiddleware(logger log.Logger, next http.Handler, siteConfig conftypes.S
 
 		if m.Code >= minCode || m.Duration >= minDuration {
 			fields := make([]log.Field, 0, 10)
+
+			var url string
+			if strings.Contains(r.URL.Path, ".auth") {
+				url = r.URL.Path // omit sensitive query params
+			} else {
+				url = r.URL.String()
+			}
 			fields = append(fields,
-				log.String("route_name", routeName),
+				log.String("route_name", fullRouteTitle),
 				log.String("method", r.Method),
-				log.String("url", truncate(r.URL.String(), 100)),
+				log.String("url", truncate(url, 100)),
 				log.Int("code", m.Code),
 				log.Duration("duration", m.Duration),
+				log.Bool("shouldTrace", policy.ShouldTrace(ctx)),
 			)
 
 			if v := r.Header.Get("X-Forwarded-For"); v != "" {
@@ -249,21 +196,22 @@ func HTTPMiddleware(logger log.Logger, next http.Handler, siteConfig conftypes.S
 				fields = append(fields, log.Int("user", int(userID)))
 			}
 
-			if gqlErr {
-				fields = append(fields, log.Bool("graphql_error", gqlErr))
-			}
 			var parts []string
 			if m.Duration >= minDuration {
 				parts = append(parts, "slow http request")
 			}
 			if m.Code >= minCode {
-				parts = append(parts, "unexpected status code")
+				parts = append(parts, fmt.Sprintf("unexpected status code %d", m.Code))
 			}
 
 			msg := strings.Join(parts, ", ")
 			switch {
 			case m.Code == http.StatusNotFound:
 				logger.Info(msg, fields...)
+			case m.Code == http.StatusNotAcceptable:
+				// Used for intentionally disabled endpoints
+				// https://www.rfc-editor.org/rfc/rfc9110.html#name-406-not-acceptable
+				logger.Debug(msg, fields...)
 			case m.Code == http.StatusUnauthorized:
 				logger.Warn(msg, fields...)
 			case m.Code >= http.StatusInternalServerError && requestErrorCause != nil:
@@ -295,15 +243,24 @@ func HTTPMiddleware(logger log.Logger, next http.Handler, siteConfig conftypes.S
 
 // Recoverer is a recovery handler to wrap the stdlib net/http Mux.
 // Example:
-//  mux := http.NewServeMux
-//  ...
-//	http.Handle("/", sentry.Recoverer(mux))
+//
+//	 mux := http.NewServeMux
+//	 ...
+//		http.Handle("/", sentry.Recoverer(mux))
 func loggingRecoverer(logger log.Logger, handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if r := recover(); r != nil {
+				// ErrAbortHandler is a sentinal error which is used to stop an
+				// http handler but not report the error. In practice we have only
+				// seen this used by httputil.ReverseProxy when the server goes
+				// down.
+				if r == http.ErrAbortHandler {
+					return
+				}
+
 				err := errors.Errorf("handler panic: %v", redact.Safe(r))
-				logger.Error("handler panic", log.Error(err))
+				logger.Error("handler panic", log.Error(err), log.String("stacktrace", string(debug.Stack())))
 				w.WriteHeader(http.StatusInternalServerError)
 			}
 		}()
@@ -338,7 +295,8 @@ func User(ctx context.Context, userID int32) {
 
 // SetRequestErrorCause will set the error for the request to err. This is
 // used in the reporting layer to inspect the error for richer reporting to
-// Sentry.
+// Sentry. The error gets logged by internal/trace.HTTPMiddleware, so there
+// is no need to log this error independently.
 func SetRequestErrorCause(ctx context.Context, err error) {
 	if p, ok := ctx.Value(requestErrorCauseKey).(*error); ok {
 		*p = err

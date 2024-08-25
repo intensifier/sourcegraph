@@ -7,12 +7,72 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/opentracing-contrib/go-stdlib/nethttp"
-	opentracing "github.com/opentracing/opentracing-go"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/sourcegraph/sourcegraph/internal/env"
+	"github.com/sourcegraph/sourcegraph/internal/httpcli"
+	"github.com/sourcegraph/sourcegraph/internal/trace"
+	"github.com/sourcegraph/sourcegraph/lib/codeintel/languages"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
+
+var (
+	client *Client
+	once   sync.Once
+)
+
+func init() {
+	syntectServer := env.Get("SRC_SYNTECT_SERVER", "http://syntect-server:9238", "syntect_server HTTP(s) address")
+	once.Do(func() {
+		client = New(syntectServer)
+	})
+}
+
+func GetSyntectClient() *Client {
+	return client
+}
+
+// Keep in sync with 'enum SyntaxEngine' in Rust code
+const (
+	SyntaxEngineSyntect    = "syntect"
+	SyntaxEngineTreesitter = "tree-sitter"
+	SyntaxEngineScipSyntax = "scip-syntax"
+
+	SyntaxEngineInvalid = "invalid"
+)
+
+func isTreesitterBased(engine string) bool {
+	switch engine {
+	case SyntaxEngineTreesitter, SyntaxEngineScipSyntax:
+		return true
+	default:
+		return false
+	}
+}
+
+type HighlightResponseType string
+
+// The different response formats supported by the syntax highlighter.
+const (
+	FormatHTMLPlaintext HighlightResponseType = "HTML_PLAINTEXT"
+	FormatHTMLHighlight HighlightResponseType = "HTML_HIGHLIGHT"
+	FormatJSONSCIP      HighlightResponseType = "JSON_SCIP"
+)
+
+// Returns corresponding format type for the request format. Defaults to
+// FormatHTMLHighlight
+func GetResponseFormat(format string) HighlightResponseType {
+	if format == string(FormatHTMLPlaintext) {
+		return FormatHTMLPlaintext
+	}
+	if format == string(FormatJSONSCIP) {
+		return FormatJSONSCIP
+	}
+	return FormatHTMLHighlight
+}
 
 // Query represents a code highlighting query to the syntect_server.
 type Query struct {
@@ -25,22 +85,8 @@ type Query struct {
 	// Filetype is the language name.
 	Filetype string `json:"filetype"`
 
-	// Theme is the color theme to use for highlighting.
-	// If CSS is true, theme is ignored.
-	//
-	// See https://github.com/sourcegraph/syntect_server#embedded-themes
-	Theme string `json:"theme"`
-
 	// Code is the literal code to highlight.
 	Code string `json:"code"`
-
-	// CSS causes results to be returned in HTML table format with CSS class
-	// names annotating the spans rather than inline styles.
-	//
-	// TODO: I think we can just delete this? And theme? We don't use these.
-	// Then we could remove themes from syntect as well. I don't think we
-	// have any use case for these anymore (and haven't for awhile).
-	CSS bool `json:"css"`
 
 	// LineLengthLimit is the maximum length of line that will be highlighted if set.
 	// Defaults to no max if zero.
@@ -55,8 +101,8 @@ type Query struct {
 	// time if the user's request ends up being a problematic one.
 	StabilizeTimeout time.Duration `json:"-"`
 
-	// Tracer, if not nil, will be used to record opentracing spans associated with the query.
-	Tracer opentracing.Tracer
+	// Which highlighting engine to use
+	Engine string `json:"engine"`
 }
 
 // Response represents a response to a code highlighting query.
@@ -64,18 +110,12 @@ type Response struct {
 	// Data is the actual highlighted HTML version of Query.Code.
 	Data string
 
-	// LSIF is the base64 encoded byte array of an LSIF Typed payload containing highlighting data.
-	LSIF string
-
 	// Plaintext indicates whether or not a syntax could not be found for the
 	// file and instead it was rendered as plain text.
 	Plaintext bool
 }
 
 var (
-	// ErrInvalidTheme is returned when the Query.Theme is not a valid theme.
-	ErrInvalidTheme = errors.New("invalid theme")
-
 	// ErrRequestTooLarge is returned when the request is too large for syntect_server to handle (e.g. file is too large to highlight).
 	ErrRequestTooLarge = errors.New("request too large")
 
@@ -94,7 +134,9 @@ var (
 
 type response struct {
 	// Successful response fields.
-	Data      string `json:"data"`
+	Data string `json:"data"`
+	// Used by the /scip endpoint
+	Scip      string `json:"scip"`
 	Plaintext bool   `json:"plaintext"`
 
 	// Error response fields.
@@ -102,50 +144,30 @@ type response struct {
 	Code  string `json:"code"`
 }
 
-// Make sure all names are lowercase here, since they are normalized
-var enryLanguageMappings = map[string]string{
-	"c#": "c_sharp",
-}
-
-var supportedFiletypes = map[string]struct{}{
-	"go":      {},
-	"c_sharp": {},
-	"jsonnet": {},
-}
-
 // Client represents a client connection to a syntect_server.
 type Client struct {
 	syntectServer string
+	httpClient    *http.Client
 }
 
-var client = &http.Client{Transport: &nethttp.Transport{}}
-
-func normalizeFiletype(filetype string) string {
-	normalized := strings.ToLower(filetype)
-	if mapped, ok := enryLanguageMappings[normalized]; ok {
-		normalized = mapped
-	}
-
-	return normalized
-}
-
-func (c *Client) IsTreesitterSupported(filetype string) bool {
-	_, contained := supportedFiletypes[normalizeFiletype(filetype)]
+func IsTreesitterSupported(filetype string) bool {
+	_, contained := treesitterSupportedFiletypes[languages.NormalizeLanguage(filetype)]
 	return contained
 }
 
 // Highlight performs a query to highlight some code.
-//
-// TOOD(tjdevries): I think it would be good to remove `useTreeSitter` as a
-// variable and instead use either two different callpaths or just
-// automatically do this via the query or something else. It feels a bit goofy
-// to be a separate param. But I need to clean up these other deprecated
-// options later, so it's OK for the first iteration.
-func (c *Client) Highlight(ctx context.Context, q *Query, useTreeSitter bool) (*Response, error) {
+func (c *Client) Highlight(ctx context.Context, q *Query, format HighlightResponseType) (_ *Response, err error) {
 	// Normalize filetype
-	q.Filetype = normalizeFiletype(q.Filetype)
+	q.Filetype = languages.NormalizeLanguage(q.Filetype)
 
-	if useTreeSitter && !c.IsTreesitterSupported(q.Filetype) {
+	tr, ctx := trace.New(ctx, "gosyntect.Highlight",
+		attribute.String("filepath", q.Filepath),
+		attribute.String("language", q.Filetype),
+		attribute.String("engine", q.Engine),
+	)
+	defer tr.EndWithErr(&err)
+
+	if isTreesitterBased(q.Engine) && !IsTreesitterSupported(q.Filetype) {
 		return nil, errors.New("Not a valid treesitter filetype")
 	}
 
@@ -156,13 +178,17 @@ func (c *Client) Highlight(ctx context.Context, q *Query, useTreeSitter bool) (*
 	}
 
 	var url string
-	if useTreeSitter {
+	if format == FormatJSONSCIP {
+		url = "/scip"
+	} else if isTreesitterBased(q.Engine) {
+		// "Legacy SCIP mode" for the HTML blob view and languages configured to
+		// be processed with tree sitter.
 		url = "/lsif"
 	} else {
 		url = "/"
 	}
 
-	req, err := http.NewRequest("POST", c.url(url), bytes.NewReader(jsonQuery))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.url(url), bytes.NewReader(jsonQuery))
 	if err != nil {
 		return nil, errors.Wrap(err, "building request")
 	}
@@ -171,19 +197,8 @@ func (c *Client) Highlight(ctx context.Context, q *Query, useTreeSitter bool) (*
 		req.Header.Set("X-Stabilize-Timeout", q.StabilizeTimeout.String())
 	}
 
-	// Add tracing to the request.
-	tracer := q.Tracer
-	if tracer == nil {
-		tracer = opentracing.NoopTracer{}
-	}
-	req = req.WithContext(ctx)
-	req, ht := nethttp.TraceRequest(tracer, req,
-		nethttp.OperationName("Highlight"),
-		nethttp.ClientTrace(false))
-	defer ht.Finish()
-
 	// Perform the request.
-	resp, err := client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, errors.Wrap(err, fmt.Sprintf("making request to %s", c.url("/")))
 	}
@@ -193,11 +208,6 @@ func (c *Client) Highlight(ctx context.Context, q *Query, useTreeSitter bool) (*
 		return nil, ErrRequestTooLarge
 	}
 
-	// Can only call ht.Span() after the request has been executed, so add our span tags in now.
-	ht.Span().SetTag("Filepath", q.Filepath)
-	ht.Span().SetTag("Theme", q.Theme)
-	ht.Span().SetTag("CSS", q.CSS)
-
 	// Decode the response.
 	var r response
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
@@ -206,8 +216,6 @@ func (c *Client) Highlight(ctx context.Context, q *Query, useTreeSitter bool) (*
 	if r.Error != "" {
 		var err error
 		switch r.Code {
-		case "invalid_theme":
-			err = ErrInvalidTheme
 		case "resource_not_found":
 			// resource_not_found is returned in the event of a 404, indicating a bug
 			// in gosyntect.
@@ -221,10 +229,17 @@ func (c *Client) Highlight(ctx context.Context, q *Query, useTreeSitter bool) (*
 		}
 		return nil, errors.Wrap(err, c.syntectServer)
 	}
-	return &Response{
+	response := &Response{
 		Data:      r.Data,
 		Plaintext: r.Plaintext,
-	}, nil
+	}
+
+	// If SCIP is set, prefer it over HTML
+	if r.Scip != "" {
+		response.Data = r.Scip
+	}
+
+	return response, nil
 }
 
 func (c *Client) url(path string) string {
@@ -235,5 +250,6 @@ func (c *Client) url(path string) string {
 func New(syntectServer string) *Client {
 	return &Client{
 		syntectServer: strings.TrimSuffix(syntectServer, "/"),
+		httpClient:    httpcli.InternalClient,
 	}
 }

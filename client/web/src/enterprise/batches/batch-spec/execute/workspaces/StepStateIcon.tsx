@@ -8,7 +8,7 @@ import TimerSandIcon from 'mdi-react/TimerSandIcon'
 
 import { Icon, LoadingSpinner, Tooltip } from '@sourcegraph/wildcard'
 
-import { BatchSpecWorkspaceStepFields } from '../../../../../graphql-operations'
+import type { BatchSpecWorkspaceStepFields } from '../../../../../graphql-operations'
 
 interface StepStateIconProps {
     step: BatchSpecWorkspaceStepFields
@@ -41,7 +41,9 @@ export const StepStateIcon: React.FunctionComponent<React.PropsWithChildren<Step
     return (
         <div className="d-flex flex-shrink-0">
             <Tooltip content={label} placement="bottom">
-                <Icon className={classNameVariant} aria-label={label} as={IconElement} />
+                <span>
+                    <Icon className={classNameVariant} aria-label={label} as={IconElement} />
+                </span>
             </Tooltip>
         </div>
     )
